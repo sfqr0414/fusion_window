@@ -6,6 +6,7 @@
 #include <dwmapi.h>
 #include <imm.h>
 #include <uxtheme.h> 
+#include <vssym32.h>
 #include <avrt.h> 
 #include <iostream>
 #include <thread>
@@ -103,7 +104,7 @@ ComPtr<IDWriteTextFormat> CreateCaptionTextFormat(IDWriteFactory* factory, HWND 
         return nullptr;
     }
     format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     return format;
 }
 
@@ -141,6 +142,9 @@ const int g_MenuCount = 4;
 const float g_MenuPadding = 20.0f;
 const float g_MenuStartX = 210.0f;
 
+float GetMenuStartLogicalX();
+float GetMenuEndLogicalX();
+
 inline int GetPanelWidth() {
     return S(200);
 }
@@ -170,7 +174,7 @@ void CalculateMenuWidths() {
 }
 
 int GetMenuIndexFromLogicalX(float logicalX) {
-    float currentX = g_MenuStartX;
+    float currentX = GetMenuStartLogicalX();
     for (int i = 0; i < g_MenuCount; ++i) {
         if (logicalX >= currentX && logicalX < currentX + g_MenuItems[i].width) return i;
         currentX += g_MenuItems[i].width;
@@ -286,6 +290,107 @@ std::atomic<bool> g_bMouseInCanvas(false);
 std::atomic<uint64_t> g_LastMousePosPacked(0);
 std::atomic<bool> g_ImGuiWantCaptureMouse(false);
 std::atomic<bool> g_IsTitleMenuVisible(false);
+std::atomic<bool> g_IsMenuPopupActive(false);
+
+POINT g_CaptionPressPoint{ 0, 0 };
+int g_PressedMenuIndex = -1;
+bool g_IsCaptionPressActive = false;
+bool g_IsCaptionDragStarted = false;
+
+constexpr float kCaptionLogicalInset = 8.0f;
+constexpr float kCaptionTextGap = 8.0f;
+
+float GetMenuStartLogicalX() {
+    return (float)GetPanelWidth() / g_dpiScale + kCaptionLogicalInset;
+}
+
+float GetMenuEndLogicalX() {
+    return GetMenuStartLogicalX() + GetTotalMenuWidth();
+}
+
+bool IsInCustomCaptionBand(POINT clientPt) {
+    return clientPt.y >= 0
+        && clientPt.y <= g_CaptionHeight.load(std::memory_order_relaxed)
+        && clientPt.x > GetPanelWidth()
+        && !IsPointInCaptionButtons(g_hMainWindow, clientPt);
+}
+
+bool IsInMenuBarBand(POINT clientPt) {
+    if (!IsInCustomCaptionBand(clientPt)) {
+        return false;
+    }
+    float logicalX = (float)clientPt.x / g_dpiScale;
+    return logicalX >= GetMenuStartLogicalX() && logicalX < GetMenuEndLogicalX();
+}
+
+void UpdateTitleMenuVisibilityFromPoint(POINT clientPt, bool pointerInWindow) {
+    bool shouldShowMenu = g_IsMenuPopupActive.load(std::memory_order_relaxed)
+        || (pointerInWindow && IsInCustomCaptionBand(clientPt));
+    g_IsTitleMenuVisible.store(shouldShowMenu, std::memory_order_relaxed);
+}
+
+void UpdateTitleMenuVisibilityFromCursor(HWND hwnd) {
+    POINT screenPt{};
+    GetCursorPos(&screenPt);
+    POINT clientPt = screenPt;
+    ScreenToClient(hwnd, &clientPt);
+    RECT clientRect{};
+    GetClientRect(hwnd, &clientRect);
+    UpdateTitleMenuVisibilityFromPoint(clientPt, PtInRect(&clientRect, clientPt));
+    uint64_t packed = ((uint64_t)(uint32_t)clientPt.y << 32) | (uint64_t)(uint32_t)clientPt.x;
+    g_LastMousePosPacked.store(packed, std::memory_order_relaxed);
+}
+
+ComPtr<ID2D1Bitmap1> CreateBitmapFromHicon(ID2D1DeviceContext* d2dContext, HICON hIcon, UINT size) {
+    if (!d2dContext || !hIcon || size == 0) {
+        return nullptr;
+    }
+
+    BITMAPV5HEADER bi{};
+    bi.bV5Size = sizeof(bi);
+    bi.bV5Width = static_cast<LONG>(size);
+    bi.bV5Height = -static_cast<LONG>(size);
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
+    bi.bV5Compression = BI_BITFIELDS;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
+
+    void* bits = nullptr;
+    HDC screenDc = GetDC(nullptr);
+    HBITMAP dib = CreateDIBSection(screenDc, reinterpret_cast<BITMAPINFO*>(&bi), DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC memDc = CreateCompatibleDC(screenDc);
+    ReleaseDC(nullptr, screenDc);
+    if (!dib || !memDc || !bits) {
+        if (memDc) {
+            DeleteDC(memDc);
+        }
+        if (dib) {
+            DeleteObject(dib);
+        }
+        return nullptr;
+    }
+
+    HGDIOBJ oldBitmap = SelectObject(memDc, dib);
+    PatBlt(memDc, 0, 0, size, size, BLACKNESS);
+    DrawIconEx(memDc, 0, 0, hIcon, size, size, 0, nullptr, DI_NORMAL);
+
+    D2D1_BITMAP_PROPERTIES1 bitmapProperties = D2D1::BitmapProperties1(
+        D2D1_BITMAP_OPTIONS_NONE,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+        96.0f,
+        96.0f);
+
+    ComPtr<ID2D1Bitmap1> bitmap;
+    d2dContext->CreateBitmap(D2D1::SizeU(size, size), bits, size * 4, &bitmapProperties, &bitmap);
+
+    SelectObject(memDc, oldBitmap);
+    DeleteDC(memDc);
+    DeleteObject(dib);
+    return bitmap;
+}
 
 // =========================================================
 // 5. UIAnimation 硬件定时器引擎
@@ -468,9 +573,14 @@ void RenderThreadFunc() {
     ComPtr<IDWriteTextFormat> titleFormat = CreateCaptionTextFormat(dwriteFactory.Get(), g_hMainWindow);
     if (!titleFormat) {
         dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-cn", &titleFormat);
+        titleFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        titleFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     }
     ComPtr<IDWriteTextFormat> menuFormat; dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"zh-cn", &menuFormat);
-
+    if (menuFormat) {
+        menuFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        menuFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    }
     ComPtr<IDXGIAdapter> dxgiAdapter; dxgiDevice->GetAdapter(&dxgiAdapter);
     ComPtr<IDXGIFactory2> dxgiFactory; dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), &dxgiFactory);
 
@@ -505,17 +615,6 @@ void RenderThreadFunc() {
     rootVisual->AddVisual(titleVisual.Get(), TRUE, mainVisual.Get());
     dcompTarget->SetRoot(rootVisual.Get()); dcompDevice->Commit();
 
-    ComPtr<ID2D1Bitmap1> titleBitmap; POINT offset = { 0 }; ComPtr<IDXGISurface> dxgiTitleSurface;
-    if (SUCCEEDED(titleSurface->BeginDraw(nullptr, __uuidof(IDXGISurface), &dxgiTitleSurface, &offset))) {
-        D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-        d2dContext->CreateBitmapFromDxgiSurface(dxgiTitleSurface.Get(), &bp, &titleBitmap);
-        d2dContext->SetTarget(titleBitmap.Get());
-        d2dContext->BeginDraw(); d2dContext->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f)); 
-        ComPtr<ID2D1SolidColorBrush> bText; d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.0f), &bText);
-        float captionHeightLogical = g_CaptionHeight.load() / g_dpiScale;
-        d2dContext->DrawTextW(L" DWM 沉浸架构: D2D 原生动画与大满贯", 34, titleFormat.Get(), D2D1::RectF(g_MenuStartX, 0.0f, 2560.0f, captionHeightLogical), bText.Get());
-        d2dContext->EndDraw(); titleSurface->EndDraw();
-    }
 
     ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
     ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground;
@@ -526,6 +625,45 @@ void RenderThreadFunc() {
     d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.6f, 0.2f), &brushAim); 
     d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.2f, 0.0f), &brushHit); 
     d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushMenuText); 
+    ComPtr<ID2D1SolidColorBrush> brushTitleText;
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushTitleText);
+
+    auto drawTitleAndCaptionButtons = [&](float titleAlpha, float captionHeightLogical, float logicalW) {
+        if (titleAlpha <= 0.01f) {
+            return;
+        }
+
+        UINT dpi = GetDpiForWindow(g_hMainWindow);
+        int iconSizePx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        float iconSizeLogical = (float)iconSizePx / g_dpiScale;
+        float startX = GetMenuStartLogicalX();
+        float iconTop = (captionHeightLogical - iconSizeLogical) * 0.5f;
+
+        HICON hIcon = (HICON)SendMessageW(g_hMainWindow, WM_GETICON, ICON_SMALL, 0);
+        if (!hIcon) {
+            hIcon = (HICON)GetClassLongPtrW(g_hMainWindow, GCLP_HICONSM);
+        }
+        if (!hIcon) {
+            hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        }
+        if (ComPtr<ID2D1Bitmap1> iconBitmap = CreateBitmapFromHicon(d2dContext.Get(), hIcon, (UINT)iconSizePx)) {
+            d2dContext->DrawBitmap(iconBitmap.Get(), D2D1::RectF(startX, iconTop, startX + iconSizeLogical, iconTop + iconSizeLogical), titleAlpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        }
+
+        wchar_t windowTitle[256] = {};
+        GetWindowTextW(g_hMainWindow, windowTitle, _countof(windowTitle));
+        float textRight = logicalW;
+        RECT buttonGroupRect = GetCaptionButtonBounds(g_hMainWindow);
+        if (!IsRectEmpty(&buttonGroupRect)) {
+            textRight = min(textRight, (float)buttonGroupRect.left / g_dpiScale - kCaptionLogicalInset);
+        }
+
+        brushTitleText->SetOpacity(titleAlpha);
+        float textLeft = startX + iconSizeLogical + kCaptionTextGap;
+        if (textRight > textLeft) {
+            d2dContext->DrawTextW(windowTitle, static_cast<UINT32>(wcslen(windowTitle)), titleFormat.Get(), D2D1::RectF(textLeft, 0.0f, textRight, captionHeightLogical), brushTitleText.Get());
+        }
+    };
 
     std::unique_ptr<ImGuiBridge> guiBridge = std::make_unique<ImGuiBridgeImpl>();
     guiBridge->Init(g_hCanvas, d3dDevice.Get(), d3dContext.Get());
@@ -610,10 +748,6 @@ void RenderThreadFunc() {
         bool wantHideTitle = g_IsTitleMenuVisible.load(std::memory_order_relaxed);
         if (wantHideTitle != isTitleHidden) {
             isTitleHidden = wantHideTitle;
-            ComPtr<IDCompositionAnimation> animation; dcompDevice->CreateAnimation(&animation);
-            float targetA = isTitleHidden ? 0.0f : 1.0f;
-            animation->AddCubic(0.0, 0.0f, 0.0f, 0.0f, targetA); animation->End(0.2, targetA);
-            titleEffectGroup->SetOpacity(animation.Get()); dcompDevice->Commit();
         }
 
         targetMenuAlpha = isTitleHidden ? 1.0f : 0.0f;
@@ -643,12 +777,14 @@ void RenderThreadFunc() {
             d2dContext->DrawLine(D2D1::Point2F(hit.x - 6, hit.y + 6), D2D1::Point2F(hit.x + 6, hit.y - 6), brushHit.Get(), 3.0f);
         }
 
+        drawTitleAndCaptionButtons(1.0f - menuAlpha, captionHeightLogical, logicalW);
+
         POINT pt; GetCursorPos(&pt); ScreenToClient(g_hCanvas, &pt);
         float mouseLogicalX = (float)pt.x / g_dpiScale;
         float mouseLogicalY = (float)pt.y / g_dpiScale;
 
         if (menuAlpha > 0.01f) {
-            float startX = g_MenuStartX;
+            float startX = GetMenuStartLogicalX();
             for (int i = 0; i < g_MenuCount; ++i) {
                 float itemWidth = g_MenuItems[i].width;
                 bool isHover = (mouseInCanvas && mouseLogicalY <= captionHeightLogical && mouseLogicalX >= startX && mouseLogicalX < startX + itemWidth);
@@ -662,7 +798,7 @@ void RenderThreadFunc() {
 
                 brushMenuText->SetOpacity(menuAlpha);
                 d2dContext->DrawTextW(g_MenuItems[i].text, static_cast<UINT32>(wcslen(g_MenuItems[i].text)), menuFormat.Get(),
-                    D2D1::RectF(startX + g_MenuPadding / 2.0f, 6.0f, startX + itemWidth, captionHeightLogical), brushMenuText.Get());
+                    D2D1::RectF(startX + g_MenuPadding / 2.0f, 0.0f, startX + itemWidth, captionHeightLogical), brushMenuText.Get());
                 startX += itemWidth;
             }
         }
@@ -729,12 +865,22 @@ void ShowCustomWin32Menu(HWND hwnd, int selectedIndex) {
         AppendMenuW(hMenu, MF_STRING, 3007, L"关于 D2D 引擎 (About)...");
     }
 
-    float popupX = g_MenuStartX;
+    float popupX = GetMenuStartLogicalX();
     for (int i = 0; i < selectedIndex; ++i) popupX += g_MenuItems[i].width;
 
     POINT pt = { (int)(popupX * g_dpiScale), g_CaptionHeight.load() };
     ClientToScreen(hwnd, &pt);
-    TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON, pt.x, pt.y, 0, g_hMainWindow, NULL);
+    g_IsMenuPopupActive.store(true, std::memory_order_relaxed);
+    g_IsTitleMenuVisible.store(true, std::memory_order_relaxed);
+    g_RenderEvent.Notify();
+    SetForegroundWindow(hwnd);
+    UINT command = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hMainWindow, NULL);
+    if (command != 0) {
+        SendMessageW(g_hMainWindow, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+    }
+    g_IsMenuPopupActive.store(false, std::memory_order_relaxed);
+    UpdateTitleMenuVisibilityFromCursor(hwnd);
+    g_RenderEvent.Notify();
     DestroyMenu(hMenu);
 }
 
@@ -775,7 +921,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         if (pt.y <= g_CaptionHeight.load()) {
             float logicalX = (float)pt.x / g_dpiScale;
             // 如果鼠标在我们的自定义菜单上，阻断透传，由 Canvas 自己处理！
-            if (logicalX >= g_MenuStartX && logicalX <= g_MenuStartX + GetTotalMenuWidth()) {
+            if (logicalX >= GetMenuStartLogicalX() && logicalX <= GetMenuEndLogicalX()) {
                 return HTCLIENT;
             }
             // 其他区域（包括右上角的三大金刚键和拖拽区），全部透传给底层主窗口！
@@ -950,6 +1096,16 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
     case WM_NCCALCSIZE: {
         if (wParam == TRUE) {
+            NCCALCSIZE_PARAMS* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
+            if (IsZoomed(hwnd)) {
+                UINT dpi = GetDpiForWindow(hwnd);
+                int frameX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                params->rgrc[0].left += frameX;
+                params->rgrc[0].right -= frameX;
+                params->rgrc[0].top += frameY;
+                params->rgrc[0].bottom -= frameY;
+            }
             return 0;
         }
         break;
@@ -957,12 +1113,30 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
     case WM_NCHITTEST: {
         LRESULT hit;
-        // 必须先让 DWM 处理，它才能识别出右上角的三大按钮热区！
         if (DwmDefWindowProc(hwnd, msg, wParam, lParam, &hit)) return hit;
 
-        // DWM 不管的，我们用你的热区算法自己算！(完美实现拖拽与八向缩放)
+        RECT windowRect{};
+        GetWindowRect(hwnd, &windowRect);
+        POINT screenPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        const int resizeBorder = GetSystemMetricsForDpi(SM_CXSIZEFRAME, GetDpiForWindow(hwnd)) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, GetDpiForWindow(hwnd));
+
+        if (screenPt.y < windowRect.top + resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTTOPLEFT;
+        if (screenPt.y < windowRect.top + resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTTOPRIGHT;
+        if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTBOTTOMLEFT;
+        if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTBOTTOMRIGHT;
+        if (screenPt.y < windowRect.top + resizeBorder) return HTTOP;
+        if (screenPt.y >= windowRect.bottom - resizeBorder) return HTBOTTOM;
+        if (screenPt.x < windowRect.left + resizeBorder) return HTLEFT;
+        if (screenPt.x >= windowRect.right - resizeBorder) return HTRIGHT;
+
+        POINT clientPt = screenPt;
+        ScreenToClient(hwnd, &clientPt);
+        if (IsInCustomCaptionBand(clientPt)) {
+            return HTCLIENT;
+        }
+
         hit = compute_sector_of_window(hwnd, wParam, lParam, g_CaptionHeight.load());
-        if (hit != HTNOWHERE) return hit;
+        if (hit != HTNOWHERE && hit != HTCAPTION) return hit;
 
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
@@ -989,8 +1163,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
         POINT pt = { x, y };
-        if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) { g_IsTitleMenuVisible.store(true, std::memory_order_relaxed); }
-        else { g_IsTitleMenuVisible.store(false, std::memory_order_relaxed); }
+        UpdateTitleMenuVisibilityFromPoint(pt, true);
+
+        if (g_IsCaptionPressActive && (wParam & MK_LBUTTON) && IsInCustomCaptionBand(g_CaptionPressPoint)) {
+            int dragX = GetSystemMetrics(SM_CXDRAG);
+            int dragY = GetSystemMetrics(SM_CYDRAG);
+            if (abs(x - g_CaptionPressPoint.x) >= dragX || abs(y - g_CaptionPressPoint.y) >= dragY) {
+                g_IsCaptionDragStarted = true;
+                g_IsCaptionPressActive = false;
+                g_PressedMenuIndex = -1;
+                ReleaseCapture();
+                g_IsTitleMenuVisible.store(false, std::memory_order_relaxed);
+                g_RenderEvent.Notify();
+                POINT screenPt = pt;
+                ClientToScreen(hwnd, &screenPt);
+                SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(screenPt.x, screenPt.y));
+                return 0;
+            }
+        }
 
         uint64_t packed = ((uint64_t)y << 32) | (uint64_t)(uint32_t)x;
         g_LastMousePosPacked.store(packed, std::memory_order_relaxed);
@@ -1000,14 +1190,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     }
     case WM_MOUSELEAVE: {
         g_bMouseInCanvas.store(false, std::memory_order_relaxed);
-        g_IsTitleMenuVisible.store(false, std::memory_order_relaxed);
+        UpdateTitleMenuVisibilityFromPoint({ -1, -1 }, false);
         g_RenderEvent.Notify();
         return 0;
     }
     case WM_LBUTTONDOWN: {
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
+        POINT pt = { x, y };
         g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
         SetFocus(hwnd);
+        if (IsInCustomCaptionBand(pt)) {
+            SetCapture(hwnd);
+            g_CaptionPressPoint = pt;
+            g_IsCaptionPressActive = true;
+            g_IsCaptionDragStarted = false;
+            g_PressedMenuIndex = IsInMenuBarBand(pt) ? GetMenuIndexFromLogicalX((float)x / g_dpiScale) : -1;
+            g_RenderEvent.Notify();
+            return 0;
+        }
         if (x > GetPanelWidth() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
             if (y > g_CaptionHeight.load()) {
                 g_CommandQueue.push(CmdAddHitMark{ (float)x / g_dpiScale, (float)y / g_dpiScale });
@@ -1020,9 +1220,25 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
         POINT pt = { x, y };
         g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
+        if (g_IsCaptionPressActive && !g_IsCaptionDragStarted) {
+            int releasedMenuIndex = IsInMenuBarBand(pt) ? GetMenuIndexFromLogicalX((float)x / g_dpiScale) : -1;
+            if (g_PressedMenuIndex != -1 && g_PressedMenuIndex == releasedMenuIndex) {
+                g_IsCaptionPressActive = false;
+                g_PressedMenuIndex = -1;
+                ShowCustomWin32Menu(hwnd, releasedMenuIndex);
+                return 0;
+            }
+        }
+        g_IsCaptionPressActive = false;
+        g_IsCaptionDragStarted = false;
+        g_PressedMenuIndex = -1;
         if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) {
-            int menuIndex = GetMenuIndexFromLogicalX((float)x / g_dpiScale);
-            if (menuIndex != -1) ShowCustomWin32Menu(hwnd, menuIndex);
+            UpdateTitleMenuVisibilityFromPoint(pt, true);
+            g_RenderEvent.Notify();
+            return 0;
         }
         return 0;
     }
