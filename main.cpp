@@ -60,16 +60,35 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 // 1. 动态 DPI 标题栏高度与 DWM 热区计算 (致敬你的代码)
 // =========================================================
 float g_dpiScale = 1.0f;
-inline int S(int val) { return (int)(val * g_dpiScale); }
+inline int S(int val) { return (int)(val * g_dpiScale + 0.5f); }
 
 inline auto compute_standard_caption_height_for_window(HWND window_handle) {
-    auto const accounting_for_borders = 2;
     auto dpi = GetDpiForWindow(window_handle);
-    RECT rcFrame = { 0 };
-    AdjustWindowRectExForDpi(&rcFrame, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
-    return -rcFrame.top - accounting_for_borders;
+    int caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
+    int frame = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
+    int pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+    return caption + frame + pad;
 }
 std::atomic<int> g_CaptionHeight{ 32 };
+
+ComPtr<IDWriteTextFormat> CreateCaptionTextFormat(IDWriteFactory* factory, HWND hwnd) {
+    NONCLIENTMETRICSW ncm{ sizeof(ncm) };
+    if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, GetDpiForWindow(hwnd))) {
+        return nullptr;
+    }
+    float fontSize = (float)abs(ncm.lfCaptionFont.lfHeight);
+    if (fontSize < 8.0f) fontSize = 16.0f;
+    ComPtr<IDWriteTextFormat> format;
+    if (FAILED(factory->CreateTextFormat(ncm.lfCaptionFont.lfFaceName, NULL,
+        static_cast<DWRITE_FONT_WEIGHT>(ncm.lfCaptionFont.lfWeight),
+        ncm.lfCaptionFont.lfItalic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL, fontSize, L"zh-cn", &format))) {
+        return nullptr;
+    }
+    format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    return format;
+}
 
 inline auto compute_sector_of_window(HWND window_handle, WPARAM, LPARAM lparam, int caption_height) -> LRESULT {
     RECT window_rectangle;
@@ -421,9 +440,11 @@ void RenderThreadFunc() {
     ComPtr<IDWriteFactory> dwriteFactory;
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwriteFactory.GetAddressOf()));
 
-    // 【完美和谐】：标题 16px，菜单 14px，取消加粗倾斜
-    ComPtr<IDWriteTextFormat> titleFormat; dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-cn", &titleFormat);
-    ComPtr<IDWriteTextFormat> menuFormat;  dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"zh-cn", &menuFormat);
+    ComPtr<IDWriteTextFormat> titleFormat = CreateCaptionTextFormat(dwriteFactory.Get(), g_hMainWindow);
+    if (!titleFormat) {
+        dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-cn", &titleFormat);
+    }
+    ComPtr<IDWriteTextFormat> menuFormat; dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"zh-cn", &menuFormat);
 
     ComPtr<IDXGIAdapter> dxgiAdapter; dxgiDevice->GetAdapter(&dxgiAdapter);
     ComPtr<IDXGIFactory2> dxgiFactory; dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), &dxgiFactory);
@@ -466,7 +487,8 @@ void RenderThreadFunc() {
         d2dContext->SetTarget(titleBitmap.Get());
         d2dContext->BeginDraw(); d2dContext->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f)); 
         ComPtr<ID2D1SolidColorBrush> bText; d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 1.0f), &bText);
-        d2dContext->DrawTextW(L" DWM 沉浸架构: D2D 原生动画与大满贯", 34, titleFormat.Get(), D2D1::RectF(g_MenuStartX, 8.0f, 2560.0f, 64.0f), bText.Get());
+        float captionHeightLogical = g_CaptionHeight.load() / g_dpiScale;
+        d2dContext->DrawTextW(L" DWM 沉浸架构: D2D 原生动画与大满贯", 34, titleFormat.Get(), D2D1::RectF(g_MenuStartX, 0.0f, 2560.0f, captionHeightLogical), bText.Get());
         d2dContext->EndDraw(); titleSurface->EndDraw();
     }
 
@@ -852,6 +874,12 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     }
     case WM_ERASEBKGND: { HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW)); return 1; }
+    case WM_NCHITTEST: {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &pt);
+        if (pt.y <= g_CaptionHeight.load()) return HTTRANSPARENT;
+        break;
+    }
     case WM_SETCURSOR: { SetCursor(LoadCursor(NULL, IDC_ARROW)); return TRUE; }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
