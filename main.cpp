@@ -937,11 +937,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE: {
         g_dpiScale = GetDpiForWindow(hwnd) / 96.0f;
         g_CaptionHeight.store(compute_standard_caption_height_for_window(hwnd), std::memory_order_relaxed);
-        RECT rcWindow{};
-        GetWindowRect(hwnd, &rcWindow);
-        SetWindowPos(hwnd, NULL, rcWindow.left, rcWindow.top,
-            rcWindow.right - rcWindow.left, rcWindow.bottom - rcWindow.top,
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
         ExtendFrameIntoClient(hwnd);
         return 0;
     }
