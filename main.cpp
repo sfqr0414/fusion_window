@@ -76,6 +76,7 @@ bool IsPointInCaptionButtons(HWND hwnd, POINT clientPt) {
 }
 
 void ExtendFrameIntoClient(HWND hwnd) {
+    UINT dpi = GetDpiForWindow(hwnd);
     MARGINS margins{};
     margins.cyTopHeight = g_CaptionHeight.load(std::memory_order_relaxed);
     DwmExtendFrameIntoClientArea(hwnd, &margins);
@@ -94,8 +95,9 @@ ComPtr<IDWriteTextFormat> CreateCaptionTextFormat(IDWriteFactory* factory, HWND 
     if (!SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0, GetDpiForWindow(hwnd))) {
         return nullptr;
     }
-    float fontSize = (float)abs(ncm.lfCaptionFont.lfHeight);
-    if (fontSize < 8.0f) fontSize = 16.0f;
+    // lfHeight 是设备像素（负值），DWrite fontSize 是 DIP（96dpi基准），必须换算
+    float fontSize = (float)abs(ncm.lfCaptionFont.lfHeight) * 96.0f / (float)GetDpiForWindow(hwnd);
+    if (fontSize < 8.0f) fontSize = 12.0f;
     ComPtr<IDWriteTextFormat> format;
     if (FAILED(factory->CreateTextFormat(ncm.lfCaptionFont.lfFaceName, NULL,
         static_cast<DWRITE_FONT_WEIGHT>(ncm.lfCaptionFont.lfWeight),
@@ -1301,8 +1303,8 @@ int main() {
     WNDCLASSW wcMain = { 0 }; wcMain.lpfnWndProc = MainWndProc; wcMain.hInstance = hInstance; wcMain.hCursor = LoadCursor(NULL, IDC_ARROW); wcMain.hbrBackground = NULL; wcMain.lpszClassName = L"MainClass"; RegisterClassW(&wcMain);
     WNDCLASSW wcPanel = { 0 }; wcPanel.lpfnWndProc = PanelWndProc; wcPanel.hInstance = hInstance; wcPanel.hbrBackground = NULL; wcPanel.lpszClassName = L"PanelClass"; RegisterClassW(&wcPanel);
 
-    // 【完美适配高分屏】：初始宽度高度调大为 1280x800，并自动按屏幕 DPI 放大！
-    int initW = 1280; int initH = 800;
+    // 【完美适配高分屏】：初始宽度高度调大为 960x600，并自动按屏幕 DPI 放大！
+    int initW = 960; int initH = 600;
     HDC screenDC = GetDC(NULL); int sysDpi = GetDeviceCaps(screenDC, LOGPIXELSX); ReleaseDC(NULL, screenDC);
     initW = initW * sysDpi / 96; initH = initH * sysDpi / 96;
 
