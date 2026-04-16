@@ -60,16 +60,33 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 // 1. 动态 DPI 标题栏高度与 DWM 热区计算 (致敬你的代码)
 // =========================================================
 float g_dpiScale = 1.0f;
+std::atomic<int> g_CaptionHeight{ 32 };
 inline int S(int val) { return (int)(val * g_dpiScale + 0.5f); }
 
-inline auto compute_standard_caption_height_for_window(HWND window_handle) {
-    auto dpi = GetDpiForWindow(window_handle);
-    int caption = GetSystemMetricsForDpi(SM_CYCAPTION, dpi);
-    int frame = GetSystemMetricsForDpi(SM_CYFRAME, dpi);
-    int pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-    return caption + frame + pad;
+RECT GetCaptionButtonBounds(HWND hwnd) {
+    RECT rc{ 0, 0, 0, 0 };
+    DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, &rc, sizeof(rc));
+    return rc;
 }
-std::atomic<int> g_CaptionHeight{ 32 };
+
+bool IsPointInCaptionButtons(HWND hwnd, POINT clientPt) {
+    RECT rc = GetCaptionButtonBounds(hwnd);
+    return !IsRectEmpty(&rc) && PtInRect(&rc, clientPt);
+}
+
+void ExtendFrameIntoClient(HWND hwnd) {
+    MARGINS margins{};
+    margins.cyTopHeight = g_CaptionHeight.load(std::memory_order_relaxed);
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
+}
+
+inline auto compute_standard_caption_height_for_window(HWND window_handle) {
+    auto const accounting_for_borders = 2;
+    auto dpi = GetDpiForWindow(window_handle);
+    RECT rcFrame = { 0 };
+    AdjustWindowRectExForDpi(&rcFrame, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    return -rcFrame.top - accounting_for_borders;
+}
 
 ComPtr<IDWriteTextFormat> CreateCaptionTextFormat(IDWriteFactory* factory, HWND hwnd) {
     NONCLIENTMETRICSW ncm{ sizeof(ncm) };
@@ -93,7 +110,7 @@ ComPtr<IDWriteTextFormat> CreateCaptionTextFormat(IDWriteFactory* factory, HWND 
 inline auto compute_sector_of_window(HWND window_handle, WPARAM, LPARAM lparam, int caption_height) -> LRESULT {
     RECT window_rectangle;
     GetWindowRect(window_handle, &window_rectangle);
-    auto offset = GetSystemMetricsForDpi(SM_CXFRAME, GetDpiForWindow(window_handle)) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, GetDpiForWindow(window_handle));
+    auto offset = 10;
     POINT cursor_position{ GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
 
     if (cursor_position.y < window_rectangle.top + offset && cursor_position.x < window_rectangle.left + offset) return HTTOPLEFT;
@@ -123,6 +140,14 @@ MenuItemInfo g_MenuItems[] = { { L"文件(F)", 0.0f }, { L"编辑(E)", 0.0f }, {
 const int g_MenuCount = 4;
 const float g_MenuPadding = 20.0f;
 const float g_MenuStartX = 210.0f;
+
+inline int GetPanelWidth() {
+    return S(200);
+}
+
+inline int GetPanelContentTop() {
+    return g_CaptionHeight.load(std::memory_order_relaxed) + S(10);
+}
 
 float GetTotalMenuWidth() {
     float total = 0.0f;
@@ -493,13 +518,14 @@ void RenderThreadFunc() {
     }
 
     ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
-    ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText;
+    ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground;
 
      // 【修复】：网格变暗，文字变暗（因为底色是白色/浅色背景）
-     d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.3f, 0.3f, 0.3f), &brushGrid); 
-     d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.6f, 0.2f), &brushAim); 
-     d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.2f, 0.0f), &brushHit); 
-     d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushMenuText); 
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.98f, 1.0f), &brushBackground);
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.3f, 0.3f, 0.3f), &brushGrid); 
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.6f, 0.2f), &brushAim); 
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.2f, 0.0f), &brushHit); 
+    d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushMenuText); 
 
     std::unique_ptr<ImGuiBridge> guiBridge = std::make_unique<ImGuiBridgeImpl>();
     guiBridge->Init(g_hCanvas, d3dDevice.Get(), d3dContext.Get());
@@ -599,14 +625,17 @@ void RenderThreadFunc() {
         d2dContext->BeginDraw();
         d2dContext->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
 
-        d2dContext->Clear(D2D1::ColorF(0.95f, 0.95f, 0.98f, 1.0f)); 
+        d2dContext->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f)); 
 
         float logicalW = currentWidth / g_dpiScale; float logicalH = currentHeight / g_dpiScale;
         float captionHeightLogical = g_CaptionHeight.load() / g_dpiScale;
+        float panelLogicalW = (float)GetPanelWidth() / g_dpiScale;
+        D2D1_RECT_F contentRect = D2D1::RectF(panelLogicalW, captionHeightLogical, logicalW, logicalH);
+        d2dContext->FillRectangle(contentRect, brushBackground.Get());
 
         if (showGrid) {
-            for (float x = 0; x < logicalW; x += 40.0f) d2dContext->DrawLine(D2D1::Point2F(x, 0), D2D1::Point2F(x, logicalH), brushGrid.Get());
-            for (float y = 0; y < logicalH; y += 40.0f) d2dContext->DrawLine(D2D1::Point2F(0, y), D2D1::Point2F(logicalW, y), brushGrid.Get());
+            for (float x = panelLogicalW; x < logicalW; x += 40.0f) d2dContext->DrawLine(D2D1::Point2F(x, captionHeightLogical), D2D1::Point2F(x, logicalH), brushGrid.Get());
+            for (float y = captionHeightLogical; y < logicalH; y += 40.0f) d2dContext->DrawLine(D2D1::Point2F(panelLogicalW, y), D2D1::Point2F(logicalW, y), brushGrid.Get());
         }
 
         for (const auto& hit : hitMarks) {
@@ -723,11 +752,24 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     switch (msg) {
     case WM_CREATE: ImmAssociateContext(hwnd, NULL); return 0;
     case WM_ERASEBKGND: return 1;
+    case WM_SIZE: {
+        int width = max(LOWORD(lParam), 1);
+        int height = max(HIWORD(lParam), 1);
+        if (g_hPanel) {
+            int panelW = min(GetPanelWidth(), width);
+            SetWindowPos(g_hPanel, HWND_TOP, 0, 0, panelW, height, SWP_SHOWWINDOW);
+        }
+        return 0;
+    }
 
         // 【重磅修复：HTTRANSPARENT 归位！】
         // 将 DWM 三大金刚键的控制权完美透传给底层的主窗口，彻底复活关闭/最大化！
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }; ScreenToClient(hwnd, &pt);
+
+        if (IsPointInCaptionButtons(g_hMainWindow, pt)) {
+            return HTTRANSPARENT;
+        }
 
         // 只有在非交互菜单的顶部标题栏区域，才允许透传，让底层主窗口处理！
         if (pt.y <= g_CaptionHeight.load()) {
@@ -749,7 +791,8 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
 
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
-        if (y <= g_CaptionHeight.load() && x > S(200)) { g_IsTitleMenuVisible.store(true, std::memory_order_relaxed); }
+        POINT pt = { x, y };
+        if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) { g_IsTitleMenuVisible.store(true, std::memory_order_relaxed); }
         else { g_IsTitleMenuVisible.store(false, std::memory_order_relaxed); }
 
         uint64_t packed = ((uint64_t)y << 32) | (uint64_t)(uint32_t)x;
@@ -768,7 +811,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
 
         SetFocus(hwnd);
-        if (x > S(200) && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
+        if (x > GetPanelWidth() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
             // 只在真实画布区打靶
             if (y > g_CaptionHeight.load()) {
                 g_CommandQueue.push(CmdAddHitMark{ (float)x / g_dpiScale, (float)y / g_dpiScale });
@@ -779,8 +822,9 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 
     case WM_LBUTTONUP: {
         int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
+        POINT pt = { x, y };
         // 这里只处理菜单点击（因为拖拽已经被 HTTRANSPARENT 交给主窗口了！）
-        if (y <= g_CaptionHeight.load() && x > S(200)) {
+        if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) {
             int menuIndex = GetMenuIndexFromLogicalX((float)x / g_dpiScale);
             if (menuIndex != -1) ShowCustomWin32Menu(hwnd, menuIndex);
         }
@@ -803,7 +847,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
     case WM_SETCURSOR: {
         if (LOWORD(lParam) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
-            if (pt.x > S(200) && pt.y > g_CaptionHeight.load() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
+            if (pt.x > GetPanelWidth() && pt.y > g_CaptionHeight.load() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
                 SetCursor(NULL); return TRUE;
             }
             else {
@@ -822,7 +866,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
-        int y = S(10);
+        int y = GetPanelContentTop();
         HWND hBtns[10];
         hBtns[0] = CreateWindowW(L"STATIC", L"全栈 C++ 降维控件秀", WS_CHILD | WS_VISIBLE, S(15), y, S(170), S(20), hwnd, NULL, NULL, NULL); y += S(25);
         hBtns[1] = CreateWindowW(L"BUTTON", L"科技绿 (Green)", WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON | WS_GROUP, S(15), y, S(170), S(20), hwnd, (HMENU)101, NULL, NULL); y += S(22);
@@ -873,13 +917,13 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if ((HWND)lParam == GetDlgItem(hwnd, 105)) { g_CommandQueue.push(CmdSetAimRadius{ (float)SendMessage((HWND)lParam, TBM_GETPOS, 0, 0) }); g_RenderEvent.Notify(); }
         return 0;
     }
-    case WM_ERASEBKGND: { HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW)); return 1; }
     case WM_NCHITTEST: {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
         ScreenToClient(hwnd, &pt);
         if (pt.y <= g_CaptionHeight.load()) return HTTRANSPARENT;
         break;
     }
+    case WM_ERASEBKGND: { HDC hdc = (HDC)wParam; RECT rc; GetClientRect(hwnd, &rc); FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW)); return 1; }
     case WM_SETCURSOR: { SetCursor(LoadCursor(NULL, IDC_ARROW)); return TRUE; }
     }
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -893,18 +937,22 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_CREATE: {
         g_dpiScale = GetDpiForWindow(hwnd) / 96.0f;
         g_CaptionHeight.store(compute_standard_caption_height_for_window(hwnd), std::memory_order_relaxed);
-        MARGINS margins = { 0, 0, 0, 1 }; DwmExtendFrameIntoClientArea(hwnd, &margins);
+        RECT rcWindow{};
+        GetWindowRect(hwnd, &rcWindow);
+        SetWindowPos(hwnd, NULL, rcWindow.left, rcWindow.top,
+            rcWindow.right - rcWindow.left, rcWindow.bottom - rcWindow.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ExtendFrameIntoClient(hwnd);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_ACTIVATE: {
+        ExtendFrameIntoClient(hwnd);
         return 0;
     }
     case WM_NCCALCSIZE: {
-        // 剥夺原本的丑陋边框，并通知 DWM 重算客户区
         if (wParam == TRUE) {
-            auto parameters = reinterpret_cast<NCCALCSIZE_PARAMS*>(lParam);
-            auto& r = parameters->rgrc[0];
-            int dpi = GetDpiForWindow(hwnd);
-            int frameX = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-            int frameY = GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-            r.right -= frameX; r.left += frameX; r.bottom -= frameY;
             return 0;
         }
         break;
@@ -927,7 +975,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         g_CaptionHeight.store(compute_standard_caption_height_for_window(hwnd), std::memory_order_relaxed);
         UpdateGlobalFont(); // 刷新字体大小
         RECT* const prcNewWindow = (RECT*)lParam;
-        SetWindowPos(hwnd, NULL, prcNewWindow->left, prcNewWindow->top, prcNewWindow->right - prcNewWindow->left, prcNewWindow->bottom - prcNewWindow->top, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hwnd, NULL, prcNewWindow->left, prcNewWindow->top, prcNewWindow->right - prcNewWindow->left, prcNewWindow->bottom - prcNewWindow->top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        ExtendFrameIntoClient(hwnd);
         return 0;
     }
     case WM_COMMAND: {
@@ -935,16 +984,90 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         if (LOWORD(wParam) == 2002) { DestroyWindow(hwnd); }
         return 0;
     }
+    case WM_MOUSEMOVE: {
+        if (!g_bMouseInCanvas.load(std::memory_order_relaxed)) {
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 }; TrackMouseEvent(&tme);
+            g_bMouseInCanvas.store(true, std::memory_order_relaxed);
+        }
+
+        int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
+        POINT pt = { x, y };
+        if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) { g_IsTitleMenuVisible.store(true, std::memory_order_relaxed); }
+        else { g_IsTitleMenuVisible.store(false, std::memory_order_relaxed); }
+
+        uint64_t packed = ((uint64_t)y << 32) | (uint64_t)(uint32_t)x;
+        g_LastMousePosPacked.store(packed, std::memory_order_relaxed);
+        g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+        g_RenderEvent.Notify();
+        return 0;
+    }
+    case WM_MOUSELEAVE: {
+        g_bMouseInCanvas.store(false, std::memory_order_relaxed);
+        g_IsTitleMenuVisible.store(false, std::memory_order_relaxed);
+        g_RenderEvent.Notify();
+        return 0;
+    }
+    case WM_LBUTTONDOWN: {
+        int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
+        g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+        SetFocus(hwnd);
+        if (x > GetPanelWidth() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
+            if (y > g_CaptionHeight.load()) {
+                g_CommandQueue.push(CmdAddHitMark{ (float)x / g_dpiScale, (float)y / g_dpiScale });
+            }
+        }
+        g_RenderEvent.Notify();
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        int y = GET_Y_LPARAM(lParam); int x = GET_X_LPARAM(lParam);
+        POINT pt = { x, y };
+        g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+        if (y <= g_CaptionHeight.load() && x > GetPanelWidth() && !IsPointInCaptionButtons(g_hMainWindow, pt)) {
+            int menuIndex = GetMenuIndexFromLogicalX((float)x / g_dpiScale);
+            if (menuIndex != -1) ShowCustomWin32Menu(hwnd, menuIndex);
+        }
+        return 0;
+    }
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MOUSEWHEEL:
+    case WM_CHAR: {
+        g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+        g_RenderEvent.Notify();
+        return 0;
+    }
+    case WM_SYSKEYDOWN: {
+        if (wParam == 'F') { ShowCustomWin32Menu(hwnd, 0); return 0; }
+        if (wParam == 'E') { ShowCustomWin32Menu(hwnd, 1); return 0; }
+        if (wParam == 'V') { ShowCustomWin32Menu(hwnd, 2); return 0; }
+        if (wParam == 'H') { ShowCustomWin32Menu(hwnd, 3); return 0; }
+        break;
+    }
+    case WM_KEYDOWN: {
+        if (wParam == 'C' || wParam == 'c') { g_CommandQueue.push(CmdResetCanvas{}); g_RenderEvent.Notify(); return 0; }
+        g_CommandQueue.push(CmdKeyDown{ wParam });
+        g_RenderEvent.Notify();
+        return 0;
+    }
     case WM_SIZE: {
         int width = max(LOWORD(lParam), 1); int height = max(HIWORD(lParam), 1);
-        if (g_hCanvas && g_hPanel) {
-            HDWP hdwp = BeginDeferWindowPos(2);
-            int panelW = S(200);
-            DeferWindowPos(hdwp, g_hCanvas, HWND_BOTTOM, 0, 0, width, height, 0);
-            DeferWindowPos(hdwp, g_hPanel, HWND_TOP, 0, 0, panelW, height, 0);
-            EndDeferWindowPos(hdwp);
+        ExtendFrameIntoClient(hwnd);
+        if (g_hPanel) {
+            int panelW = min(GetPanelWidth(), width);
+            SetWindowPos(g_hPanel, HWND_TOP, 0, 0, panelW, height, SWP_SHOWWINDOW);
         }
         g_CommandQueue.push(CmdResize{ width, height }); g_RenderEvent.Notify(); return 0;
+    }
+    case WM_SETCURSOR: {
+        if (LOWORD(lParam) == HTCLIENT) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+            if (pt.x > GetPanelWidth() && pt.y > g_CaptionHeight.load() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
+                SetCursor(NULL); return TRUE;
+            }
+            SetCursor(LoadCursor(NULL, IDC_ARROW)); return TRUE;
+        }
+        break;
     }
     case WM_DESTROY:
         g_CommandQueue.push(CmdExit{}); g_isRunning.store(false, std::memory_order_relaxed);
@@ -962,8 +1085,7 @@ int main() {
     CalculateMenuWidths();
 
     HINSTANCE hInstance = GetModuleHandle(NULL);
-    WNDCLASSW wcMain = { 0 }; wcMain.lpfnWndProc = MainWndProc; wcMain.hInstance = hInstance; wcMain.hCursor = LoadCursor(NULL, IDC_ARROW); wcMain.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); wcMain.lpszClassName = L"MainClass"; RegisterClassW(&wcMain);
-    WNDCLASSW wcCanvas = { 0 }; wcCanvas.lpfnWndProc = CanvasWndProc; wcCanvas.hInstance = hInstance; wcCanvas.hbrBackground = NULL; wcCanvas.lpszClassName = L"CanvasClass"; RegisterClassW(&wcCanvas);
+    WNDCLASSW wcMain = { 0 }; wcMain.lpfnWndProc = MainWndProc; wcMain.hInstance = hInstance; wcMain.hCursor = LoadCursor(NULL, IDC_ARROW); wcMain.hbrBackground = NULL; wcMain.lpszClassName = L"MainClass"; RegisterClassW(&wcMain);
     WNDCLASSW wcPanel = { 0 }; wcPanel.lpfnWndProc = PanelWndProc; wcPanel.hInstance = hInstance; wcPanel.hbrBackground = NULL; wcPanel.lpszClassName = L"PanelClass"; RegisterClassW(&wcPanel);
 
     // 【完美适配高分屏】：初始宽度高度调大为 1280x800，并自动按屏幕 DPI 放大！
@@ -972,8 +1094,9 @@ int main() {
     initW = initW * sysDpi / 96; initH = initH * sysDpi / 96;
 
     g_hMainWindow = CreateWindowExW(0, wcMain.lpszClassName, L"Modern C++20 Win32 究极大满贯", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, initW, initH, NULL, NULL, hInstance, NULL);
-    g_hCanvas = CreateWindowExW(0, wcCanvas.lpszClassName, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, initW, initH, g_hMainWindow, NULL, hInstance, NULL);
-    g_hPanel = CreateWindowExW(0, wcPanel.lpszClassName, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, S(200), initH, g_hMainWindow, NULL, hInstance, NULL);
+    g_hCanvas = g_hMainWindow;
+    int initialPanelWidth = min(GetPanelWidth(), initW);
+    g_hPanel = CreateWindowExW(0, wcPanel.lpszClassName, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, initialPanelWidth, initH, g_hMainWindow, NULL, hInstance, NULL);
 
     g_UIThreadId = GetCurrentThreadId();
 

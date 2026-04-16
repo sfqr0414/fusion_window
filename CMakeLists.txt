@@ -41,6 +41,4 @@ target_compile_options(fusion_window PUBLIC "/utf-8")
 # 2. Windows窗口程序链接配置（屏蔽控制台）
 target_link_options(fusion_window PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
 
-# 3. 开启VS性能分析配置
-set_target_properties(fusion_window PROPERTIES LINK_FLAGS "/PROFILE")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT fusion_window)
