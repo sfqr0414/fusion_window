@@ -325,6 +325,13 @@ bool IsInMenuBarBand(POINT clientPt) {
     return logicalX >= GetMenuStartLogicalX() && logicalX < GetMenuEndLogicalX();
 }
 
+bool IsInDraggableCaptionBand(POINT clientPt) {
+    return clientPt.y >= 0
+        && clientPt.y <= g_CaptionHeight.load(std::memory_order_relaxed)
+        && !IsInMenuBarBand(clientPt)
+        && !IsPointInCaptionButtons(g_hMainWindow, clientPt);
+}
+
 void UpdateTitleMenuVisibilityFromPoint(POINT clientPt, bool pointerInWindow) {
     bool shouldShowMenu = g_IsMenuPopupActive.load(std::memory_order_relaxed)
         || (pointerInWindow && IsInCustomCaptionBand(clientPt));
@@ -1120,27 +1127,36 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         RECT windowRect{};
         GetWindowRect(hwnd, &windowRect);
         POINT screenPt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-        const int resizeBorder = GetSystemMetricsForDpi(SM_CXSIZEFRAME, GetDpiForWindow(hwnd)) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, GetDpiForWindow(hwnd));
+        if (!IsZoomed(hwnd)) {
+            const int resizeBorder = GetSystemMetricsForDpi(SM_CXSIZEFRAME, GetDpiForWindow(hwnd)) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, GetDpiForWindow(hwnd));
 
-        if (screenPt.y < windowRect.top + resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTTOPLEFT;
-        if (screenPt.y < windowRect.top + resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTTOPRIGHT;
-        if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTBOTTOMLEFT;
-        if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTBOTTOMRIGHT;
-        if (screenPt.y < windowRect.top + resizeBorder) return HTTOP;
-        if (screenPt.y >= windowRect.bottom - resizeBorder) return HTBOTTOM;
-        if (screenPt.x < windowRect.left + resizeBorder) return HTLEFT;
-        if (screenPt.x >= windowRect.right - resizeBorder) return HTRIGHT;
+            if (screenPt.y < windowRect.top + resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTTOPLEFT;
+            if (screenPt.y < windowRect.top + resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTTOPRIGHT;
+            if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x < windowRect.left + resizeBorder) return HTBOTTOMLEFT;
+            if (screenPt.y >= windowRect.bottom - resizeBorder && screenPt.x >= windowRect.right - resizeBorder) return HTBOTTOMRIGHT;
+            if (screenPt.y < windowRect.top + resizeBorder) return HTTOP;
+            if (screenPt.y >= windowRect.bottom - resizeBorder) return HTBOTTOM;
+            if (screenPt.x < windowRect.left + resizeBorder) return HTLEFT;
+            if (screenPt.x >= windowRect.right - resizeBorder) return HTRIGHT;
+        }
 
         POINT clientPt = screenPt;
         ScreenToClient(hwnd, &clientPt);
-        if (IsInCustomCaptionBand(clientPt)) {
+        RECT buttonRect = GetCaptionButtonBounds(hwnd);
+        if (!IsRectEmpty(&buttonRect) && PtInRect(&buttonRect, clientPt)) {
+            int buttonWidth = max((buttonRect.right - buttonRect.left) / 3, 1);
+            int buttonIndex = min(2, max(0, (clientPt.x - buttonRect.left) / buttonWidth));
+            if (buttonIndex == 0) return HTMINBUTTON;
+            if (buttonIndex == 1) return HTMAXBUTTON;
+            return HTCLOSE;
+        }
+        if (IsInMenuBarBand(clientPt)) {
             return HTCLIENT;
         }
-
-        hit = compute_sector_of_window(hwnd, wParam, lParam, g_CaptionHeight.load());
-        if (hit != HTNOWHERE && hit != HTCAPTION) return hit;
-
-        return DefWindowProc(hwnd, msg, wParam, lParam);
+        if (IsInDraggableCaptionBand(clientPt)) {
+            return HTCAPTION;
+        }
+        return HTCLIENT;
     }
 
     case WM_DPICHANGED: {
