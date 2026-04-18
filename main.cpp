@@ -923,224 +923,240 @@ public:
 #endif
 
 // =========================================================
-// 8. GPU 渲染线程
+// 8. GPU 渲染线程（重构为 CRTP + RAII）
 // =========================================================
-void RenderThreadFunc() {
-	DWORD renderThreadId = GetCurrentThreadId();
-	//if (!AttachThreadInput(renderThreadId, g_UIThreadId, TRUE)) return;
 
-	DWORD_PTR pCoreMask = GetPCoreMask();
-	if (pCoreMask) SetThreadAffinityMask(GetCurrentThread(), pCoreMask);
+template <typename Derived>
+class RenderThreadScope {
+public:
+	RenderThreadScope() {
+		InitializeThread();
+		InitializeDevicesAndFactories();
+		InitializeWriteFormats();
+		InitializeCompositionAndSwapChain();
+		InitializeBrushes();
 
-	// MMCSS 联想护盾
-	DWORD taskIndex = 0;
-	HANDLE hAvrt = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
-	if (hAvrt) AvSetMmThreadPriority(hAvrt, AVRT_PRIORITY_CRITICAL);
+		guiBridge = std::make_unique<ImGuiBridgeImpl>();
+		guiBridge->Init(g_hCanvas, d3dDevice.Get(), d3dContext.Get());
 
-	ComPtr<ID3D11Device> d3dDevice; ComPtr<ID3D11DeviceContext> d3dContext;
-	D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &d3dDevice, nullptr, &d3dContext);
-	ComPtr<IDXGIDevice1> dxgiDevice; d3dDevice.As(&dxgiDevice); dxgiDevice->SetMaximumFrameLatency(1);
+		CreateTarget();
 
-	ComPtr<ID2D1Factory1> d2dFactory; D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &d2dFactory);
-	ComPtr<ID2D1Device> d2dDevice; d2dFactory->CreateDevice(dxgiDevice.Get(), &d2dDevice);
-	ComPtr<ID2D1DeviceContext> d2dContext; d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2dContext);
+		showGrid = true; aimRadius = 18.0f; aimStyle = 0;
+		hitMarks.clear();
+		currentMenuAlpha = 0.0f; currentHoverAlphas = { 0 };
 
-	ComPtr<IDWriteFactory> dwriteFactory;
-
-	DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwriteFactory.GetAddressOf()));
-
-	ComPtr<IDWriteTextFormat> titleFormat = CreateCaptionTextFormat(dwriteFactory.Get(), g_hMainWindow);
-	if (!titleFormat) {
-		dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-cn", &titleFormat);
-		titleFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-		titleFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+		g_GpuInitDoneEvent.Notify();
 	}
-	ComPtr<IDWriteTextFormat> menuFormat; dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"zh-cn", &menuFormat);
-	if (menuFormat) {
-		menuFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-		menuFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+	~RenderThreadScope() {
+		if (m_hAvrt) {
+			AvRevertMmThreadCharacteristics(m_hAvrt);
+			m_hAvrt = nullptr;
+		}
+		if (guiBridge) {
+			guiBridge->Shutdown();
+			guiBridge.reset();
+		}
+		if (d2dContext) d2dContext->SetTarget(nullptr);
 	}
-	ComPtr<IDXGIAdapter> dxgiAdapter; dxgiDevice->GetAdapter(&dxgiAdapter);
-	ComPtr<IDXGIFactory2> dxgiFactory; dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), &dxgiFactory);
 
-	RECT rc; GetClientRect(g_hCanvas, &rc);
-	int currentWidth = max(rc.right - rc.left, 1);
-	int currentHeight = max(rc.bottom - rc.top, 1);
+	void Run() {
+		RunLoop();
+	}
 
-	DXGI_SWAP_CHAIN_DESC1 swapChainDesc = { 0 };
-	swapChainDesc.Width = currentWidth; swapChainDesc.Height = currentHeight;
-	swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; swapChainDesc.SampleDesc.Count = 1;
-	swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; swapChainDesc.BufferCount = 2;
-	swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+private:
+	void InitializeThread() {
+		DWORD_PTR pCoreMask = GetPCoreMask();
+		if (pCoreMask) SetThreadAffinityMask(GetCurrentThread(), pCoreMask);
 
-	ComPtr<IDXGISwapChain1> swapChain;
-	dxgiFactory->CreateSwapChainForComposition(d3dDevice.Get(), &swapChainDesc, nullptr, &swapChain);
+		DWORD taskIndex = 0;
+		m_hAvrt = AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
+		if (m_hAvrt) AvSetMmThreadPriority(m_hAvrt, AVRT_PRIORITY_CRITICAL);
+	}
 
-	ComPtr<IDCompositionDevice> dcompDevice; DCompositionCreateDevice(dxgiDevice.Get(), __uuidof(IDCompositionDevice), &dcompDevice);
-	ComPtr<IDCompositionTarget> dcompTarget; dcompDevice->CreateTargetForHwnd(g_hCanvas, TRUE, &dcompTarget);
+	void InitializeDevicesAndFactories() {
+		D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &d3dDevice, nullptr, &d3dContext);
+		d3dDevice.As(&dxgiDevice); if (dxgiDevice) dxgiDevice->SetMaximumFrameLatency(1);
 
-	ComPtr<IDCompositionVisual> rootVisual; dcompDevice->CreateVisual(&rootVisual);
-	ComPtr<IDCompositionVisual> mainVisual; dcompDevice->CreateVisual(&mainVisual);
-	mainVisual->SetContent(swapChain.Get());
-	rootVisual->AddVisual(mainVisual.Get(), FALSE, nullptr);
+		D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &d2dFactory);
+		if (d2dFactory) d2dFactory->CreateDevice(dxgiDevice.Get(), &d2dDevice);
+		if (d2dDevice) d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2dContext);
 
-	ComPtr<IDCompositionEffectGroup> titleEffectGroup; dcompDevice->CreateEffectGroup(&titleEffectGroup);
-	titleEffectGroup->SetOpacity(1.0f);
-	dcompTarget->SetRoot(rootVisual.Get()); dcompDevice->Commit();
+		DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwriteFactory.GetAddressOf()));
+	}
 
-
-	ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
-	ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground, brushPaint;
-
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.f, 0.f, 0.f, 1.0f), &brushPaint);
-
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.98f, 1.0f), &brushBackground);
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.3f, 0.3f, 0.3f), &brushGrid);
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.6f, 0.2f), &brushAim);
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.2f, 0.0f), &brushHit);
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushMenuText);
-	ComPtr<ID2D1SolidColorBrush> brushTitleText;
-	d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushTitleText);
-
-
-
-	auto drawTitleAndCaptionButtons = [&](float titleAlpha, float captionHeightLogical, float logicalW) {
-
-		if (titleAlpha <= 0.01f) {
-			return;
+	void InitializeWriteFormats() {
+		titleFormat = CreateCaptionTextFormat(dwriteFactory.Get(), g_hMainWindow);
+		if (!titleFormat) {
+			dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f, L"zh-cn", &titleFormat);
+			if (titleFormat) { titleFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING); titleFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); }
 		}
+		dwriteFactory->CreateTextFormat(L"Microsoft YaHei UI", NULL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"zh-cn", &menuFormat);
+		if (menuFormat) { menuFormat->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING); menuFormat->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER); }
+	}
 
-		UINT dpi = GetDpiForWindow(g_hMainWindow);
-		int iconSizePx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
-		float iconSizeLogical = (float)iconSizePx / g_dpiScale;
-		float startX = GetMenuStartLogicalX();
-		float iconTop = (captionHeightLogical - iconSizeLogical) * 0.5f;
+	void InitializeCompositionAndSwapChain() {
+		dxgiDevice->GetAdapter(&dxgiAdapter);
+		dxgiAdapter->GetParent(__uuidof(IDXGIFactory2), &dxgiFactory);
 
-		HICON hIcon = (HICON)SendMessageW(g_hMainWindow, WM_GETICON, ICON_SMALL, 0);
-		if (!hIcon) {
-			hIcon = (HICON)GetClassLongPtrW(g_hMainWindow, GCLP_HICONSM);
+		RECT rc; GetClientRect(g_hCanvas, &rc);
+		currentWidth = max(rc.right - rc.left, 1);
+		currentHeight = max(rc.bottom - rc.top, 1);
+
+		DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+		swapChainDesc.Width = currentWidth; swapChainDesc.Height = currentHeight;
+		swapChainDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; swapChainDesc.SampleDesc.Count = 1;
+		swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; swapChainDesc.BufferCount = 2;
+		swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+
+		dxgiFactory->CreateSwapChainForComposition(d3dDevice.Get(), &swapChainDesc, nullptr, &swapChain);
+
+		DCompositionCreateDevice(dxgiDevice.Get(), __uuidof(IDCompositionDevice), &dcompDevice);
+		dcompDevice->CreateTargetForHwnd(g_hCanvas, TRUE, &dcompTarget);
+
+		dcompDevice->CreateVisual(&rootVisual);
+		dcompDevice->CreateVisual(&mainVisual);
+		mainVisual->SetContent(swapChain.Get());
+		rootVisual->AddVisual(mainVisual.Get(), FALSE, nullptr);
+		dcompTarget->SetRoot(rootVisual.Get()); dcompDevice->Commit();
+	}
+
+	void InitializeBrushes() {
+		if (d2dContext) {
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.f, 0.f, 0.f, 1.0f), &brushPaint);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.98f, 1.0f), &brushBackground);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.3f, 0.3f, 0.3f), &brushGrid);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.6f, 0.2f), &brushAim);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.2f, 0.0f), &brushHit);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushMenuText);
+			d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.1f, 0.1f, 0.1f), &brushTitleText);
 		}
-		if (!hIcon) {
-			hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-		}
-		if (ComPtr<ID2D1Bitmap1> iconBitmap = CreateBitmapFromHicon(d2dContext.Get(), hIcon, (UINT)iconSizePx)) {
-			d2dContext->DrawBitmap(iconBitmap.Get(), D2D1::RectF(startX, iconTop, startX + iconSizeLogical, iconTop + iconSizeLogical), titleAlpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-		}
+	}
 
-		wchar_t windowTitle[256] = {};
-		GetWindowTextW(g_hMainWindow, windowTitle, _countof(windowTitle));
-		float textRight = logicalW;
-		RECT buttonGroupRect = GetCaptionButtonBounds(g_hMainWindow);
-		if (!IsRectEmpty(&buttonGroupRect)) {
-			textRight = min(textRight, (float)buttonGroupRect.left / g_dpiScale - kCaptionLogicalInset);
-		}
-
-		brushTitleText->SetOpacity(titleAlpha);
-		float textLeft = startX + iconSizeLogical + kCaptionTextGap;
-		if (textRight > textLeft) {
-			d2dContext->DrawTextW(windowTitle, static_cast<UINT32>(wcslen(windowTitle)), titleFormat.Get(), D2D1::RectF(textLeft, 0.0f, textRight, captionHeightLogical), brushTitleText.Get());
-		}
-		};
-
-	std::unique_ptr<ImGuiBridge> guiBridge = std::make_unique<ImGuiBridgeImpl>();
-	guiBridge->Init(g_hCanvas, d3dDevice.Get(), d3dContext.Get());
-
-	auto CreateTarget = [&]() {
+	void CreateTarget() {
+		if (!swapChain || !d2dContext) return;
 		ComPtr<IDXGISurface> dxgiBackBuffer; swapChain->GetBuffer(0, __uuidof(IDXGISurface), &dxgiBackBuffer);
 		D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
 		d2dContext->CreateBitmapFromDxgiSurface(dxgiBackBuffer.Get(), &bp, &d2dTargetBitmap);
 		d2dContext->SetTarget(d2dTargetBitmap.Get());
-		guiBridge->ResizeOffscreenTarget(d3dDevice.Get(), d2dContext.Get(), currentWidth, currentHeight);
-		};
-	CreateTarget();
+		if (guiBridge) guiBridge->ResizeOffscreenTarget(d3dDevice.Get(), d2dContext.Get(), currentWidth, currentHeight);
+	}
 
+	void RunLoop() {
+		LONG currentRenderSignal = g_RenderEvent.Capture();
+
+		while (g_isRunning.load(std::memory_order_relaxed)) {
+			bool queueHasCmds = !g_CommandQueue.is_empty();
+			bool isAnimating = (currentMenuAlpha > 0.01f && currentMenuAlpha < 0.99f);
+			for (int i = 0; i < g_MenuCount; ++i) { if (currentHoverAlphas[i] > 0.01f && currentHoverAlphas[i] < 0.99f) isAnimating = true; }
+
+			if (!queueHasCmds) {
+				if (isAnimating) g_RenderEvent.HybridWait(currentRenderSignal, 500, 16);
+				else g_RenderEvent.HybridWait(currentRenderSignal, 1500, INFINITE);
+				LONG newRenderSignal = g_RenderEvent.Capture();
+				if (newRenderSignal == currentRenderSignal && !isAnimating) continue;
+				currentRenderSignal = newRenderSignal;
+			}
+
+			if (!g_isRunning.load(std::memory_order_relaxed)) break;
+
+			auto begin = std::chrono::steady_clock::now();
+
+			int pendingResizeW = -1, pendingResizeH = -1;
+
+			RenderCommand cmd;
+			while (g_CommandQueue.pop(cmd)) {
+				HandleCommand(cmd, pendingResizeW, pendingResizeH);
+			}
+
+			if (pendingResizeW > 0 && pendingResizeH > 0 && (pendingResizeW != currentWidth || pendingResizeH != currentHeight)) {
+				d2dContext->SetTarget(nullptr); d2dTargetBitmap.Reset();
+				d2dContext->Flush(); ComPtr<ID3D11DeviceContext> d3dContext2; d3dDevice->GetImmediateContext(&d3dContext2);
+				d3dContext2->ClearState(); d3dContext2->Flush();
+				if (SUCCEEDED(swapChain->ResizeBuffers(2, pendingResizeW, pendingResizeH, DXGI_FORMAT_UNKNOWN, 0))) {
+					currentWidth = pendingResizeW; currentHeight = pendingResizeH; CreateTarget();
+				}
+			}
+			if (!g_isRunning.load(std::memory_order_relaxed)) break;
+
+			guiBridge->RenderFrame(d3dContext.Get(), currentMenuAlpha, showGrid);
+
+			d2dContext->SetTarget(d2dTargetBitmap.Get());
+			d2dContext->BeginDraw();
+			d2dContext->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
+
+			d2dContext->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
+
+			float logicalW = currentWidth / g_dpiScale; float logicalH = currentHeight / g_dpiScale;
+			float captionHeightLogical = g_CaptionHeight.load() / g_dpiScale;
+			float panelLogicalW = (float)GetPanelWidth() / g_dpiScale;
+			D2D1_RECT_F contentRect = D2D1::RectF(panelLogicalW, captionHeightLogical, logicalW, logicalH);
+			d2dContext->FillRectangle(contentRect, brushBackground.Get());
+
+			// 委托给派生类完成具体绘制
+			static_cast<Derived*>(this)->OnRender(logicalW, logicalH, captionHeightLogical, panelLogicalW);
+
+			d2dContext->EndDraw();
+			swapChain->Present(0, 0);
+
+			auto pass = std::chrono::duration_cast<std::chrono::milliseconds>((std::chrono::steady_clock::now() - begin)).count();
+			utils::console("\ndraw frame in {} ms\n\n", pass);
+		}
+	}
+
+	void HandleCommand(RenderCommand& cmd, int& pendingResizeW, int& pendingResizeH) {
+		std::visit([&](auto&& arg) {
+			using T = std::decay_t<decltype(arg)>;
+			if constexpr (std::is_same_v<T, CmdResize>) {
+				if (arg.width > 0 && arg.height > 0) { pendingResizeW = arg.width; pendingResizeH = arg.height; }
+			}
+			else if constexpr (std::is_same_v<T, CmdChangeColor>) brushAim->SetColor(D2D1::ColorF(arg.r, arg.g, arg.b));
+			else if constexpr (std::is_same_v<T, CmdSetGrid>) showGrid = arg.show;
+			else if constexpr (std::is_same_v<T, CmdSetAimRadius>) aimRadius = arg.radius;
+			else if constexpr (std::is_same_v<T, CmdSetAimStyle>) aimStyle = arg.style;
+			else if constexpr (std::is_same_v<T, CmdAddHitMark>) hitMarks.push_back({ arg.x, arg.y });
+			else if constexpr (std::is_same_v<T, CmdResetCanvas>) hitMarks.clear();
+			else if constexpr (std::is_same_v<T, CmdUpdateAnim>) {
+				currentMenuAlpha = arg.menuAlpha; currentHoverAlphas = arg.hoverAlpha;
+			}
+			else if constexpr (std::is_same_v<T, CmdKeyDown>) {
+				if (arg.key == 'C' || arg.key == 'c') hitMarks.clear();
+				if (arg.key == VK_SPACE) {
+					POINT pt; GetCursorPos(&pt); ScreenToClient(g_hCanvas, &pt);
+					if (pt.x > (int)(200 * g_dpiScale)) hitMarks.push_back({ (float)pt.x / g_dpiScale, (float)pt.y / g_dpiScale });
+				}
+			}
+			else if constexpr (std::is_same_v<T, CmdWin32Msg>) guiBridge->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
+			else if constexpr (std::is_same_v<T, CmdExit>) g_isRunning.store(false, std::memory_order_relaxed);
+			}, cmd);
+	}
+
+protected:
+	HANDLE m_hAvrt = nullptr;
+	ComPtr<ID3D11Device> d3dDevice; ComPtr<ID3D11DeviceContext> d3dContext; ComPtr<IDXGIDevice1> dxgiDevice;
+	ComPtr<ID2D1Factory1> d2dFactory; ComPtr<ID2D1Device> d2dDevice; ComPtr<ID2D1DeviceContext> d2dContext;
+	ComPtr<IDWriteFactory> dwriteFactory; ComPtr<IDWriteTextFormat> titleFormat; ComPtr<IDWriteTextFormat> menuFormat;
+	ComPtr<IDXGIAdapter> dxgiAdapter; ComPtr<IDXGIFactory2> dxgiFactory; ComPtr<IDXGISwapChain1> swapChain;
+	ComPtr<IDCompositionDevice> dcompDevice; ComPtr<IDCompositionTarget> dcompTarget; ComPtr<IDCompositionVisual> rootVisual; ComPtr<IDCompositionVisual> mainVisual;
+	ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
+	ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground, brushPaint, brushTitleText;
+	std::unique_ptr<ImGuiBridge> guiBridge;
+
+	int currentWidth = 0; int currentHeight = 0;
 	bool showGrid = true; float aimRadius = 18.0f; int aimStyle = 0;
 	std::vector<D2D1_POINT_2F> hitMarks;
+	float currentMenuAlpha = 0.0f; std::array<float, 4> currentHoverAlphas = { 0 };
+};
 
-	float currentMenuAlpha = 0.0f;
-	std::array<float, 4> currentHoverAlphas = { 0 };;
-
-	g_GpuInitDoneEvent.Notify();
-
-	LONG currentRenderSignal = g_RenderEvent.Capture();
-
-
-	while (g_isRunning.load(std::memory_order_relaxed)) {
-
-		bool queueHasCmds = !g_CommandQueue.is_empty();
-		bool isAnimating = (currentMenuAlpha > 0.01f && currentMenuAlpha < 0.99f);
-		for (int i = 0; i < g_MenuCount; ++i) { if (currentHoverAlphas[i] > 0.01f && currentHoverAlphas[i] < 0.99f) isAnimating = true; }
-
-		if (!queueHasCmds) {
-			if (isAnimating) g_RenderEvent.HybridWait(currentRenderSignal, 500, 16);
-			else g_RenderEvent.HybridWait(currentRenderSignal, 1500, INFINITE);
-			LONG newRenderSignal = g_RenderEvent.Capture();
-			if (newRenderSignal == currentRenderSignal && !isAnimating) continue;
-			currentRenderSignal = newRenderSignal;
-		}
-
-		if (!g_isRunning.load(std::memory_order_relaxed)) break;
-
-		auto begin = std::chrono::steady_clock::now();
-
-		int pendingResizeW = -1, pendingResizeH = -1;
-
-		RenderCommand cmd;
-		while (g_CommandQueue.pop(cmd)) {
-			std::visit([&](auto&& arg) {
-				using T = std::decay_t<decltype(arg)>;
-				if constexpr (std::is_same_v<T, CmdResize>) {
-					if (arg.width > 0 && arg.height > 0) { pendingResizeW = arg.width; pendingResizeH = arg.height; }
-				}
-				else if constexpr (std::is_same_v<T, CmdChangeColor>) brushAim->SetColor(D2D1::ColorF(arg.r, arg.g, arg.b));
-				else if constexpr (std::is_same_v<T, CmdSetGrid>) showGrid = arg.show;
-				else if constexpr (std::is_same_v<T, CmdSetAimRadius>) aimRadius = arg.radius;
-				else if constexpr (std::is_same_v<T, CmdSetAimStyle>) aimStyle = arg.style;
-				else if constexpr (std::is_same_v<T, CmdAddHitMark>) hitMarks.push_back({ arg.x, arg.y });
-				else if constexpr (std::is_same_v<T, CmdResetCanvas>) hitMarks.clear();
-				else if constexpr (std::is_same_v<T, CmdUpdateAnim>) {
-					currentMenuAlpha = arg.menuAlpha; currentHoverAlphas = arg.hoverAlpha;
-				}
-				else if constexpr (std::is_same_v<T, CmdKeyDown>) {
-					if (arg.key == 'C' || arg.key == 'c') hitMarks.clear();
-					if (arg.key == VK_SPACE) {
-						POINT pt; GetCursorPos(&pt); ScreenToClient(g_hCanvas, &pt);
-						if (pt.x > (int)(200 * g_dpiScale)) hitMarks.push_back({ (float)pt.x / g_dpiScale, (float)pt.y / g_dpiScale });
-					}
-				}
-				else if constexpr (std::is_same_v<T, CmdWin32Msg>) guiBridge->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
-				else if constexpr (std::is_same_v<T, CmdExit>) g_isRunning.store(false, std::memory_order_relaxed);
-				}, cmd);
-		}
-
-		if (pendingResizeW > 0 && pendingResizeH > 0 && (pendingResizeW != currentWidth || pendingResizeH != currentHeight)) {
-			d2dContext->SetTarget(nullptr); d2dTargetBitmap.Reset();
-			d2dContext->Flush(); ComPtr<ID3D11DeviceContext> d3dContext2; d3dDevice->GetImmediateContext(&d3dContext2);
-			d3dContext2->ClearState(); d3dContext2->Flush();
-			if (SUCCEEDED(swapChain->ResizeBuffers(2, pendingResizeW, pendingResizeH, DXGI_FORMAT_UNKNOWN, 0))) {
-				currentWidth = pendingResizeW; currentHeight = pendingResizeH; CreateTarget();
-			}
-		}
-		if (!g_isRunning.load(std::memory_order_relaxed)) break;
-
-		guiBridge->RenderFrame(d3dContext.Get(), currentMenuAlpha, showGrid);
-
-		d2dContext->SetTarget(d2dTargetBitmap.Get());
-		d2dContext->BeginDraw();
-		d2dContext->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
-
-		d2dContext->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
-
-		float logicalW = currentWidth / g_dpiScale; float logicalH = currentHeight / g_dpiScale;
-		float captionHeightLogical = g_CaptionHeight.load() / g_dpiScale;
-		float panelLogicalW = (float)GetPanelWidth() / g_dpiScale;
-		D2D1_RECT_F contentRect = D2D1::RectF(panelLogicalW, captionHeightLogical, logicalW, logicalH);
-		d2dContext->FillRectangle(contentRect, brushBackground.Get());
-
+// 默认绘制实现，保留原本绘制逻辑
+class FusionRenderer : public RenderThreadScope<FusionRenderer> {
+public:
+	void OnRender(float logicalW, float logicalH, float captionHeightLogical, float panelLogicalW) {
+		// grid
 		if (showGrid) {
-			for (float x = panelLogicalW; x < logicalW; x += 40.0f) 
+			for (float x = panelLogicalW; x < logicalW; x += 40.0f)
 				d2dContext->DrawLine(D2D1::Point2F(x, captionHeightLogical), D2D1::Point2F(x, logicalH), brushGrid.Get());
-			for (float y = captionHeightLogical; y < logicalH; y += 40.0f) 
+			for (float y = captionHeightLogical; y < logicalH; y += 40.0f)
 				d2dContext->DrawLine(D2D1::Point2F(panelLogicalW, y), D2D1::Point2F(logicalW, y), brushGrid.Get());
 		}
 
@@ -1158,9 +1174,7 @@ void RenderThreadFunc() {
 				float hAlpha = currentHoverAlphas[i];
 
 				if (hAlpha > 0.01f) {
-					//ComPtr<ID2D1SolidColorBrush> bgBrush;
 					brushPaint->SetColor((D2D1::ColorF(0.f, 0.f, 0.f, 0.1f * currentMenuAlpha * hAlpha)));
-					//d2dContext->CreateSolidColorBrush(D2D1::ColorF(0.f, 0.f, 0.f, 0.1f * currentMenuAlpha * hAlpha), &bgBrush);
 					d2dContext->FillRectangle(D2D1::RectF(startX, 0, startX + itemWidth, captionHeightLogical), brushPaint.Get());
 				}
 
@@ -1184,8 +1198,6 @@ void RenderThreadFunc() {
 				d2dContext->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(fx, fy), aimRadius, aimRadius), brushAim.Get(), 2.0f);
 			}
 			else if (aimStyle == 1) {
-				//ComPtr<ID2D1SolidColorBrush> fillBrush; d2dContext->CreateSolidColorBrush(brushAim->GetColor(), &fillBrush);
-				//brushPaint->SetColor(brushAim->GetColor());
 				d2dContext->FillEllipse(D2D1::Ellipse(D2D1::Point2F(fx, fy), aimRadius * 0.3f, aimRadius * 0.3f), brushAim.Get());
 			}
 			else if (aimStyle == 2) {
@@ -1195,17 +1207,41 @@ void RenderThreadFunc() {
 				d2dContext->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(fx, fy), 2.0f, 2.0f), brushAim.Get(), 2.0f);
 			}
 		}
-
-		d2dContext->EndDraw();
-		swapChain->Present(0, 0);
-
-		auto pass = std::chrono::duration_cast<std::chrono::milliseconds>((std::chrono::steady_clock::now() - begin)).count();
-		utils::console("\ndraw frame in {} ms\n\n", pass);
 	}
 
-	if (hAvrt) AvRevertMmThreadCharacteristics(hAvrt);
-	guiBridge->Shutdown();
-	//AttachThreadInput(renderThreadId, g_UIThreadId, FALSE);
+private:
+	void drawTitleAndCaptionButtons(float titleAlpha, float captionHeightLogical, float logicalW) {
+		if (titleAlpha <= 0.01f) return;
+
+		UINT dpi = GetDpiForWindow(g_hMainWindow);
+		int iconSizePx = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+		float iconSizeLogical = (float)iconSizePx / g_dpiScale;
+		float startX = GetMenuStartLogicalX();
+		float iconTop = (captionHeightLogical - iconSizeLogical) * 0.5f;
+
+		HICON hIcon = (HICON)SendMessageW(g_hMainWindow, WM_GETICON, ICON_SMALL, 0);
+		if (!hIcon) hIcon = (HICON)GetClassLongPtrW(g_hMainWindow, GCLP_HICONSM);
+		if (!hIcon) hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+		if (ComPtr<ID2D1Bitmap1> iconBitmap = CreateBitmapFromHicon(d2dContext.Get(), hIcon, (UINT)iconSizePx)) {
+			d2dContext->DrawBitmap(iconBitmap.Get(), D2D1::RectF(startX, iconTop, startX + iconSizeLogical, iconTop + iconSizeLogical), titleAlpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+		}
+
+		wchar_t windowTitle[256] = {}; GetWindowTextW(g_hMainWindow, windowTitle, _countof(windowTitle));
+		float textRight = logicalW;
+		RECT buttonGroupRect = GetCaptionButtonBounds(g_hMainWindow);
+		if (!IsRectEmpty(&buttonGroupRect)) textRight = min(textRight, (float)buttonGroupRect.left / g_dpiScale - kCaptionLogicalInset);
+
+		brushTitleText->SetOpacity(titleAlpha);
+		float textLeft = startX + iconSizeLogical + kCaptionTextGap;
+		if (textRight > textLeft) {
+			d2dContext->DrawTextW(windowTitle, static_cast<UINT32>(wcslen(windowTitle)), titleFormat.Get(), D2D1::RectF(textLeft, 0.0f, textRight, captionHeightLogical), brushTitleText.Get());
+		}
+	}
+};
+
+void RenderThreadFunc() {
+	FusionRenderer r;
+	r.Run();
 }
 
 
@@ -1292,8 +1328,8 @@ LRESULT CALLBACK PanelWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		SendMessage(hCombo, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 		SendMessage(hSlider, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
-		InitUIAnimation(); 
-		StartProgressPingPongAnimation(); 
+		InitUIAnimation();
+		StartProgressPingPongAnimation();
 		return 0;
 	}
 
@@ -1475,8 +1511,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		GetCursorPos(&currMousePt);          // 获取鼠标屏幕坐标
 		ScreenToClient(hwnd, &currMousePt);  // 转为窗口客户区坐标
 		g_bMouseInCanvas.store(false, std::memory_order_relaxed);
-		if (!IsInMenuBarBand(currMousePt) && g_MenuVisibleState && !g_IsMenuPopupActive.load()) { 
-			g_MenuVisibleState = false; PlayAnimation(g_VarMenuAlpha, 0.0, 0.2); }
+		if (!IsInMenuBarBand(currMousePt) && g_MenuVisibleState && !g_IsMenuPopupActive.load()) {
+			g_MenuVisibleState = false; PlayAnimation(g_VarMenuAlpha, 0.0, 0.2);
+		}
 		if (g_HoveredMenuIndex != -1) { PlayAnimation(g_VarHoverAlpha[g_HoveredMenuIndex], 0.0, 0.15); g_HoveredMenuIndex = -1; }
 		g_RenderEvent.Notify(); return 0;
 	}
