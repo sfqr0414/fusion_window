@@ -660,13 +660,15 @@ std::atomic<bool> g_ImGuiWantCaptureMouse(false);
 bool g_MenuVisibleState = false;
 int g_HoveredMenuIndex = -1;
 std::atomic<bool> g_IsMenuPopupActive(false);
+std::atomic<int> g_NextMenuIndex{-1};
 std::atomic<bool> g_IsTitleMenuVisible(false);
-
+std::atomic<int> g_PressedMenuIndexForRender{ -1 };
 
 POINT g_CaptionPressPoint{ 0, 0 };
 int g_PressedMenuIndex = -1;
 bool g_IsCaptionPressActive = false;
 bool g_IsCaptionDragStarted = false;
+
 
 constexpr float kCaptionLogicalInset = 8.0f;
 constexpr float kCaptionTextGap = 8.0f;
@@ -1031,13 +1033,17 @@ private:
 
 		dxgiFactory->CreateSwapChainForComposition(d3dDevice.Get(), &swapChainDesc, nullptr, &swapChain);
 
-		DCompositionCreateDevice(dxgiDevice.Get(), __uuidof(IDCompositionDevice), &dcompDevice);
+		DCompositionCreateDevice2(d2dDevice.Get(), IID_PPV_ARGS(&dcompDevice));
 		dcompDevice->CreateTargetForHwnd(g_hCanvas, TRUE, &dcompTarget);
 
 		dcompDevice->CreateVisual(&rootVisual);
 		dcompDevice->CreateVisual(&mainVisual);
 		mainVisual->SetContent(swapChain.Get());
 		rootVisual->AddVisual(mainVisual.Get(), FALSE, nullptr);
+		dcompDevice->CreateVisual(&titleVisual);
+		dcompDevice->CreateVirtualSurface(currentWidth, max(64, g_CaptionHeight.load()), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &titleSurface);
+		titleVisual->SetContent(titleSurface.Get());
+		rootVisual->AddVisual(titleVisual.Get(), TRUE, mainVisual.Get());
 		dcompTarget->SetRoot(rootVisual.Get()); dcompDevice->Commit();
 	}
 
@@ -1097,7 +1103,12 @@ private:
 					d2dContext->Flush(); ComPtr<ID3D11DeviceContext> d3dContext2; d3dDevice->GetImmediateContext(&d3dContext2);
 					d3dContext2->ClearState(); d3dContext2->Flush();
 					if (SUCCEEDED(swapChain->ResizeBuffers(2, pendingResizeW, pendingResizeH, DXGI_FORMAT_UNKNOWN, 0))) {
-						currentWidth = pendingResizeW; currentHeight = pendingResizeH; CreateTarget();
+						currentWidth = pendingResizeW;
+					currentHeight = pendingResizeH;
+					if (titleSurface) {
+						titleSurface->Resize(pendingResizeW, max(64, g_CaptionHeight.load()));
+					}
+					CreateTarget();
 					}
 				}
 			}
@@ -1121,6 +1132,42 @@ private:
 			static_cast<Derived*>(this)->OnRender(logicalW, logicalH, captionHeightLogical, panelLogicalW);
 
 			d2dContext->EndDraw();
+
+			if (titleSurface) {
+				ComPtr<ID2D1DeviceContext> d2dContextForTitle;
+				POINT offset{};
+				int captionH = max(1, g_CaptionHeight.load());
+				RECT updateRect = { 0, 0, currentWidth, captionH };
+
+				// 听你的！直接拿 DComp 配置好 Clip 和 Target 的完美 Context，绝不撕裂！
+				if (SUCCEEDED(titleSurface->BeginDraw(&updateRect, IID_PPV_ARGS(&d2dContextForTitle), &offset))) {
+
+					// DComp 已经在内部把原点(0,0)对齐到了这块图集区域，无脑 SetDpi 即可
+					d2dContextForTitle->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
+					
+					// 【重要修复】：DComp 返回的 offset 是物理像素，在图集(Atlas)上的偏移量
+					// 必须向 D2D 提供基于逻辑像素(DIP)的 Transform 偏移，不然就是满天乱飞的闪烁
+					d2dContextForTitle->SetTransform(D2D1::Matrix3x2F::Translation(offset.x / g_dpiScale, offset.y / g_dpiScale));
+
+					// 官方配发的 Context 处于完美的隔离态，且由于 DComp 初始化了 Clip，可以放心 Clear
+					d2dContextForTitle->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
+
+					// 临时借尸还魂：因为画刷都是同一个 d2dDevice 创建的，完美互通！
+					auto originalContext = d2dContext;
+					d2dContext = d2dContextForTitle;
+
+					// 绘制标题与菜单图层
+					static_cast<Derived*>(this)->OnRenderTitleLayer(logicalW, captionHeightLogical);
+
+					// 用完还回去
+					d2dContext = originalContext;
+
+					titleSurface->EndDraw();
+				}
+			}
+
+			// 2. 提交 DComp 变更并统一进行 SwapChain 刷新，保证同帧同步
+			dcompDevice->Commit();
 			swapChain->Present(0, 0);
 
 			if (receivedResizeCmd) {
@@ -1171,11 +1218,27 @@ private:
 
 protected:
 	HANDLE m_hAvrt = nullptr;
-	ComPtr<ID3D11Device> d3dDevice; ComPtr<ID3D11DeviceContext> d3dContext; ComPtr<IDXGIDevice1> dxgiDevice;
-	ComPtr<ID2D1Factory1> d2dFactory; ComPtr<ID2D1Device> d2dDevice; ComPtr<ID2D1DeviceContext> d2dContext;
-	ComPtr<IDWriteFactory> dwriteFactory; ComPtr<IDWriteTextFormat> titleFormat; ComPtr<IDWriteTextFormat> menuFormat;
-	ComPtr<IDXGIAdapter> dxgiAdapter; ComPtr<IDXGIFactory2> dxgiFactory; ComPtr<IDXGISwapChain1> swapChain;
-	ComPtr<IDCompositionDevice> dcompDevice; ComPtr<IDCompositionTarget> dcompTarget; ComPtr<IDCompositionVisual> rootVisual; ComPtr<IDCompositionVisual> mainVisual;
+	ComPtr<ID3D11Device> d3dDevice; 
+	ComPtr<ID3D11DeviceContext> d3dContext; 
+	
+	ComPtr<IDXGIDevice1> dxgiDevice;
+	ComPtr<IDXGIAdapter> dxgiAdapter;
+	ComPtr<IDXGIFactory2> dxgiFactory;
+
+	ComPtr<ID2D1Factory1> d2dFactory; 
+	ComPtr<ID2D1Device> d2dDevice; 
+	ComPtr<ID2D1DeviceContext> d2dContext;
+	
+	ComPtr<IDWriteFactory> dwriteFactory; 
+	ComPtr<IDWriteTextFormat> titleFormat, menuFormat;
+	 
+	ComPtr<IDXGISwapChain1> swapChain;
+
+	ComPtr<IDCompositionDesktopDevice> dcompDevice; 
+	ComPtr<IDCompositionTarget> dcompTarget; 
+	ComPtr<IDCompositionVisual2> rootVisual, mainVisual, titleVisual;
+	ComPtr<IDCompositionVirtualSurface> titleSurface;
+
 	ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
 	ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground, brushPaint, brushTitleText;
 	std::unique_ptr<ImGuiBridge> guiBridge;
@@ -1207,30 +1270,6 @@ public:
 			d2dContext->DrawLine(D2D1::Point2F(hit.x - 6, hit.y + 6), D2D1::Point2F(hit.x + 6, hit.y - 6), brushHit.Get(), 3.0f);
 		}
 
-		drawTitleAndCaptionButtons(1.0f - currentMenuAlpha, captionHeightLogical, logicalW);
-
-		if (currentMenuAlpha > 0.01f) {
-			float startX = GetMenuStartLogicalX();
-			for (int i = 0; i < g_MenuCount; ++i) {
-				float itemWidth = g_MenuItems[i].width;
-				float hAlpha = currentHoverAlphas[i];
-
-				if (hAlpha > 0.01f) {
-					brushPaint->SetColor((D2D1::ColorF(0.f, 0.f, 0.f, 0.1f * currentMenuAlpha * hAlpha)));
-					d2dContext->FillRectangle(D2D1::RectF(startX, 0, startX + itemWidth, captionHeightLogical), brushPaint.Get());
-				}
-
-				brushMenuText->SetOpacity(currentMenuAlpha);
-				d2dContext->DrawTextW(g_MenuItems[i].text, static_cast<UINT32>(wcslen(g_MenuItems[i].text)), menuFormat.Get(),
-					D2D1::RectF(startX + g_MenuPadding / 2.0f, 0.0f, startX + itemWidth, captionHeightLogical), brushMenuText.Get());
-				startX += itemWidth;
-			}
-		}
-
-		if (ID2D1Bitmap1* imguiBmp = guiBridge->GetD2DTexture()) {
-			d2dContext->DrawBitmap(imguiBmp, D2D1::RectF(0, 0, logicalW, logicalH), 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-		}
-
 		POINT pt; GetCursorPos(&pt); ScreenToClient(g_hCanvas, &pt);
 		if (g_bMouseInCanvas.load(std::memory_order_relaxed) && pt.x > (int)(200 * g_dpiScale) && pt.y > g_CaptionHeight.load() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
 			float fx = (float)pt.x / g_dpiScale, fy = (float)pt.y / g_dpiScale;
@@ -1247,6 +1286,30 @@ public:
 				d2dContext->DrawLine(D2D1::Point2F(fx - aimRadius, fy + aimRadius), D2D1::Point2F(fx + aimRadius, fy + aimRadius), brushAim.Get(), 2.0f);
 				d2dContext->DrawLine(D2D1::Point2F(fx + aimRadius, fy + aimRadius), D2D1::Point2F(fx, fy - aimRadius), brushAim.Get(), 2.0f);
 				d2dContext->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(fx, fy), 2.0f, 2.0f), brushAim.Get(), 2.0f);
+			}
+		}
+	}
+
+	void OnRenderTitleLayer(float logicalW, float captionHeightLogical) {
+		drawTitleAndCaptionButtons(1.0f - currentMenuAlpha, captionHeightLogical, logicalW);
+		int pressedIdx = g_PressedMenuIndexForRender.load(std::memory_order_acquire);
+		if (currentMenuAlpha > 0.01f) {
+			float startX = GetMenuStartLogicalX();
+			for (int i = 0; i < g_MenuCount; ++i) {
+				float itemWidth = g_MenuItems[i].width;
+				float hAlpha = currentHoverAlphas[i];
+				bool isPressed = (i == pressedIdx);
+
+				if (hAlpha > 0.01f || isPressed) {
+					float bgAlpha = isPressed ? 1.f : hAlpha;
+					brushPaint->SetColor(D2D1::ColorF(0.f, 0.f, 0.f, 0.1f * currentMenuAlpha * bgAlpha));
+					d2dContext->FillRectangle(D2D1::RectF(startX, 0, startX + itemWidth, captionHeightLogical), brushPaint.Get());
+				}
+
+				brushMenuText->SetOpacity(currentMenuAlpha);
+				d2dContext->DrawTextW(g_MenuItems[i].text, static_cast<UINT32>(wcslen(g_MenuItems[i].text)), menuFormat.Get(),
+					D2D1::RectF(startX + g_MenuPadding / 2.0f, 0.0f, startX + itemWidth, captionHeightLogical), brushMenuText.Get());
+				startX += itemWidth;
 			}
 		}
 	}
@@ -1311,48 +1374,77 @@ void PushTitleBarInfoToGPU(HWND hwnd) {
 // =========================================================
 // UI 线程：原生 Win32 右键菜单生成器 
 // =========================================================
+LRESULT CALLBACK MenuMsgFilterHook(int code, WPARAM wParam, LPARAM lParam) {
+	if (code == MSGF_MENU) {
+		MSG* msg = (MSG*)lParam;
+		if (msg->message == WM_MOUSEMOVE) {
+			POINT pt = msg->pt;
+			ScreenToClient(g_hMainWindow, &pt);
+			if (IsInMenuBarBand(pt)) {
+				int hoverIdx = GetMenuIndexFromLogicalX((float)pt.x / g_dpiScale);
+				if (hoverIdx != -1 && hoverIdx != g_PressedMenuIndexForRender.load()) {
+					g_NextMenuIndex.store(hoverIdx);
+					PostMessageW(g_hMainWindow, WM_CANCELMODE, 0, 0);
+				}
+			}
+		}
+	}
+	return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
 void ShowCustomWin32Menu(HWND hwnd, int selectedIndex) {
-	if (selectedIndex < 0 || selectedIndex >= g_MenuCount) return;
+	int currentIndex = selectedIndex;
 
-	HMENU hMenu = CreatePopupMenu();
-	if (selectedIndex == 0) {
-		AppendMenuW(hMenu, MF_STRING, 3001, L"新建画布 (New)\tCtrl+N");
-		HMENU hRecent = CreatePopupMenu();
-		AppendMenuW(hRecent, MF_STRING, 3002, L"项目: 赛博空间");
-		AppendMenuW(hRecent, MF_STRING, 3003, L"项目: 极简打靶场");
-		AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hRecent, L"打开近期 (Open Recent) ►");
-		AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-		AppendMenuW(hMenu, MF_STRING, 2002, L"退出 (Exit)\tAlt+F4");
-	}
-	else if (selectedIndex == 1) {
-		AppendMenuW(hMenu, MF_STRING, 2001, L"撤销弹孔 (Undo)\tCtrl+Z");
-		AppendMenuW(hMenu, MF_STRING, 3004, L"清空所有 (Clear All)\tC");
-	}
-	else if (selectedIndex == 2) {
-		AppendMenuW(hMenu, MF_STRING | MF_CHECKED, 3005, L"显示网格 (Show Grid)");
-		AppendMenuW(hMenu, MF_STRING, 3006, L"性能监控面板 (Perf Overlay)");
-	}
-	else if (selectedIndex == 3) {
-		AppendMenuW(hMenu, MF_STRING, 3007, L"关于 D2D 引擎 (About)...");
+	while (currentIndex >= 0 && currentIndex < g_MenuCount) {
+		g_NextMenuIndex.store(-1);
+		g_PressedMenuIndexForRender.store(currentIndex, std::memory_order_release);
+
+		HMENU hMenu = CreatePopupMenu();
+		if (currentIndex == 0) {
+			AppendMenuW(hMenu, MF_STRING, 3001, L"新建画布 (New)\tCtrl+N");
+			HMENU hRecent = CreatePopupMenu();
+			AppendMenuW(hRecent, MF_STRING, 3002, L"项目: 赛博空间");
+			AppendMenuW(hRecent, MF_STRING, 3003, L"项目: 极简打靶场");
+			AppendMenuW(hMenu, MF_POPUP, (UINT_PTR)hRecent, L"打开近期 (Open Recent) ►");
+			AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+			AppendMenuW(hMenu, MF_STRING, 2002, L"退出 (Exit)\tAlt+F4");
+		}
+		else if (currentIndex == 1) {
+			AppendMenuW(hMenu, MF_STRING, 2001, L"撤销弹孔 (Undo)\tCtrl+Z");
+			AppendMenuW(hMenu, MF_STRING, 3004, L"清空所有 (Clear All)\tC");
+		}
+		else if (currentIndex == 2) {
+			AppendMenuW(hMenu, MF_STRING | MF_CHECKED, 3005, L"显示网格 (Show Grid)");
+			AppendMenuW(hMenu, MF_STRING, 3006, L"性能监控面板 (Perf Overlay)");
+		}
+		else if (currentIndex == 3) {
+			AppendMenuW(hMenu, MF_STRING, 3007, L"关于 D2D 引擎 (About)...");
+		}
+
+		float popupX = GetMenuStartLogicalX();
+		for (int i = 0; i < currentIndex; ++i) popupX += g_MenuItems[i].width;
+
+		POINT pt = { (int)(popupX * g_dpiScale), g_CaptionHeight.load() };
+		ClientToScreen(hwnd, &pt);
+		g_IsMenuPopupActive.store(true, std::memory_order_relaxed);
+		if (!g_MenuVisibleState) { g_MenuVisibleState = true; PlayAnimation(g_VarMenuAlpha, 1.0, 0.2); }
+		g_RenderEvent.Notify();
+		SetForegroundWindow(hwnd);
+		HHOOK hHook = SetWindowsHookExW(WH_MSGFILTER, MenuMsgFilterHook, NULL, GetCurrentThreadId());
+		UINT command = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hMainWindow, NULL);
+		UnhookWindowsHookEx(hHook);
+		if (command != 0) {
+			SendMessageW(g_hMainWindow, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+		}
+		DestroyMenu(hMenu);
+
+		currentIndex = g_NextMenuIndex.load();
 	}
 
-	float popupX = GetMenuStartLogicalX();
-	for (int i = 0; i < selectedIndex; ++i) popupX += g_MenuItems[i].width;
-
-	POINT pt = { (int)(popupX * g_dpiScale), g_CaptionHeight.load() };
-	ClientToScreen(hwnd, &pt);
-	g_IsMenuPopupActive.store(true, std::memory_order_relaxed);
-	if (!g_MenuVisibleState) { g_MenuVisibleState = true; PlayAnimation(g_VarMenuAlpha, 1.0, 0.2); }
-	g_RenderEvent.Notify();
-	SetForegroundWindow(hwnd);
-	UINT command = TrackPopupMenu(hMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RETURNCMD, pt.x, pt.y, 0, g_hMainWindow, NULL);
-	if (command != 0) {
-		SendMessageW(g_hMainWindow, WM_COMMAND, MAKEWPARAM(command, 0), 0);
-	}
+	g_PressedMenuIndexForRender.store(-1, std::memory_order_release);
 	g_IsMenuPopupActive.store(false, std::memory_order_relaxed);
 	UpdateTitleMenuVisibilityFromCursor(hwnd);
 	g_RenderEvent.Notify();
-	DestroyMenu(hMenu);
 }
 
 // =========================================================
@@ -1599,9 +1691,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		ScreenToClient(hwnd, &currMousePt);  // 转为窗口客户区坐标
 		g_bMouseInCanvas.store(false, std::memory_order_relaxed);
 		if (!IsInMenuBarBand(currMousePt) && g_MenuVisibleState && !g_IsMenuPopupActive.load()) {
-			g_MenuVisibleState = false; PlayAnimation(g_VarMenuAlpha, 0.0, 0.2);
+			g_MenuVisibleState = false; 
+			g_PressedMenuIndexForRender.store(-1, std::memory_order_release);
+			PlayAnimation(g_VarMenuAlpha, 0.0, 0.2);
 		}
-		if (g_HoveredMenuIndex != -1) { PlayAnimation(g_VarHoverAlpha[g_HoveredMenuIndex], 0.0, 0.15); g_HoveredMenuIndex = -1; }
+		if (g_HoveredMenuIndex != -1) { 
+			PlayAnimation(g_VarHoverAlpha[g_HoveredMenuIndex], 0.0, 0.15); 
+			g_HoveredMenuIndex = -1; 
+		}
 		g_RenderEvent.Notify(); return 0;
 	}
 	case WM_LBUTTONDOWN: {
@@ -1638,6 +1735,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 			if (g_PressedMenuIndex != -1 && g_PressedMenuIndex == releasedMenuIndex) {
 				g_IsCaptionPressActive = false;
 				g_PressedMenuIndex = -1;
+				g_PressedMenuIndexForRender.store(releasedMenuIndex, std::memory_order_release);
 				ShowCustomWin32Menu(hwnd, releasedMenuIndex);
 				return 0;
 			}
@@ -1675,7 +1773,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 			int panelW = min(GetPanelWidth(), width);
 			SetWindowPos(g_hPanel, HWND_TOP, 0, 0, panelW, height, SWP_SHOWWINDOW);
 		}
-		//g_CommandQueue.push(CmdResize{ width, height }); g_RenderEvent.Notify(); return 0;
 	}
 	case WM_SETCURSOR: {
 		if (LOWORD(lParam) == HTCLIENT) {
@@ -1758,8 +1855,6 @@ int main() {
 	g_hCanvas = g_hMainWindow;
 	int initialPanelWidth = min(GetPanelWidth(), initW);
 	g_hPanel = CreateWindowExW(0, wcPanel.lpszClassName, NULL, WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 0, 0, initialPanelWidth, initH, g_hMainWindow, NULL, hInstance, NULL);
-
-	g_UIThreadId = GetCurrentThreadId();
 
 	g_UIThreadId = GetCurrentThreadId();
 
