@@ -553,7 +553,25 @@ struct CmdKeyDown { WPARAM key; };
 struct CmdWin32Msg { HWND hwnd; UINT msg; WPARAM wParam; LPARAM lParam; };
 struct CmdUpdateAnim { float menuAlpha; std::array<float, 4> hoverAlpha; };
 struct CmdExit {};
-using RenderCommand = std::variant<CmdResize, CmdChangeColor, CmdSetGrid, CmdSetAimRadius, CmdSetAimStyle, CmdAddHitMark, CmdResetCanvas, CmdKeyDown, CmdWin32Msg, CmdUpdateAnim, CmdExit>;
+struct CmdUpdateTitleBar {
+	HICON hIcon;
+	int iconSizePx;
+	std::array<wchar_t, 256> title;
+	RECT buttonRect;
+};
+using RenderCommand = std::variant<
+	CmdResize, 
+	CmdChangeColor, 
+	CmdSetGrid, 
+	CmdSetAimRadius, 
+	CmdSetAimStyle, 
+	CmdAddHitMark, 
+	CmdResetCanvas, 
+	CmdKeyDown, 
+	CmdWin32Msg, 
+	CmdUpdateAnim, 
+	CmdUpdateTitleBar,
+	CmdExit>;
 
 
 // =========================================================
@@ -630,6 +648,8 @@ public:
 };
 
 FutexEvent g_RenderEvent, g_GpuInitDoneEvent;
+FutexEvent g_ResizeDoneEvent; // [新增] 用于阻塞 UI 线程直到 Resize 帧上屏
+std::atomic<bool> g_RenderThreadReady(false); // [新增] 防止窗口刚创建时死锁
 std::atomic<bool> g_isRunning(true);
 HWND g_hMainWindow = NULL, g_hCanvas = NULL, g_hPanel = NULL;
 DWORD g_UIThreadId = 0;
@@ -1061,6 +1081,7 @@ private:
 			if (!g_isRunning.load(std::memory_order_relaxed)) break;
 
 			auto begin = std::chrono::steady_clock::now();
+			bool receivedResizeCmd = false; // [新增]
 
 			int pendingResizeW = -1, pendingResizeH = -1;
 
@@ -1069,12 +1090,15 @@ private:
 				HandleCommand(cmd, pendingResizeW, pendingResizeH);
 			}
 
-			if (pendingResizeW > 0 && pendingResizeH > 0 && (pendingResizeW != currentWidth || pendingResizeH != currentHeight)) {
-				d2dContext->SetTarget(nullptr); d2dTargetBitmap.Reset();
-				d2dContext->Flush(); ComPtr<ID3D11DeviceContext> d3dContext2; d3dDevice->GetImmediateContext(&d3dContext2);
-				d3dContext2->ClearState(); d3dContext2->Flush();
-				if (SUCCEEDED(swapChain->ResizeBuffers(2, pendingResizeW, pendingResizeH, DXGI_FORMAT_UNKNOWN, 0))) {
-					currentWidth = pendingResizeW; currentHeight = pendingResizeH; CreateTarget();
+			if (pendingResizeW > 0 && pendingResizeH > 0) {
+				receivedResizeCmd = true; // [新增] 标记我们收到了 Resize 指令
+				if (pendingResizeW != currentWidth || pendingResizeH != currentHeight) {
+					d2dContext->SetTarget(nullptr); d2dTargetBitmap.Reset();
+					d2dContext->Flush(); ComPtr<ID3D11DeviceContext> d3dContext2; d3dDevice->GetImmediateContext(&d3dContext2);
+					d3dContext2->ClearState(); d3dContext2->Flush();
+					if (SUCCEEDED(swapChain->ResizeBuffers(2, pendingResizeW, pendingResizeH, DXGI_FORMAT_UNKNOWN, 0))) {
+						currentWidth = pendingResizeW; currentHeight = pendingResizeH; CreateTarget();
+					}
 				}
 			}
 			if (!g_isRunning.load(std::memory_order_relaxed)) break;
@@ -1098,6 +1122,11 @@ private:
 
 			d2dContext->EndDraw();
 			swapChain->Present(0, 0);
+
+			if (receivedResizeCmd) {
+				// [新增] 一旦完成重绘并 Present，立刻唤醒阻塞中的 UI 线程完成 NCCALCSIZE
+				g_ResizeDoneEvent.Notify();
+			}
 
 			auto pass = std::chrono::duration_cast<std::chrono::milliseconds>((std::chrono::steady_clock::now() - begin)).count();
 			utils::console("\ndraw frame in {} ms\n\n", pass);
@@ -1128,6 +1157,15 @@ private:
 			}
 			else if constexpr (std::is_same_v<T, CmdWin32Msg>) guiBridge->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
 			else if constexpr (std::is_same_v<T, CmdExit>) g_isRunning.store(false, std::memory_order_relaxed);
+			else if constexpr (std::is_same_v<T, CmdUpdateTitleBar>) {
+				cachedWindowTitle = arg.title.data();
+				cachedButtonBounds = arg.buttonRect;
+				// 创建并缓存 D2D Bitmap，避免每帧重复创建引发性能灾难
+				if (arg.hIcon && d2dContext) {
+					cachedIconBitmap = CreateBitmapFromHicon(d2dContext.Get(), arg.hIcon, arg.iconSizePx);
+					cachedIconSizePx = arg.iconSizePx;
+				}
+			}
 			}, cmd);
 	}
 
@@ -1146,6 +1184,10 @@ protected:
 	bool showGrid = true; float aimRadius = 18.0f; int aimStyle = 0;
 	std::vector<D2D1_POINT_2F> hitMarks;
 	float currentMenuAlpha = 0.0f; std::array<float, 4> currentHoverAlphas = { 0 };
+	std::wstring cachedWindowTitle;
+	RECT cachedButtonBounds{ 0, 0, 0, 0 };
+	ComPtr<ID2D1Bitmap1> cachedIconBitmap;
+	int cachedIconSizePx = 0;
 };
 
 // 默认绘制实现，保留原本绘制逻辑
@@ -1211,6 +1253,7 @@ public:
 
 private:
 	void drawTitleAndCaptionButtons(float titleAlpha, float captionHeightLogical, float logicalW) {
+
 		if (titleAlpha <= 0.01f) return;
 
 		UINT dpi = GetDpiForWindow(g_hMainWindow);
@@ -1219,22 +1262,21 @@ private:
 		float startX = GetMenuStartLogicalX();
 		float iconTop = (captionHeightLogical - iconSizeLogical) * 0.5f;
 
-		HICON hIcon = (HICON)SendMessageW(g_hMainWindow, WM_GETICON, ICON_SMALL, 0);
-		if (!hIcon) hIcon = (HICON)GetClassLongPtrW(g_hMainWindow, GCLP_HICONSM);
-		if (!hIcon) hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-		if (ComPtr<ID2D1Bitmap1> iconBitmap = CreateBitmapFromHicon(d2dContext.Get(), hIcon, (UINT)iconSizePx)) {
-			d2dContext->DrawBitmap(iconBitmap.Get(), D2D1::RectF(startX, iconTop, startX + iconSizeLogical, iconTop + iconSizeLogical), titleAlpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+		// 1. 直接使用缓存好的 Bitmap 绘制图标
+		if (cachedIconBitmap) {
+			d2dContext->DrawBitmap(cachedIconBitmap.Get(), D2D1::RectF(startX, iconTop, startX + iconSizeLogical, iconTop + iconSizeLogical), titleAlpha, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
 		}
 
-		wchar_t windowTitle[256] = {}; GetWindowTextW(g_hMainWindow, windowTitle, _countof(windowTitle));
+		// 2. 直接使用缓存好的边界和标题绘制文字
 		float textRight = logicalW;
-		RECT buttonGroupRect = GetCaptionButtonBounds(g_hMainWindow);
-		if (!IsRectEmpty(&buttonGroupRect)) textRight = min(textRight, (float)buttonGroupRect.left / g_dpiScale - kCaptionLogicalInset);
+		if (!IsRectEmpty(&cachedButtonBounds)) {
+			textRight = min(textRight, (float)cachedButtonBounds.left / g_dpiScale - kCaptionLogicalInset);
+		}
 
 		brushTitleText->SetOpacity(titleAlpha);
 		float textLeft = startX + iconSizeLogical + kCaptionTextGap;
-		if (textRight > textLeft) {
-			d2dContext->DrawTextW(windowTitle, static_cast<UINT32>(wcslen(windowTitle)), titleFormat.Get(), D2D1::RectF(textLeft, 0.0f, textRight, captionHeightLogical), brushTitleText.Get());
+		if (textRight > textLeft && !cachedWindowTitle.empty()) {
+			d2dContext->DrawTextW(cachedWindowTitle.c_str(), static_cast<UINT32>(cachedWindowTitle.length()), titleFormat.Get(), D2D1::RectF(textLeft, 0.0f, textRight, captionHeightLogical), brushTitleText.Get());
 		}
 	}
 };
@@ -1244,6 +1286,27 @@ void RenderThreadFunc() {
 	r.Run();
 }
 
+
+void PushTitleBarInfoToGPU(HWND hwnd) {
+	CmdUpdateTitleBar cmd{};
+
+	// 获取图标
+	cmd.hIcon = (HICON)SendMessageW(hwnd, WM_GETICON, ICON_SMALL, 0);
+	if (!cmd.hIcon) cmd.hIcon = (HICON)GetClassLongPtrW(hwnd, GCLP_HICONSM);
+	if (!cmd.hIcon) cmd.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+
+	// 获取文字
+	cmd.title.fill(0);
+	GetWindowTextW(hwnd, cmd.title.data(), 255);
+
+	// 获取热区
+	DwmGetWindowAttribute(hwnd, DWMWA_CAPTION_BUTTON_BOUNDS, &cmd.buttonRect, sizeof(cmd.buttonRect));
+
+	// 获取 DPI 图标尺寸
+	cmd.iconSizePx = GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForWindow(hwnd));
+
+	g_CommandQueue.push(cmd);
+}
 
 // =========================================================
 // UI 线程：原生 Win32 右键菜单生成器 
@@ -1377,6 +1440,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 			SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
 		//SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
 		ExtendFrameIntoClient(hwnd);
+		PushTitleBarInfoToGPU(hwnd); // [新增]
 		ImmAssociateContext(hwnd, NULL);
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
@@ -1404,7 +1468,29 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 				params->rgrc[0].right -= frameX;
 				//params->rgrc[0].top += frameY;
 				params->rgrc[0].bottom -= frameY;
+
 			}
+
+			// [新增] 计算新的客户区宽高
+			int newWidth = params->rgrc[0].right - params->rgrc[0].left;
+			int newHeight = params->rgrc[0].bottom - params->rgrc[0].top;
+
+			// [新增] 拦截缩放，通知渲染线程并阻塞等待新帧上屏
+			static int s_lastWidth = 0, s_lastHeight = 0;
+			if (newWidth > 0 && newHeight > 0 && (newWidth != s_lastWidth || newHeight != s_lastHeight)) {
+				s_lastWidth = newWidth;
+				s_lastHeight = newHeight;
+
+				if (g_RenderThreadReady.load(std::memory_order_acquire)) {
+					PushTitleBarInfoToGPU(hwnd);
+					LONG expected = g_ResizeDoneEvent.Capture();
+					g_CommandQueue.push(CmdResize{ newWidth, newHeight });
+					g_RenderEvent.Notify();
+					// UI线程阻塞，直到渲染线程完成本次 Resize 并 Present
+					g_ResizeDoneEvent.HybridWait(expected, 1500, INFINITE);
+				}
+			}
+
 			return 0;
 		}
 		break;
@@ -1454,6 +1540,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		g_dpiScale = HIWORD(wParam) / 96.0f;
 		g_CaptionHeight.store(compute_standard_caption_height_for_window(hwnd), std::memory_order_relaxed);
 		UpdateGlobalFont(); // 刷新字体大小
+		PushTitleBarInfoToGPU(hwnd); // [新增]
 		RECT* const prcNewWindow = (RECT*)lParam;
 		SetWindowPos(hwnd, NULL, prcNewWindow->left, prcNewWindow->top, prcNewWindow->right - prcNewWindow->left, prcNewWindow->bottom - prcNewWindow->top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 		ExtendFrameIntoClient(hwnd);
@@ -1588,7 +1675,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 			int panelW = min(GetPanelWidth(), width);
 			SetWindowPos(g_hPanel, HWND_TOP, 0, 0, panelW, height, SWP_SHOWWINDOW);
 		}
-		g_CommandQueue.push(CmdResize{ width, height }); g_RenderEvent.Notify(); return 0;
+		//g_CommandQueue.push(CmdResize{ width, height }); g_RenderEvent.Notify(); return 0;
 	}
 	case WM_SETCURSOR: {
 		if (LOWORD(lParam) == HTCLIENT) {
@@ -1678,6 +1765,7 @@ int main() {
 
 	std::thread renderThread(RenderThreadFunc);
 	g_GpuInitDoneEvent.Wait(0);
+	g_RenderThreadReady.store(true, std::memory_order_release); // [新增] 标记渲染线程已就绪
 
 	RECT rc; GetClientRect(g_hCanvas, &rc);
 	g_CommandQueue.push(CmdResize{ (int)rc.right, (int)rc.bottom });
