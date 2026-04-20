@@ -1170,16 +1170,11 @@ private:
 			if (uiHost && uiSurface) {
 				ComPtr<ID2D1DeviceContext> d2dContextForUi;
 				POINT uiOffset{};
-				RECT uiUpdateRect = { 0, g_CaptionHeight.load(), currentWidth, currentHeight };
+				RECT uiUpdateRect = { 0, 0, currentWidth, currentHeight };
 				if (SUCCEEDED(uiSurface->BeginDraw(&uiUpdateRect, IID_PPV_ARGS(&d2dContextForUi), &uiOffset))) {
 					d2dContextForUi->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
 					d2dContextForUi->SetTransform(D2D1::Matrix3x2F::Translation(uiOffset.x / g_dpiScale, uiOffset.y / g_dpiScale));
 					d2dContextForUi->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
-					ComPtr<ID2D1SolidColorBrush> uiDebugBrush;
-					d2dContextForUi->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.15f, 0.35f, 0.9f), &uiDebugBrush);
-					if (uiDebugBrush) {
-						d2dContextForUi->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(contentRect.right - 180.0f, contentRect.top + 24.0f, contentRect.right - 24.0f, contentRect.top + 96.0f), 18.0f, 18.0f), uiDebugBrush.Get());
-					}
 					uiHost->SetViewport(contentRect, g_dpiScale);
 					uiHost->Render(d2dContextForUi.Get());
 					const auto uiBounds = uiHost->VisibleUiBounds();

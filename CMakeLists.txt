@@ -16,8 +16,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ==================== 项目定义 ====================
 project(fusion_window)
 
-# ==================== 源文件（仅main.cpp） ====================
-set(SOURCES main.cpp)
+# ==================== 源文件 ====================
+set(SOURCES
+    main.cpp
+    ui/native_ui.hpp
+)
 
 # ==================== 生成Windows窗口程序（无控制台弹窗） ====================
 add_executable(fusion_window WIN32 ${SOURCES})

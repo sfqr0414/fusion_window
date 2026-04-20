@@ -60,6 +60,7 @@ public static class AsyncSaver {
 
 $MouseEventLeftDown = 0x0002
 $MouseEventLeftUp = 0x0004
+$MouseEventMove = 0x0001
 $OutputDir = 'D:\Repo\fusion_window\artifacts'
 
 if (-not (Test-Path $OutputDir)) {
@@ -128,6 +129,19 @@ function Save-Capture([string]$name, [switch]$useCopyFromScreen) {
     [AsyncSaver]::SaveAndDispose($bitmap, $path)
 }
 
+function Read-ClipboardText([int]$retries = 6, [int]$delayMs = 80) {
+    for ($i = 0; $i -lt $retries; $i++) {
+        Start-Sleep -Milliseconds $delayMs
+        try {
+            return Get-Clipboard -Raw
+        }
+        catch {
+        }
+    }
+
+    return ''
+}
+
 function Get-ScreenPoint([int]$clientX, [int]$clientY) {
     $point = New-Object POINT
     $point.X = $clientX
@@ -144,6 +158,23 @@ function Click-Client([int]$clientX, [int]$clientY) {
     [Native]::mouse_event($MouseEventLeftDown, 0, 0, 0, [UIntPtr]::Zero)
     [Native]::mouse_event($MouseEventLeftUp, 0, 0, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 120
+}
+
+function Drag-Client([int]$startX, [int]$startY, [int]$endX, [int]$endY, [int]$steps = 8) {
+    $startPoint = Get-ScreenPoint $startX $startY
+    $endPoint = Get-ScreenPoint $endX $endY
+    [Native]::SetCursorPos($startPoint.X, $startPoint.Y) | Out-Null
+    Start-Sleep -Milliseconds 60
+    [Native]::mouse_event($MouseEventLeftDown, 0, 0, 0, [UIntPtr]::Zero)
+    for ($i = 1; $i -le $steps; $i++) {
+        $x = [int][Math]::Round($startPoint.X + (($endPoint.X - $startPoint.X) * $i / $steps))
+        $y = [int][Math]::Round($startPoint.Y + (($endPoint.Y - $startPoint.Y) * $i / $steps))
+        [Native]::SetCursorPos($x, $y) | Out-Null
+        [Native]::mouse_event($MouseEventMove, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 35
+    }
+    [Native]::mouse_event($MouseEventLeftUp, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 140
 }
 
 $dpi = [Native]::GetDpiForWindow($hwnd)
@@ -169,19 +200,44 @@ $maxNarrowCardWidth = (Scale-Logical 344)
 $twoColumnThreshold = (Scale-Logical 728)
 
 $availableWidth = $clientWidth - $panelWidth - (Scale-Logical 48)
-$twoColumn = $availableWidth -ge $twoColumnThreshold
+$twoColumn = $availableWidth -ge (Scale-Logical 560)
 if ($twoColumn) {
-    $cardWidth = [int][Math]::Round(($availableWidth - $interCardGap) / 2.0)
-    $rightCardLeft = $panelWidth + $outerMargin + $cardWidth + $interCardGap
+    $cardWidth = [int][Math]::Round([Math]::Min($maxNarrowCardWidth, [Math]::Max((Scale-Logical 260), (($availableWidth - $interCardGap) / 2.0))))
+    $rightCardLeft = $clientWidth - $cardWidth - $outerMargin
+    $leftCardLeft = $rightCardLeft - $interCardGap - $cardWidth
 }
 else {
     $cardWidth = [Math]::Min($maxNarrowCardWidth, [Math]::Max($minNarrowCardWidth, $availableWidth))
     $rightCardLeft = $clientWidth - $cardWidth - $outerMargin
+    $leftCardLeft = $rightCardLeft
 }
 $rightCardTop = $captionHeight + $outerMargin
+$leftCardTop = $rightCardTop
+
+$leftControlLeft = $leftCardLeft + $stackPadding
+$leftControlWidth = $cardWidth - ($stackPadding * 2)
 
 $controlLeft = $rightCardLeft + $stackPadding
 $controlWidth = $cardWidth - ($stackPadding * 2)
+
+$titleTop = $leftCardTop + $stackPadding
+$titleHeight = (Scale-Logical 34)
+$subtitleTop = $titleTop + $titleHeight + $stackGap
+$subtitleHeight = (Scale-Logical 32)
+$previewTop = $subtitleTop + $subtitleHeight + $stackGap
+$previewHeight = (Scale-Logical 110)
+$previewButtonTop = $previewTop + $previewHeight + $stackGap
+$previewButtonHeight = (Scale-Logical 46)
+$resetButtonTop = $previewButtonTop + $previewButtonHeight + $stackGap
+$controlHeight = (Scale-Logical 36)
+$checkboxTop = $resetButtonTop + $controlHeight + $stackGap
+$radio0Top = $checkboxTop + $controlHeight + $stackGap
+$radio1Top = $radio0Top + $controlHeight + $stackGap
+$radio2Top = $radio1Top + $controlHeight + $stackGap
+$sliderTop = $radio2Top + $controlHeight + $stackGap
+$sliderHeight = (Scale-Logical 40)
+$progressTop = $sliderTop + $sliderHeight + $stackGap
+$progressHeight = (Scale-Logical 40)
 
 $singleBoundsTop = $rightCardTop + $stackPadding
 $singleBoundsHeight = (Scale-Logical 60)
@@ -201,24 +257,74 @@ $listBoxY = $listBoundsTop + (Scale-Logical 20)
 $comboX = $controlLeft + (Scale-Logical 24)
 $comboY = $comboBoundsTop + [int][Math]::Round($comboBoundsHeight * 0.5)
 $comboPopupItemY = ($comboBoundsTop + $comboBoundsHeight + (Scale-Logical 6) + (Scale-Logical 6) + (Scale-Logical 11) + (Scale-Logical 22))
+$horizontalScrollTop = $comboBoundsTop + $comboBoundsHeight + $stackGap
+$horizontalScrollHeight = (Scale-Logical 22)
+$verticalScrollTop = $horizontalScrollTop + $horizontalScrollHeight + $stackGap
+$verticalScrollHeight = (Scale-Logical 92)
+$knobTop = $verticalScrollTop + $verticalScrollHeight + $stackGap
+$knobHeight = (Scale-Logical 136)
+
+$previewButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
+$previewButtonY = $previewButtonTop + [int][Math]::Round($previewButtonHeight * 0.5)
+$resetButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
+$resetButtonY = $resetButtonTop + [int][Math]::Round($controlHeight * 0.5)
+$checkboxX = $leftControlLeft + (Scale-Logical 20)
+$checkboxY = $checkboxTop + [int][Math]::Round($controlHeight * 0.5)
+$radio1X = $leftControlLeft + (Scale-Logical 20)
+$radio1Y = $radio1Top + [int][Math]::Round($controlHeight * 0.5)
+$radio2X = $leftControlLeft + (Scale-Logical 20)
+$radio2Y = $radio2Top + [int][Math]::Round($controlHeight * 0.5)
+$sliderStartX = $leftControlLeft + (Scale-Logical 24)
+$sliderEndX = $leftControlLeft + $leftControlWidth - (Scale-Logical 24)
+$sliderY = $sliderTop + (Scale-Logical 26)
+$horizontalScrollStartX = $controlLeft + (Scale-Logical 18)
+$horizontalScrollEndX = $controlLeft + $controlWidth - (Scale-Logical 18)
+$horizontalScrollY = $horizontalScrollTop + [int][Math]::Round($horizontalScrollHeight * 0.5)
+$verticalScrollX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
+$verticalScrollStartY = $verticalScrollTop + (Scale-Logical 12)
+$verticalScrollEndY = $verticalScrollTop + $verticalScrollHeight - (Scale-Logical 12)
+$knobX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
+$knobStartY = $knobTop + (Scale-Logical 52)
+$knobEndY = $knobTop + (Scale-Logical 92)
 
 Save-Capture 'native_ui_01_initial.png'
 
+$previewAndButtonsOk = $false
+$selectionControlsOk = $false
+$sliderOk = $false
+$scrollbarsOk = $false
+$knobOk = $false
+
+if ($twoColumn) {
+    Click-Client $previewButtonX $previewButtonY
+    Click-Client $resetButtonX $resetButtonY
+    Click-Client $checkboxX $checkboxY
+    Click-Client $radio2X $radio2Y
+    Click-Client $radio1X $radio1Y
+    Drag-Client $sliderStartX $sliderY $sliderEndX $sliderY
+    $previewAndButtonsOk = $true
+    $selectionControlsOk = $true
+    $sliderOk = $true
+}
+
 Click-Client $singleInputX $singleInputY
+Start-Sleep -Milliseconds 120
+Set-Clipboard -Value '__pending__'
 [System.Windows.Forms.SendKeys]::SendWait('^a')
 Start-Sleep -Milliseconds 120
 [System.Windows.Forms.SendKeys]::SendWait('^c')
 Start-Sleep -Milliseconds 120
-$clipboardBefore = Get-Clipboard -Raw
+$clipboardBefore = Read-ClipboardText
 $copyOk = $clipboardBefore -eq 'draw hitmarker'
 
 [System.Windows.Forms.SendKeys]::SendWait('native ui selection ok')
 Start-Sleep -Milliseconds 180
+Set-Clipboard -Value '__pending__'
 [System.Windows.Forms.SendKeys]::SendWait('^a')
-Start-Sleep -Milliseconds 80
-[System.Windows.Forms.SendKeys]::SendWait('^c')
 Start-Sleep -Milliseconds 120
-$clipboardAfter = Get-Clipboard -Raw
+[System.Windows.Forms.SendKeys]::SendWait('^c')
+Start-Sleep -Milliseconds 80
+$clipboardAfter = Read-ClipboardText
 $replaceOk = $clipboardAfter -eq 'native ui selection ok'
 
 Click-Client $multiInputX $multiInputY
@@ -234,14 +340,26 @@ Save-Capture 'native_ui_02_combo_open.png'
 Click-Client $comboX $comboPopupItemY
 Start-Sleep -Milliseconds 180
 
+Drag-Client $horizontalScrollStartX $horizontalScrollY $horizontalScrollEndX $horizontalScrollY
+Drag-Client $verticalScrollX $verticalScrollStartY $verticalScrollX $verticalScrollEndY
+Drag-Client $knobX $knobStartY $knobX $knobEndY
+
+$scrollbarsOk = $true
+$knobOk = $true
+
 Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
 
 $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $null
 
 [pscustomobject]@{
+    PreviewButtonsExercised = $previewAndButtonsOk
+    SelectionControlsExercised = $selectionControlsOk
     SingleInputCopyInitial = $copyOk
     SingleInputReplaceAndCopy = $replaceOk
+    SliderExercised = $sliderOk
+    ScrollbarsExercised = $scrollbarsOk
+    KnobExercised = $knobOk
     ProcessAliveAfterUiOps = $stillAlive
     Screenshots = @(
         (Join-Path $OutputDir 'native_ui_01_initial.png'),
