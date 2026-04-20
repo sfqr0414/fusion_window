@@ -63,6 +63,31 @@ enum class VerticalAlign {
 	Bottom,
 };
 
+struct TextStyle {
+	std::wstring fontFamily = L"Segoe UI";
+	float fontSize = 13.0f;
+	DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+	DWRITE_FONT_STYLE style = DWRITE_FONT_STYLE_NORMAL;
+	DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+	D2D1_COLOR_F color = D2D1::ColorF(0.09f, 0.09f, 0.11f, 1.0f);
+	bool underline = false;
+	bool strikethrough = false;
+	HorizontalAlign horizontalAlign = HorizontalAlign::Left;
+	VerticalAlign verticalAlign = VerticalAlign::Top;
+	std::wstring locale = L"en-us";
+};
+
+struct StyledTextRun {
+	std::wstring text;
+	TextStyle style{};
+};
+
+struct StyledTextRange {
+	size_t start = 0;
+	size_t length = 0;
+	TextStyle style{};
+};
+
 enum class CursorKind {
 	None,
 	Arrow,
@@ -495,6 +520,144 @@ inline ComPtr<IDWriteTextLayout> CreateTextLayout(IDWriteFactory* factory, IDWri
 	return layout;
 }
 
+inline TextStyle CaptureTextStyle(IDWriteTextFormat* format, ID2D1SolidColorBrush* brush) {
+	TextStyle style;
+	if (format) {
+		UINT32 length = format->GetFontFamilyNameLength();
+		style.fontFamily.resize(length + 1);
+		if (length > 0) {
+			format->GetFontFamilyName(style.fontFamily.data(), length + 1);
+			style.fontFamily.resize(length);
+		}
+		else {
+			style.fontFamily = L"Segoe UI";
+		}
+		style.fontSize = format->GetFontSize();
+		style.weight = format->GetFontWeight();
+		style.style = format->GetFontStyle();
+		style.stretch = format->GetFontStretch();
+		UINT32 localeLength = format->GetLocaleNameLength();
+		style.locale.resize(localeLength + 1);
+		if (localeLength > 0) {
+			format->GetLocaleName(style.locale.data(), localeLength + 1);
+			style.locale.resize(localeLength);
+		}
+		else {
+			style.locale = L"en-us";
+		}
+	}
+	if (brush) {
+		style.color = brush->GetColor();
+	}
+	return style;
+}
+
+inline ComPtr<IDWriteTextFormat> CreateTextFormat(IDWriteFactory* factory, const TextStyle& style) {
+	if (!factory) {
+		return nullptr;
+	}
+	ComPtr<IDWriteTextFormat> format;
+	if (FAILED(factory->CreateTextFormat(style.fontFamily.c_str(), nullptr, style.weight, style.style, style.stretch, style.fontSize, style.locale.c_str(), &format))) {
+		return nullptr;
+	}
+	switch (style.horizontalAlign) {
+	case HorizontalAlign::Left:
+		format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+		break;
+	case HorizontalAlign::Right:
+		format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+		break;
+	default:
+		format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+		break;
+	}
+	switch (style.verticalAlign) {
+	case VerticalAlign::Top:
+		format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+		break;
+	case VerticalAlign::Bottom:
+		format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+		break;
+	default:
+		format->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+		break;
+	}
+	return format;
+}
+
+inline void ApplyTextStyleToLayout(IDWriteTextLayout* layout, const TextStyle& style, const DWRITE_TEXT_RANGE& range) {
+	if (!layout) {
+		return;
+	}
+	layout->SetFontFamilyName(style.fontFamily.c_str(), range);
+	layout->SetFontSize(style.fontSize, range);
+	layout->SetFontWeight(style.weight, range);
+	layout->SetFontStyle(style.style, range);
+	layout->SetFontStretch(style.stretch, range);
+	layout->SetUnderline(style.underline, range);
+	layout->SetStrikethrough(style.strikethrough, range);
+	if (range.startPosition == 0) {
+		switch (style.horizontalAlign) {
+		case HorizontalAlign::Left:
+			layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+			break;
+		case HorizontalAlign::Right:
+			layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+			break;
+		default:
+			layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+			break;
+		}
+		switch (style.verticalAlign) {
+		case VerticalAlign::Top:
+			layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+			break;
+		case VerticalAlign::Bottom:
+			layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+			break;
+		default:
+			layout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+			break;
+		}
+	}
+}
+
+inline ComPtr<IDWriteTextLayout> CreateStyledTextLayout(
+	IDWriteFactory* factory,
+	IDWriteTextFormat* fallbackFormat,
+	std::wstring_view text,
+	float width,
+	float height,
+	const TextStyle* baseStyle,
+	std::span<const StyledTextRange> ranges = {}) {
+	auto effectiveFormat = baseStyle ? CreateTextFormat(factory, *baseStyle) : nullptr;
+	auto layout = CreateTextLayout(factory, effectiveFormat ? effectiveFormat.Get() : fallbackFormat, text, width, height);
+	if (!layout) {
+		return nullptr;
+	}
+	if (baseStyle) {
+		ApplyTextStyleToLayout(layout.Get(), *baseStyle, DWRITE_TEXT_RANGE{ 0, static_cast<UINT32>(text.size()) });
+	}
+	for (const auto& range : ranges) {
+		if (range.length == 0 || range.start >= text.size()) {
+			continue;
+		}
+		const UINT32 start = static_cast<UINT32>(range.start);
+		const UINT32 length = static_cast<UINT32>((std::min)(range.length, text.size() - range.start));
+		ApplyTextStyleToLayout(layout.Get(), range.style, DWRITE_TEXT_RANGE{ start, length });
+	}
+	return layout;
+}
+
+inline ComPtr<ID2D1SolidColorBrush> CreateBrush(ID2D1DeviceContext* context, const D2D1_COLOR_F& color) {
+	if (!context) {
+		return nullptr;
+	}
+	ComPtr<ID2D1SolidColorBrush> brush;
+	context->CreateSolidColorBrush(color, &brush);
+	return brush;
+}
+
 inline DWRITE_TEXT_ALIGNMENT ToDWrite(HorizontalAlign align) {
 	switch (align) {
 	case HorizontalAlign::Left:
@@ -565,11 +728,20 @@ inline bool SetClipboardText(std::wstring_view text) {
 
 class TextBlock final : public UIComponent {
 public:
-	TextBlock(std::wstring text, ComPtr<IDWriteTextFormat> format, ComPtr<ID2D1SolidColorBrush> brush, bool dynamicText = false)
-		: text_(std::move(text)), format_(std::move(format)), brush_(std::move(brush)), dynamicText_(dynamicText) {}
+	TextBlock(std::wstring text, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> format, ComPtr<ID2D1SolidColorBrush> brush, bool dynamicText = false)
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), brush_(std::move(brush)), dynamicText_(dynamicText), textStyle_(CaptureTextStyle(format_.Get(), brush_.Get())) {}
 
 	void SetText(std::wstring text) {
 		text_ = std::move(text);
+	}
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		styleOverride_ = true;
+	}
+
+	void SetStyledRanges(std::vector<StyledTextRange> ranges) {
+		styledRanges_ = std::move(ranges);
 	}
 
 	bool IsDynamic() const override {
@@ -580,14 +752,23 @@ public:
 		if (!visible_ || !format_ || !brush_) {
 			return;
 		}
-		context->DrawTextW(text_.c_str(), static_cast<UINT32>(text_.size()), format_.Get(), bounds_, brush_.Get());
+		const TextStyle* baseStyle = styleOverride_ ? &textStyle_ : nullptr;
+		auto layout = CreateStyledTextLayout(dwriteFactory_.Get(), format_.Get(), text_, bounds_.right - bounds_.left, bounds_.bottom - bounds_.top, baseStyle, styledRanges_);
+		auto styledBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
+		if (layout) {
+			context->DrawTextLayout(D2D1::Point2F(bounds_.left, bounds_.top), layout.Get(), styledBrush ? styledBrush.Get() : brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		}
 	}
 
 private:
 	std::wstring text_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> brush_;
 	bool dynamicText_ = false;
+	TextStyle textStyle_{};
+	bool styleOverride_ = false;
+	std::vector<StyledTextRange> styledRanges_;
 };
 
 class ExpandableNote final : public UIComponent {
@@ -1273,7 +1454,7 @@ public:
 		ComPtr<ID2D1SolidColorBrush> selectionBrush,
 		bool multiline,
 		std::function<void(std::wstring_view)> onChanged)
-		: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)), selectionBrush_(std::move(selectionBrush)), multiline_(multiline), onChanged_(std::move(onChanged)) {
+		: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)), selectionBrush_(std::move(selectionBrush)), multiline_(multiline), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())), labelStyle_(CaptureTextStyle(format_.Get(), mutedBrush_.Get())) {
 		caret_ = text_.size();
 			selectionAnchor_ = caret_;
 	}
@@ -1281,6 +1462,20 @@ public:
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
 	CursorKind Cursor() const override { return CursorKind::IBeam; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		styleOverride_ = true;
+	}
+
+	void SetLabelStyle(const TextStyle& style) {
+		labelStyle_ = style;
+		labelStyleOverride_ = true;
+	}
+
+	void SetStyledRanges(std::vector<StyledTextRange> ranges) {
+		styledRanges_ = std::move(ranges);
+	}
 
 	void OnAttachAnimations() override {
 		if (animator_) {
@@ -1295,7 +1490,12 @@ public:
 		auto* surfaceBrush = surface_.Get();
 		auto* outlineBrush = outline_.Get();
 		auto* selectionBrush = selectionBrush_.Get();
-		context->DrawTextW(label_.c_str(), static_cast<UINT32>(label_.size()), format_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), mutedBrush);
+		const D2D1_RECT_F labelRect = D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f);
+		auto labelLayout = CreateStyledTextLayout(dwriteFactory_.Get(), format_.Get(), label_, labelRect.right - labelRect.left, labelRect.bottom - labelRect.top, labelStyleOverride_ ? &labelStyle_ : nullptr);
+		auto labelBrush = labelStyleOverride_ ? CreateBrush(context, labelStyle_.color) : nullptr;
+		if (labelLayout) {
+			context->DrawTextLayout(D2D1::Point2F(labelRect.left, labelRect.top), labelLayout.Get(), labelBrush ? labelBrush.Get() : mutedBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		}
 		D2D1_RECT_F box = TextBounds();
 		if (focused_) {
 			selectionBrush->SetOpacity(0.10f);
@@ -1315,7 +1515,8 @@ public:
 			context->DrawTextW(placeholder_.c_str(), static_cast<UINT32>(placeholder_.size()), format_.Get(), content, mutedBrush);
 		}
 		else {
-			context->DrawTextLayout(origin, layout.Get(), textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			auto styledBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
+			context->DrawTextLayout(origin, layout.Get(), styledBrush ? styledBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 			DrawImeUnderline(context, layout.Get(), origin, outlineBrush);
 		}
 		if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
@@ -1553,11 +1754,47 @@ private:
 	ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
 		const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, detail::MeasureTextWidth(dwriteFactory_.Get(), format_.Get(), renderText) + 24.0f);
 		const float height = multiline_ ? (std::max)(content.bottom - content.top, detail::kLineHeight * 8.0f) : (content.bottom - content.top);
-		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), renderText, width, height);
+		auto layout = CreateStyledTextLayout(dwriteFactory_.Get(), format_.Get(), renderText, width, height, styleOverride_ ? &textStyle_ : nullptr, styledRanges_);
 		if (layout) {
 			layout->SetWordWrapping(multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
 		}
 		return layout;
+	}
+
+	void ShiftStyledRanges(size_t start, ptrdiff_t delta, size_t removedLength = 0) {
+		std::vector<StyledTextRange> updated;
+		updated.reserve(styledRanges_.size());
+		for (auto range : styledRanges_) {
+			const size_t rangeEnd = range.start + range.length;
+			if (removedLength > 0 && rangeEnd <= start) {
+				updated.push_back(range);
+				continue;
+			}
+			if (removedLength > 0 && range.start >= start + removedLength) {
+				range.start = static_cast<size_t>(static_cast<ptrdiff_t>(range.start) + delta);
+				updated.push_back(range);
+				continue;
+			}
+			if (removedLength > 0) {
+				const size_t newStart = range.start < start ? range.start : start;
+				const size_t preservedPrefix = range.start < start ? start - range.start : 0;
+				const size_t preservedSuffix = rangeEnd > start + removedLength ? rangeEnd - (start + removedLength) : 0;
+				range.start = newStart;
+				range.length = preservedPrefix + preservedSuffix;
+				if (range.length > 0) {
+					updated.push_back(range);
+				}
+				continue;
+			}
+			if (range.start >= start) {
+				range.start = static_cast<size_t>(static_cast<ptrdiff_t>(range.start) + delta);
+			}
+			else if (rangeEnd > start) {
+				range.length = static_cast<size_t>(static_cast<ptrdiff_t>(range.length) + delta);
+			}
+			updated.push_back(range);
+		}
+		styledRanges_ = std::move(updated);
 	}
 
 	void DrawSelection(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* selectionBrush) {
@@ -1692,6 +1929,7 @@ private:
 			return false;
 		}
 		const size_t start = SelectionStart();
+		ShiftStyledRanges(start, -static_cast<ptrdiff_t>(SelectionLength()), SelectionLength());
 		text_.erase(start, SelectionLength());
 		caret_ = start;
 		selectionAnchor_ = start;
@@ -1701,6 +1939,12 @@ private:
 	}
 
 	void ReplaceRange(size_t start, size_t length, std::wstring_view replacement) {
+		if (length > 0) {
+			ShiftStyledRanges(start, -static_cast<ptrdiff_t>(length), length);
+		}
+		if (!replacement.empty()) {
+			ShiftStyledRanges(start, static_cast<ptrdiff_t>(replacement.size()));
+		}
 		text_.replace(start, length, replacement.data(), replacement.size());
 		caret_ = start + replacement.size();
 		selectionAnchor_ = caret_;
@@ -1785,6 +2029,11 @@ private:
 	size_t compositionAnchor_ = 0;
 	size_t compositionReplaceLength_ = 0;
 	std::function<void(std::wstring_view)> onChanged_;
+	TextStyle textStyle_{};
+	TextStyle labelStyle_{};
+	bool styleOverride_ = false;
+	bool labelStyleOverride_ = false;
+	std::vector<StyledTextRange> styledRanges_;
 };
 
 class ListBox final : public UIComponent {
@@ -2465,6 +2714,10 @@ public:
 		return currentCursor_;
 	}
 
+	bool NeedsContinuousRedraw() const {
+		return focused_ != nullptr || captured_ != nullptr || dynamicDirty_;
+	}
+
 	D2D1_RECT_F VisibleUiBounds() const {
 		return visibleUiBounds_;
 	}
@@ -2636,19 +2889,23 @@ public:
 		}
 		if (rightCard_ && rightCard_->Visible()) {
 			rightCard_->Render(targetContext);
+			targetContext->PushAxisAlignedClip(D2D1::RectF(rightCard_->Bounds().left + 2.0f, rightCard_->Bounds().top + 2.0f, rightCard_->Bounds().right - 2.0f, rightCard_->Bounds().bottom - 2.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 			for (auto* item : rightLayoutOrder_) {
 				if (item && item->Visible()) {
 					item->Render(targetContext);
 				}
 			}
+			targetContext->PopAxisAlignedClip();
 		}
 		if (leftCard_ && leftCard_->Visible()) {
 			leftCard_->Render(targetContext);
+			targetContext->PushAxisAlignedClip(D2D1::RectF(leftCard_->Bounds().left + 2.0f, leftCard_->Bounds().top + 2.0f, leftCard_->Bounds().right - 2.0f, leftCard_->Bounds().bottom - 2.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 			for (auto* item : leftLayoutOrder_) {
 				if (item && item->Visible()) {
 					item->Render(targetContext);
 				}
 			}
+			targetContext->PopAxisAlignedClip();
 		}
 		dynamicDirty_ = false;
 	}
@@ -2720,15 +2977,19 @@ private:
 		rightCard_ = rightCard.get();
 		components_.push_back(std::move(rightCard));
 
-		auto title = std::make_unique<TextBlock>(L"Command Surface", titleFormat_, textBrush_);
+		auto title = std::make_unique<TextBlock>(L"Command Surface", graphics_.dwriteFactory, titleFormat_, textBrush_);
 		title->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 34.0f));
 		title->SetZIndex(1);
 		leftLayoutOrder_.push_back(title.get());
 		components_.push_back(std::move(title));
 
-		auto subtitle = std::make_unique<TextBlock>(L"Radix / shadcn inspired tokens, focus rings, clipped surfaces and composite widgets.", captionFormat_, mutedTextBrush_);
+		auto subtitle = std::make_unique<TextBlock>(L"Radix / shadcn inspired tokens, focus rings, clipped surfaces and composite widgets.", graphics_.dwriteFactory, captionFormat_, mutedTextBrush_);
 		subtitle->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 32.0f));
 		subtitle->SetZIndex(1);
+		subtitle->SetStyledRanges({
+			StyledTextRange{ 0, 16, TextStyle{ .fontFamily = L"Segoe UI", .fontSize = 12.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .style = DWRITE_FONT_STYLE_NORMAL, .stretch = DWRITE_FONT_STRETCH_NORMAL, .color = detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f), .underline = false, .strikethrough = false, .horizontalAlign = HorizontalAlign::Left, .verticalAlign = VerticalAlign::Top, .locale = L"en-us" } },
+			StyledTextRange{ 17, 7, TextStyle{ .fontFamily = L"Segoe UI", .fontSize = 12.0f, .weight = DWRITE_FONT_WEIGHT_NORMAL, .style = DWRITE_FONT_STYLE_ITALIC, .stretch = DWRITE_FONT_STRETCH_NORMAL, .color = detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f), .underline = true, .strikethrough = false, .horizontalAlign = HorizontalAlign::Left, .verticalAlign = VerticalAlign::Top, .locale = L"en-us" } }
+		});
 		leftLayoutOrder_.push_back(subtitle.get());
 		components_.push_back(std::move(subtitle));
 

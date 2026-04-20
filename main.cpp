@@ -1106,6 +1106,9 @@ private:
 			bool queueHasCmds = !g_CommandQueue.is_empty();
 			bool isAnimating = (currentMenuAlpha > 0.01f && currentMenuAlpha < 0.99f);
 			for (int i = 0; i < g_MenuCount; ++i) { if (currentHoverAlphas[i] > 0.01f && currentHoverAlphas[i] < 0.99f) isAnimating = true; }
+			if (uiHost && uiHost->NeedsContinuousRedraw()) {
+				isAnimating = true;
+			}
 
 			if (!queueHasCmds) {
 				if (isAnimating) g_RenderEvent.HybridWait(currentRenderSignal, 500, 16);
