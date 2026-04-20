@@ -14,6 +14,8 @@ public struct RECT { public int Left; public int Top; public int Right; public i
 
 public static class Native {
     public const int SW_RESTORE = 9;
+    public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
@@ -25,6 +27,7 @@ public static class Native {
     [DllImport("user32.dll", SetLastError = true)] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
 }
 
@@ -77,6 +80,8 @@ if ([Native]::IsIconic($hwnd)) {
 
 [Native]::SetForegroundWindow($hwnd) | Out-Null
 Start-Sleep -Milliseconds 300
+[Native]::SetWindowPos($hwnd, [IntPtr]::Zero, 0, 0, 1440, 1120, [Native]::SWP_NOZORDER -bor [Native]::SWP_NOACTIVATE) | Out-Null
+Start-Sleep -Milliseconds 240
 
 function Get-Rect {
     $rect = New-Object RECT
@@ -200,11 +205,11 @@ $maxNarrowCardWidth = (Scale-Logical 344)
 $twoColumnThreshold = (Scale-Logical 728)
 
 $availableWidth = $clientWidth - $panelWidth - (Scale-Logical 48)
-$twoColumn = $availableWidth -ge (Scale-Logical 560)
+$twoColumn = $availableWidth -ge (Scale-Logical 420)
 if ($twoColumn) {
     $cardWidth = [int][Math]::Round([Math]::Min($maxNarrowCardWidth, [Math]::Max((Scale-Logical 260), (($availableWidth - $interCardGap) / 2.0))))
-    $rightCardLeft = $clientWidth - $cardWidth - $outerMargin
-    $leftCardLeft = $rightCardLeft - $interCardGap - $cardWidth
+    $leftCardLeft = $panelWidth + $outerMargin
+    $rightCardLeft = $leftCardLeft + $cardWidth + $interCardGap
 }
 else {
     $cardWidth = [Math]::Min($maxNarrowCardWidth, [Math]::Max($minNarrowCardWidth, $availableWidth))
@@ -247,6 +252,12 @@ $listBoundsTop = $multiBoundsTop + $multiBoundsHeight + $stackGap
 $listBoundsHeight = (Scale-Logical 142)
 $comboBoundsTop = $listBoundsTop + $listBoundsHeight + $stackGap
 $comboBoundsHeight = (Scale-Logical 38)
+$chipStripTop = $comboBoundsTop + $comboBoundsHeight + $stackGap
+$chipStripHeight = (Scale-Logical 76)
+$knobTop = $chipStripTop + $chipStripHeight + $stackGap
+$knobHeight = (Scale-Logical 136)
+$noteTop = $knobTop + $knobHeight + $stackGap
+$noteHeight = (Scale-Logical 84)
 
 $singleInputX = $controlLeft + [int][Math]::Round($controlWidth * 0.25)
 $singleInputY = $singleBoundsTop + (Scale-Logical 40)
@@ -254,18 +265,30 @@ $multiInputX = $controlLeft + (Scale-Logical 24)
 $multiInputY = $multiBoundsTop + (Scale-Logical 54)
 $listBoxX = $controlLeft + (Scale-Logical 24)
 $listBoxY = $listBoundsTop + (Scale-Logical 20)
+$listScrollX = $controlLeft + $controlWidth - (Scale-Logical 10)
+$listScrollStartY = $listBoundsTop + (Scale-Logical 30)
+$listScrollEndY = $listBoundsTop + $listBoundsHeight - (Scale-Logical 30)
 $comboX = $controlLeft + (Scale-Logical 24)
 $comboY = $comboBoundsTop + [int][Math]::Round($comboBoundsHeight * 0.5)
 $comboPopupItemY = ($comboBoundsTop + $comboBoundsHeight + (Scale-Logical 6) + (Scale-Logical 6) + (Scale-Logical 11) + (Scale-Logical 22))
-$horizontalScrollTop = $comboBoundsTop + $comboBoundsHeight + $stackGap
-$horizontalScrollHeight = (Scale-Logical 22)
-$verticalScrollTop = $horizontalScrollTop + $horizontalScrollHeight + $stackGap
-$verticalScrollHeight = (Scale-Logical 92)
-$knobTop = $verticalScrollTop + $verticalScrollHeight + $stackGap
-$knobHeight = (Scale-Logical 136)
+$chipStripStartX = $controlLeft + (Scale-Logical 28)
+$chipStripEndX = $controlLeft + $controlWidth - (Scale-Logical 40)
+$chipStripY = $chipStripTop + $chipStripHeight - (Scale-Logical 8)
+$noteX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
+$noteY = $noteTop + (Scale-Logical 18)
 
 $previewButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
 $previewButtonY = $previewButtonTop + [int][Math]::Round($previewButtonHeight * 0.5)
+$previewViewportLeft = $leftControlLeft + (Scale-Logical 12)
+$previewViewportTop = $previewTop + (Scale-Logical 12)
+$previewViewportRight = $leftControlLeft + $leftControlWidth - (Scale-Logical 30)
+$previewViewportBottom = $previewTop + $previewHeight - (Scale-Logical 30)
+$previewHScrollStartX = $previewViewportLeft + (Scale-Logical 24)
+$previewHScrollEndX = $previewViewportRight - (Scale-Logical 28)
+$previewHScrollY = $previewTop + $previewHeight - (Scale-Logical 18)
+$previewVScrollX = $leftControlLeft + $leftControlWidth - (Scale-Logical 18)
+$previewVScrollStartY = $previewViewportTop + (Scale-Logical 16)
+$previewVScrollEndY = $previewViewportBottom - (Scale-Logical 22)
 $resetButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
 $resetButtonY = $resetButtonTop + [int][Math]::Round($controlHeight * 0.5)
 $checkboxX = $leftControlLeft + (Scale-Logical 20)
@@ -277,12 +300,6 @@ $radio2Y = $radio2Top + [int][Math]::Round($controlHeight * 0.5)
 $sliderStartX = $leftControlLeft + (Scale-Logical 24)
 $sliderEndX = $leftControlLeft + $leftControlWidth - (Scale-Logical 24)
 $sliderY = $sliderTop + (Scale-Logical 26)
-$horizontalScrollStartX = $controlLeft + (Scale-Logical 18)
-$horizontalScrollEndX = $controlLeft + $controlWidth - (Scale-Logical 18)
-$horizontalScrollY = $horizontalScrollTop + [int][Math]::Round($horizontalScrollHeight * 0.5)
-$verticalScrollX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
-$verticalScrollStartY = $verticalScrollTop + (Scale-Logical 12)
-$verticalScrollEndY = $verticalScrollTop + $verticalScrollHeight - (Scale-Logical 12)
 $knobX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
 $knobStartY = $knobTop + (Scale-Logical 52)
 $knobEndY = $knobTop + (Scale-Logical 92)
@@ -294,6 +311,7 @@ $selectionControlsOk = $false
 $sliderOk = $false
 $scrollbarsOk = $false
 $knobOk = $false
+$expandCollapseOk = $false
 
 if ($twoColumn) {
     Click-Client $previewButtonX $previewButtonY
@@ -302,6 +320,8 @@ if ($twoColumn) {
     Click-Client $radio2X $radio2Y
     Click-Client $radio1X $radio1Y
     Drag-Client $sliderStartX $sliderY $sliderEndX $sliderY
+    Drag-Client $previewHScrollStartX $previewHScrollY $previewHScrollEndX $previewHScrollY
+    Drag-Client $previewVScrollX $previewVScrollStartY $previewVScrollX $previewVScrollEndY
     $previewAndButtonsOk = $true
     $selectionControlsOk = $true
     $sliderOk = $true
@@ -340,12 +360,17 @@ Save-Capture 'native_ui_02_combo_open.png'
 Click-Client $comboX $comboPopupItemY
 Start-Sleep -Milliseconds 180
 
-Drag-Client $horizontalScrollStartX $horizontalScrollY $horizontalScrollEndX $horizontalScrollY
-Drag-Client $verticalScrollX $verticalScrollStartY $verticalScrollX $verticalScrollEndY
+Drag-Client $chipStripStartX $chipStripY $chipStripEndX $chipStripY
+Drag-Client $listScrollX $listScrollStartY $listScrollX $listScrollEndY
 Drag-Client $knobX $knobStartY $knobX $knobEndY
+Click-Client $noteX $noteY
+Start-Sleep -Milliseconds 120
+Click-Client $noteX $noteY
+Start-Sleep -Milliseconds 120
 
 $scrollbarsOk = $true
 $knobOk = $true
+$expandCollapseOk = $true
 
 Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
@@ -360,6 +385,7 @@ $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $nu
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
     KnobExercised = $knobOk
+    ExpandCollapseExercised = $expandCollapseOk
     ProcessAliveAfterUiOps = $stillAlive
     Screenshots = @(
         (Join-Path $OutputDir 'native_ui_01_initial.png'),

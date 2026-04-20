@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -48,6 +49,18 @@ struct KeyModifiers {
 	bool ctrl = false;
 	bool shift = false;
 	bool alt = false;
+};
+
+enum class HorizontalAlign {
+	Left,
+	Center,
+	Right,
+};
+
+enum class VerticalAlign {
+	Top,
+	Center,
+	Bottom,
 };
 
 enum class CursorKind {
@@ -147,6 +160,27 @@ public:
 		storyboard->Schedule(NowSeconds());
 	}
 
+	void AnimateLinear(UIAnimation& animation, float target, double duration = 0.16) {
+		animation.SetObservedValue(target);
+		if (!manager_ || !library_ || !animation.Variable()) {
+			return;
+		}
+		double current = 0.0;
+		if (FAILED(animation.Variable()->GetValue(&current)) || std::fabs(current - static_cast<double>(target)) < 1e-4) {
+			return;
+		}
+		ComPtr<IUIAnimationStoryboard> storyboard;
+		ComPtr<IUIAnimationTransition> transition;
+		if (FAILED(manager_->CreateStoryboard(&storyboard)) || !storyboard) {
+			return;
+		}
+		if (FAILED(library_->CreateLinearTransition(duration, target, &transition)) || !transition) {
+			return;
+		}
+		storyboard->AddTransition(animation.Variable(), transition.Get());
+		storyboard->Schedule(NowSeconds());
+	}
+
 	void Update() {
 		if (manager_) {
 			manager_->Update(NowSeconds());
@@ -177,6 +211,9 @@ public:
 		animator_->Attach(hoverAnimation_, hovered_ ? 1.0f : 0.0f);
 		animator_->Attach(pressAnimation_, pressed_ ? 1.0f : 0.0f);
 		animator_->Attach(focusAnimation_, focused_ ? 1.0f : 0.0f);
+		for (auto& [_, animation] : customAnimations_) {
+			animator_->Attach(animation, animation.Value());
+		}
 		OnAttachAnimations();
 	}
 
@@ -202,6 +239,14 @@ public:
 
 	void SetVisible(bool visible) {
 		visible_ = visible;
+		if (!visible_) {
+			hovered_ = false;
+			pressed_ = false;
+			focused_ = false;
+			Animate(hoverAnimation_, 0.0f, 0.10);
+			Animate(pressAnimation_, 0.0f, 0.10);
+			Animate(focusAnimation_, 0.0f, 0.10);
+		}
 	}
 
 	bool Enabled() const {
@@ -222,6 +267,10 @@ public:
 
 	virtual bool IsFocusable() const {
 		return false;
+	}
+
+	bool CanFocus() const {
+		return visible_ && enabled_ && IsFocusable();
 	}
 
 	virtual CursorKind Cursor() const {
@@ -283,12 +332,59 @@ public:
 		return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
 	}
 
+	void RegisterAnimationSlot(std::wstring key, float initialValue = 0.0f) {
+		auto [it, inserted] = customAnimations_.try_emplace(std::move(key), UIAnimation(initialValue));
+		if (!inserted) {
+			it->second.SetObservedValue(initialValue);
+		}
+		if (animator_) {
+			animator_->Attach(it->second, it->second.Value());
+		}
+	}
+
+	void AnimateSlot(std::wstring_view key, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
+		auto animation = customAnimations_.find(std::wstring(key));
+		if (animation == customAnimations_.end()) {
+			RegisterAnimationSlot(std::wstring(key), target);
+			animation = customAnimations_.find(std::wstring(key));
+		}
+		Animate(animation->second, target, duration, accel, decel);
+	}
+
+	void AnimateSlotLinear(std::wstring_view key, float target, double duration = 0.16) {
+		auto animation = customAnimations_.find(std::wstring(key));
+		if (animation == customAnimations_.end()) {
+			RegisterAnimationSlot(std::wstring(key), target);
+			animation = customAnimations_.find(std::wstring(key));
+		}
+		if (animator_) {
+			animator_->AnimateLinear(animation->second, target, duration);
+		}
+		else {
+			animation->second.SetObservedValue(target);
+		}
+	}
+
+	float AnimationSlotValue(std::wstring_view key, float fallback = 0.0f) const {
+		auto animation = customAnimations_.find(std::wstring(key));
+		return animation == customAnimations_.end() ? fallback : animation->second.Value();
+	}
+
 protected:
 	virtual void OnAttachAnimations() {}
 
 	void Animate(UIAnimation& animation, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
 		if (animator_) {
 			animator_->Animate(animation, target, duration, accel, decel);
+		}
+		else {
+			animation.SetObservedValue(target);
+		}
+	}
+
+	void AnimateLinear(UIAnimation& animation, float target, double duration = 0.16) {
+		if (animator_) {
+			animator_->AnimateLinear(animation, target, duration);
 		}
 		else {
 			animation.SetObservedValue(target);
@@ -325,6 +421,7 @@ protected:
 	UIAnimation hoverAnimation_{};
 	UIAnimation pressAnimation_{};
 	UIAnimation focusAnimation_{};
+	std::unordered_map<std::wstring, UIAnimation> customAnimations_;
 };
 
 class LayoutBase {
@@ -396,6 +493,28 @@ inline ComPtr<IDWriteTextLayout> CreateTextLayout(IDWriteFactory* factory, IDWri
 		return nullptr;
 	}
 	return layout;
+}
+
+inline DWRITE_TEXT_ALIGNMENT ToDWrite(HorizontalAlign align) {
+	switch (align) {
+	case HorizontalAlign::Left:
+		return DWRITE_TEXT_ALIGNMENT_LEADING;
+	case HorizontalAlign::Right:
+		return DWRITE_TEXT_ALIGNMENT_TRAILING;
+	default:
+		return DWRITE_TEXT_ALIGNMENT_CENTER;
+	}
+}
+
+inline DWRITE_PARAGRAPH_ALIGNMENT ToDWrite(VerticalAlign align) {
+	switch (align) {
+	case VerticalAlign::Top:
+		return DWRITE_PARAGRAPH_ALIGNMENT_NEAR;
+	case VerticalAlign::Bottom:
+		return DWRITE_PARAGRAPH_ALIGNMENT_FAR;
+	default:
+		return DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
+	}
 }
 
 inline std::wstring GetClipboardText() {
@@ -471,6 +590,81 @@ private:
 	bool dynamicText_ = false;
 };
 
+class ExpandableNote final : public UIComponent {
+public:
+	ExpandableNote(std::wstring title, std::wstring body, ComPtr<IDWriteTextFormat> titleFormat, ComPtr<IDWriteTextFormat> bodyFormat, ComPtr<ID2D1SolidColorBrush> surface, ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> textBrush, ComPtr<ID2D1SolidColorBrush> mutedBrush)
+		: title_(std::move(title)), body_(std::move(body)), titleFormat_(std::move(titleFormat)), bodyFormat_(std::move(bodyFormat)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)) {}
+
+	bool IsDynamic() const override { return true; }
+	bool IsFocusable() const override { return true; }
+	CursorKind Cursor() const override { return CursorKind::Hand; }
+
+	void SetTitle(std::wstring title) {
+		title_ = std::move(title);
+	}
+
+	void SetBody(std::wstring body) {
+		body_ = std::move(body);
+	}
+
+	void OnAttachAnimations() override {
+		RegisterAnimationSlot(L"expand", expanded_ ? 1.0f : 0.0f);
+	}
+
+	void Render(ID2D1DeviceContext* context) override {
+		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
+		outline_->SetOpacity(0.4f + 0.5f * FocusProgress());
+		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		const D2D1_RECT_F headerRect = D2D1::RectF(bounds_.left + 14.0f, bounds_.top + 8.0f, bounds_.right - 28.0f, bounds_.top + 30.0f);
+		context->DrawTextW(title_.c_str(), static_cast<UINT32>(title_.size()), titleFormat_.Get(), headerRect, textBrush_.Get());
+		const float expand = AnimationSlotValue(L"expand", 0.0f);
+		const float arrowCenterX = bounds_.right - 16.0f;
+		const float arrowCenterY = bounds_.top + 18.0f;
+		const float arrowLift = 3.0f * expand;
+		context->DrawLine(D2D1::Point2F(arrowCenterX - 5.0f, arrowCenterY - 2.0f + arrowLift), D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), outline_.Get(), 1.5f);
+		context->DrawLine(D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), D2D1::Point2F(arrowCenterX + 5.0f, arrowCenterY - 2.0f + arrowLift), outline_.Get(), 1.5f);
+		if (expand <= 0.01f) {
+			return;
+		}
+		const D2D1_RECT_F bodyRect = D2D1::RectF(bounds_.left + 14.0f, bounds_.top + 34.0f, bounds_.right - 14.0f, bounds_.bottom - 12.0f);
+		const float visibleHeight = (bodyRect.bottom - bodyRect.top) * expand;
+		const D2D1_RECT_F clip = D2D1::RectF(bodyRect.left, bodyRect.top, bodyRect.right, bodyRect.top + visibleHeight);
+		context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		mutedBrush_->SetOpacity(expand);
+		context->DrawTextW(body_.c_str(), static_cast<UINT32>(body_.size()), bodyFormat_.Get(), bodyRect, mutedBrush_.Get());
+		context->PopAxisAlignedClip();
+	}
+
+	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
+
+	void OnPointerUp(D2D1_POINT_2F point) override {
+		const bool shouldToggle = pressed_ && PointInRect(bounds_, point);
+		UIComponent::OnPointerUp(point);
+		if (shouldToggle) {
+			expanded_ = !expanded_;
+			AnimateSlot(L"expand", expanded_ ? 1.0f : 0.0f, 0.18, 0.25, 0.25);
+		}
+	}
+
+	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
+		if (key == VK_SPACE || key == VK_RETURN) {
+			expanded_ = !expanded_;
+			AnimateSlot(L"expand", expanded_ ? 1.0f : 0.0f, 0.18, 0.25, 0.25);
+		}
+	}
+
+private:
+	std::wstring title_;
+	std::wstring body_;
+	ComPtr<IDWriteTextFormat> titleFormat_;
+	ComPtr<IDWriteTextFormat> bodyFormat_;
+	ComPtr<ID2D1SolidColorBrush> surface_;
+	ComPtr<ID2D1SolidColorBrush> outline_;
+	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	ComPtr<ID2D1SolidColorBrush> mutedBrush_;
+	bool expanded_ = true;
+};
+
 class CardSurface final : public UIComponent {
 public:
 	CardSurface(ComPtr<ID2D1SolidColorBrush> fill, ComPtr<ID2D1SolidColorBrush> outline)
@@ -501,6 +695,7 @@ private:
 class Button final : public UIComponent {
 public:
 	Button(std::wstring text,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> primaryFill,
 		ComPtr<ID2D1SolidColorBrush> secondaryFill,
@@ -508,11 +703,21 @@ public:
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void()> onClick,
 		bool primary)
-		: text_(std::move(text)), format_(std::move(format)), primaryFill_(std::move(primaryFill)), secondaryFill_(std::move(secondaryFill)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), primary_(primary) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), primaryFill_(std::move(primaryFill)), secondaryFill_(std::move(secondaryFill)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), primary_(primary) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
 	CursorKind Cursor() const override { return CursorKind::Hand; }
+
+	void SetTextAlignment(HorizontalAlign horizontal, VerticalAlign vertical) {
+		horizontalAlign_ = horizontal;
+		verticalAlign_ = vertical;
+	}
+
+	void SetTextPadding(float leftRight, float topBottom) {
+		textPaddingX_ = leftRight;
+		textPaddingY_ = topBottom;
+	}
 
 	void Render(ID2D1DeviceContext* context) override {
 		auto rounded = D2D1::RoundedRect(bounds_, 12.0f, 12.0f);
@@ -524,7 +729,13 @@ public:
 		outline_->SetOpacity(0.55f + 0.45f * FocusProgress());
 		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f + FocusProgress());
 		textBrush_->SetOpacity(enabled_ ? 1.0f : 0.5f);
-		context->DrawTextW(text_.c_str(), static_cast<UINT32>(text_.size()), format_.Get(), bounds_, textBrush_.Get());
+		const D2D1_RECT_F textRect = D2D1::RectF(bounds_.left + textPaddingX_, bounds_.top + textPaddingY_, bounds_.right - textPaddingX_, bounds_.bottom - textPaddingY_);
+		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top);
+		if (layout) {
+			layout->SetTextAlignment(ToDWrite(horizontalAlign_));
+			layout->SetParagraphAlignment(ToDWrite(verticalAlign_));
+			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout.Get(), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		}
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override {
@@ -547,6 +758,7 @@ public:
 
 private:
 	std::wstring text_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> primaryFill_;
 	ComPtr<ID2D1SolidColorBrush> secondaryFill_;
@@ -554,6 +766,10 @@ private:
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	std::function<void()> onClick_;
 	bool primary_ = false;
+	HorizontalAlign horizontalAlign_ = HorizontalAlign::Center;
+	VerticalAlign verticalAlign_ = VerticalAlign::Center;
+	float textPaddingX_ = 14.0f;
+	float textPaddingY_ = 6.0f;
 };
 
 class ImageFrame final : public UIComponent {
@@ -562,6 +778,7 @@ public:
 		: outline_(std::move(outline)), accent_(std::move(accent)), muted_(std::move(muted)) {}
 
 	bool IsDynamic() const override { return true; }
+	bool IsFocusable() const override { return true; }
 
 	void SetScrollOffset(float x, float y) {
 		scrollX_ = Clamp01(x);
@@ -569,56 +786,180 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
+		const auto metrics = ComputeMetrics();
 		auto rounded = D2D1::RoundedRect(bounds_, 14.0f, 14.0f);
 		context->FillRoundedRectangle(rounded, muted_.Get());
-		const D2D1_RECT_F viewport = InflateRect(bounds_, 12.0f);
-		const float viewportWidth = viewport.right - viewport.left;
-		const float viewportHeight = viewport.bottom - viewport.top;
-		const float contentWidth = viewportWidth * 1.65f;
-		const float contentHeight = viewportHeight * 1.75f;
-		const float offsetX = (contentWidth - viewportWidth) * scrollX_;
-		const float offsetY = (contentHeight - viewportHeight) * scrollY_;
-		context->PushAxisAlignedClip(viewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		const float offsetX = (metrics.contentWidth - metrics.viewportWidth) * scrollX_;
+		const float offsetY = (metrics.contentHeight - metrics.viewportHeight) * scrollY_;
+		context->PushAxisAlignedClip(metrics.viewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 		for (int row = 0; row < 5; ++row) {
 			for (int col = 0; col < 8; ++col) {
-				const float tileW = contentWidth / 8.0f;
-				const float tileH = contentHeight / 5.0f;
-				const float left = viewport.left + tileW * col - offsetX;
-				const float top = viewport.top + tileH * row - offsetY;
+				const float tileW = metrics.contentWidth / 8.0f;
+				const float tileH = metrics.contentHeight / 5.0f;
+				const float left = metrics.viewport.left + tileW * col - offsetX;
+				const float top = metrics.viewport.top + tileH * row - offsetY;
 				const float alpha = ((row + col) % 2 == 0) ? 0.18f : 0.08f;
 				accent_->SetOpacity(alpha);
 				context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(left, top, left + tileW - 8.0f, top + tileH - 8.0f), 8.0f, 8.0f), accent_.Get());
 			}
 		}
 		accent_->SetOpacity(0.78f);
-		context->DrawLine(D2D1::Point2F(viewport.left + 16.0f - offsetX, viewport.top + contentHeight * 0.72f - offsetY), D2D1::Point2F(viewport.left + contentWidth * 0.45f - offsetX, viewport.top + contentHeight * 0.34f - offsetY), accent_.Get(), 2.0f);
-		context->DrawLine(D2D1::Point2F(viewport.left + contentWidth * 0.45f - offsetX, viewport.top + contentHeight * 0.34f - offsetY), D2D1::Point2F(viewport.left + contentWidth - 16.0f - offsetX, viewport.top + contentHeight * 0.64f - offsetY), accent_.Get(), 2.0f);
+		context->DrawLine(D2D1::Point2F(metrics.viewport.left + 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.72f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), accent_.Get(), 2.0f);
+		context->DrawLine(D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth - 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.64f - offsetY), accent_.Get(), 2.0f);
 		context->PopAxisAlignedClip();
+		DrawScrollBars(context, metrics);
 		outline_->SetOpacity(0.55f);
 		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f);
 	}
 
+	void OnPointerDown(D2D1_POINT_2F point) override {
+		UIComponent::OnPointerDown(point);
+		const auto metrics = ComputeMetrics();
+		dragMode_ = DragMode::None;
+		if (metrics.showHorizontal && PointInRect(metrics.horizontalThumb, point)) {
+			dragMode_ = DragMode::Horizontal;
+		}
+		else if (metrics.showVertical && PointInRect(metrics.verticalThumb, point)) {
+			dragMode_ = DragMode::Vertical;
+		}
+		if (dragMode_ != DragMode::None) {
+			dragOrigin_ = point;
+			originScrollX_ = scrollX_;
+			originScrollY_ = scrollY_;
+		}
+	}
+
+	void OnPointerMove(D2D1_POINT_2F point) override {
+		if (!pressed_ || dragMode_ == DragMode::None) {
+			return;
+		}
+		const auto metrics = ComputeMetrics();
+		if (dragMode_ == DragMode::Horizontal) {
+			const float trackWidth = (std::max)(1.0f, metrics.horizontalTrack.right - metrics.horizontalTrack.left - (metrics.horizontalThumb.right - metrics.horizontalThumb.left));
+			scrollX_ = Clamp01(originScrollX_ + (point.x - dragOrigin_.x) / trackWidth);
+			return;
+		}
+		const float trackHeight = (std::max)(1.0f, metrics.verticalTrack.bottom - metrics.verticalTrack.top - (metrics.verticalThumb.bottom - metrics.verticalThumb.top));
+		scrollY_ = Clamp01(originScrollY_ + (point.y - dragOrigin_.y) / trackHeight);
+	}
+
+	void OnPointerUp(D2D1_POINT_2F point) override {
+		dragMode_ = DragMode::None;
+		UIComponent::OnPointerUp(point);
+	}
+
+	void OnMouseWheel(int delta) override {
+		scrollY_ = Clamp01(scrollY_ + (delta > 0 ? -0.05f : 0.05f));
+	}
+
+	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
+		if (key == VK_LEFT) scrollX_ = Clamp01(scrollX_ - 0.04f);
+		if (key == VK_RIGHT) scrollX_ = Clamp01(scrollX_ + 0.04f);
+		if (key == VK_UP) scrollY_ = Clamp01(scrollY_ - 0.04f);
+		if (key == VK_DOWN) scrollY_ = Clamp01(scrollY_ + 0.04f);
+	}
+
 private:
+	struct Metrics {
+		D2D1_RECT_F viewport{ D2D1::RectF() };
+		D2D1_RECT_F horizontalTrack{ D2D1::RectF() };
+		D2D1_RECT_F verticalTrack{ D2D1::RectF() };
+		D2D1_RECT_F horizontalThumb{ D2D1::RectF() };
+		D2D1_RECT_F verticalThumb{ D2D1::RectF() };
+		float viewportWidth = 0.0f;
+		float viewportHeight = 0.0f;
+		float contentWidth = 0.0f;
+		float contentHeight = 0.0f;
+		bool showHorizontal = false;
+		bool showVertical = false;
+	};
+
+	enum class DragMode {
+		None,
+		Horizontal,
+		Vertical,
+	};
+
+	Metrics ComputeMetrics() const {
+		Metrics metrics;
+		metrics.viewport = InflateRect(bounds_, 12.0f);
+		constexpr float barThickness = 12.0f;
+		constexpr float barGap = 6.0f;
+		const float rawWidth = (std::max)(1.0f, metrics.viewport.right - metrics.viewport.left);
+		const float rawHeight = (std::max)(1.0f, metrics.viewport.bottom - metrics.viewport.top);
+		metrics.contentWidth = rawWidth * 1.65f;
+		metrics.contentHeight = rawHeight * 1.75f;
+		metrics.showHorizontal = metrics.contentWidth > rawWidth + 1.0f;
+		metrics.showVertical = metrics.contentHeight > rawHeight + 1.0f;
+		if (metrics.showHorizontal) {
+			metrics.viewport.bottom -= barThickness + barGap;
+		}
+		if (metrics.showVertical) {
+			metrics.viewport.right -= barThickness + barGap;
+		}
+		metrics.viewportWidth = (std::max)(1.0f, metrics.viewport.right - metrics.viewport.left);
+		metrics.viewportHeight = (std::max)(1.0f, metrics.viewport.bottom - metrics.viewport.top);
+		if (metrics.showHorizontal) {
+			metrics.horizontalTrack = D2D1::RectF(metrics.viewport.left, metrics.viewport.bottom + barGap, metrics.viewport.right, metrics.viewport.bottom + barGap + barThickness);
+			const float thumbWidth = (std::max)(24.0f, metrics.viewportWidth * (metrics.viewportWidth / metrics.contentWidth));
+			const float thumbLeft = metrics.horizontalTrack.left + (metrics.horizontalTrack.right - metrics.horizontalTrack.left - thumbWidth) * scrollX_;
+			metrics.horizontalThumb = D2D1::RectF(thumbLeft, metrics.horizontalTrack.top + 1.0f, thumbLeft + thumbWidth, metrics.horizontalTrack.bottom - 1.0f);
+		}
+		if (metrics.showVertical) {
+			metrics.verticalTrack = D2D1::RectF(metrics.viewport.right + barGap, metrics.viewport.top, metrics.viewport.right + barGap + barThickness, metrics.viewport.bottom);
+			const float thumbHeight = (std::max)(24.0f, metrics.viewportHeight * (metrics.viewportHeight / metrics.contentHeight));
+			const float thumbTop = metrics.verticalTrack.top + (metrics.verticalTrack.bottom - metrics.verticalTrack.top - thumbHeight) * scrollY_;
+			metrics.verticalThumb = D2D1::RectF(metrics.verticalTrack.left + 1.0f, thumbTop, metrics.verticalTrack.right - 1.0f, thumbTop + thumbHeight);
+		}
+		return metrics;
+	}
+
+	void DrawScrollBars(ID2D1DeviceContext* context, const Metrics& metrics) {
+		if (metrics.showHorizontal) {
+			outline_->SetOpacity(0.26f + 0.34f * FocusProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(metrics.horizontalTrack, 8.0f, 8.0f), outline_.Get());
+			accent_->SetOpacity(0.55f + 0.15f * HoverProgress() + 0.15f * PressProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(metrics.horizontalThumb, 8.0f, 8.0f), accent_.Get());
+		}
+		if (metrics.showVertical) {
+			outline_->SetOpacity(0.26f + 0.34f * FocusProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(metrics.verticalTrack, 8.0f, 8.0f), outline_.Get());
+			accent_->SetOpacity(0.55f + 0.15f * HoverProgress() + 0.15f * PressProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(metrics.verticalThumb, 8.0f, 8.0f), accent_.Get());
+		}
+	}
+
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> muted_;
 	float scrollX_ = 0.0f;
 	float scrollY_ = 0.0f;
+	DragMode dragMode_ = DragMode::None;
+	D2D1_POINT_2F dragOrigin_{ 0.0f, 0.0f };
+	float originScrollX_ = 0.0f;
+	float originScrollY_ = 0.0f;
 };
 
 class ImageButton final : public UIComponent {
 public:
 	ImageButton(std::wstring text,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
 		ComPtr<ID2D1SolidColorBrush> outline,
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void()> onClick)
-		: text_(std::move(text)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+	CursorKind Cursor() const override { return CursorKind::Hand; }
+
+	void SetTextAlignment(HorizontalAlign horizontal, VerticalAlign vertical) {
+		horizontalAlign_ = horizontal;
+		verticalAlign_ = vertical;
+	}
 
 	void Render(ID2D1DeviceContext* context) override {
 		auto rounded = D2D1::RoundedRect(bounds_, 12.0f, 12.0f);
@@ -633,7 +974,13 @@ public:
 		context->DrawLine(D2D1::Point2F(imageRect.left + 8.0f, imageRect.bottom - 10.0f), D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), accent_.Get(), 2.0f);
 		context->DrawLine(D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), D2D1::Point2F(imageRect.right - 8.0f, imageRect.bottom - 12.0f), accent_.Get(), 2.0f);
 		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(imageRect.right - 12.0f, imageRect.top + 12.0f), 4.0f, 4.0f), accent_.Get());
-		context->DrawTextW(text_.c_str(), static_cast<UINT32>(text_.size()), format_.Get(), D2D1::RectF(imageRect.right + 12.0f, bounds_.top, bounds_.right - 12.0f, bounds_.bottom), textBrush_.Get());
+		const D2D1_RECT_F textRect = D2D1::RectF(imageRect.right + 12.0f, bounds_.top + 6.0f, bounds_.right - 12.0f, bounds_.bottom - 6.0f);
+		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top);
+		if (layout) {
+			layout->SetTextAlignment(ToDWrite(horizontalAlign_));
+			layout->SetParagraphAlignment(ToDWrite(verticalAlign_));
+			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout.Get(), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		}
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -652,12 +999,15 @@ public:
 
 private:
 	std::wstring text_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	std::function<void()> onClick_;
+	HorizontalAlign horizontalAlign_ = HorizontalAlign::Left;
+	VerticalAlign verticalAlign_ = VerticalAlign::Center;
 };
 
 class Checkbox final : public UIComponent {
@@ -932,7 +1282,14 @@ public:
 	bool IsFocusable() const override { return true; }
 	CursorKind Cursor() const override { return CursorKind::IBeam; }
 
+	void OnAttachAnimations() override {
+		if (animator_) {
+			animator_->Attach(caretOpacityAnimation_, 1.0f);
+		}
+	}
+
 	void Render(ID2D1DeviceContext* context) override {
+		UpdateCaretBlink();
 		auto* textBrush = textBrush_.Get();
 		auto* mutedBrush = mutedBrush_.Get();
 		auto* surfaceBrush = surface_.Get();
@@ -948,19 +1305,21 @@ public:
 		outlineBrush->SetOpacity(0.58f + FocusProgress() * 0.42f);
 		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), outlineBrush, focused_ ? 1.8f : 1.0f);
 		D2D1_RECT_F content = InflateRect(box, 12.0f);
-		context->PushAxisAlignedClip(content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 		const auto renderText = DisplayText();
-		const auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), renderText, content.right - content.left, content.bottom - content.top);
-		DrawSelection(context, layout.Get(), content, selectionBrush);
+		auto layout = CreateLayout(renderText, content);
+		SyncScrollOffsets(layout.Get(), content);
+		const D2D1_POINT_2F origin = D2D1::Point2F(content.left - scrollX_, content.top - scrollY_);
+		context->PushAxisAlignedClip(content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		DrawSelection(context, layout.Get(), origin, selectionBrush);
 		if (renderText.empty()) {
 			context->DrawTextW(placeholder_.c_str(), static_cast<UINT32>(placeholder_.size()), format_.Get(), content, mutedBrush);
 		}
 		else {
-			context->DrawTextLayout(D2D1::Point2F(content.left, content.top), layout.Get(), textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
-			DrawImeUnderline(context, layout.Get(), content, outlineBrush);
+			context->DrawTextLayout(origin, layout.Get(), textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			DrawImeUnderline(context, layout.Get(), origin, outlineBrush);
 		}
-		if (focused_) {
-			DrawCaret(context, layout.Get(), content, outlineBrush);
+		if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
+			DrawCaret(context, layout.Get(), origin, outlineBrush, caretOpacityAnimation_.Value());
 		}
 		context->PopAxisAlignedClip();
 	}
@@ -971,11 +1330,15 @@ public:
 		const size_t index = HitTestText(point);
 		caret_ = index;
 		selectionAnchor_ = index;
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 	}
 
 	void OnPointerMove(D2D1_POINT_2F point) override {
 		if (draggingSelection_) {
 			caret_ = HitTestText(point);
+			ensureCaretVisible_ = true;
+			ResetCaretBlink();
 		}
 	}
 
@@ -1059,6 +1422,8 @@ public:
 		default:
 			break;
 		}
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 	}
 
 	void OnChar(wchar_t ch) override {
@@ -1084,7 +1449,12 @@ public:
 		UIComponent::OnFocus(focused);
 		if (!focused) {
 			draggingSelection_ = false;
+			AnimateLinear(caretOpacityAnimation_, 0.0f, 0.08);
+			caretTargetVisible_ = false;
+			return;
 		}
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 	}
 
 	void OnImeStart(HWND) override {
@@ -1093,6 +1463,7 @@ public:
 		compositionReplaceLength_ = HasSelection() ? SelectionLength() : 0;
 		imeComposition_.clear();
 		imeCursorPos_ = 0;
+		ResetCaretBlink();
 	}
 
 	void OnImeComposition(HWND hwnd, LPARAM lParam) override {
@@ -1133,12 +1504,15 @@ public:
 		}
 		imeComposition_ = std::move(composition);
 		imeCursorPos_ = cursorPos;
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 	}
 
 	void OnImeEnd(HWND) override {
 		imeActive_ = false;
 		imeComposition_.clear();
 		compositionReplaceLength_ = 0;
+		ResetCaretBlink();
 	}
 
 	const std::wstring& Text() const { return text_; }
@@ -1176,18 +1550,28 @@ private:
 		return compositionAnchor_ + (std::min)(static_cast<size_t>((std::max)(0L, imeCursorPos_)), imeComposition_.size());
 	}
 
-	void DrawSelection(ID2D1DeviceContext* context, IDWriteTextLayout* layout, const D2D1_RECT_F& content, ID2D1SolidColorBrush* selectionBrush) {
+	ComPtr<IDWriteTextLayout> CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
+		const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, detail::MeasureTextWidth(dwriteFactory_.Get(), format_.Get(), renderText) + 24.0f);
+		const float height = multiline_ ? (std::max)(content.bottom - content.top, detail::kLineHeight * 8.0f) : (content.bottom - content.top);
+		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), renderText, width, height);
+		if (layout) {
+			layout->SetWordWrapping(multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+		}
+		return layout;
+	}
+
+	void DrawSelection(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* selectionBrush) {
 		if (!layout || imeActive_ || !HasSelection()) {
 			return;
 		}
 		std::array<DWRITE_HIT_TEST_METRICS, 8> stackMetrics{};
 		UINT32 actualCount = 0;
 		const UINT32 length = static_cast<UINT32>(SelectionLength());
-		HRESULT hr = layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, content.left, content.top, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
+		HRESULT hr = layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, origin.x, origin.y, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
 		std::vector<DWRITE_HIT_TEST_METRICS> dynamicMetrics;
 		if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
 			dynamicMetrics.resize(actualCount);
-			if (SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, content.left, content.top, dynamicMetrics.data(), actualCount, &actualCount))) {
+			if (SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, origin.x, origin.y, dynamicMetrics.data(), actualCount, &actualCount))) {
 				for (const auto& metric : dynamicMetrics) {
 					selectionBrush->SetOpacity(0.18f + FocusProgress() * 0.18f);
 					context->FillRectangle(D2D1::RectF(metric.left, metric.top, metric.left + metric.width, metric.top + metric.height), selectionBrush);
@@ -1204,7 +1588,7 @@ private:
 		}
 	}
 
-	void DrawImeUnderline(ID2D1DeviceContext* context, IDWriteTextLayout* layout, const D2D1_RECT_F& content, ID2D1SolidColorBrush* outlineBrush) {
+	void DrawImeUnderline(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* outlineBrush) {
 		if (!layout || !imeActive_ || imeComposition_.empty()) {
 			return;
 		}
@@ -1212,7 +1596,7 @@ private:
 		UINT32 actualCount = 0;
 		const UINT32 start = static_cast<UINT32>(compositionAnchor_);
 		const UINT32 length = static_cast<UINT32>(imeComposition_.size());
-		HRESULT hr = layout->HitTestTextRange(start, length, content.left, content.top, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
+		HRESULT hr = layout->HitTestTextRange(start, length, origin.x, origin.y, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
 		if (FAILED(hr)) {
 			return;
 		}
@@ -1222,30 +1606,80 @@ private:
 		}
 	}
 
-	void DrawCaret(ID2D1DeviceContext* context, IDWriteTextLayout* layout, const D2D1_RECT_F& content, ID2D1SolidColorBrush* outlineBrush) {
-		FLOAT x = content.left;
-		FLOAT y = content.top;
+	void DrawCaret(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* outlineBrush, float opacity) {
+		FLOAT x = origin.x;
+		FLOAT y = origin.y;
 		DWRITE_HIT_TEST_METRICS metrics{};
 		if (!layout || FAILED(layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &x, &y, &metrics))) {
-			metrics.height = multiline_ ? 18.0f : content.bottom - content.top - 4.0f;
-			x = content.left + 1.0f;
-			y = content.top + 2.0f;
+			metrics.height = multiline_ ? 18.0f : detail::kLineHeight;
+			x = origin.x + 1.0f;
+			y = origin.y + 2.0f;
 		}
-		outlineBrush->SetOpacity(1.0f);
+		outlineBrush->SetOpacity((std::clamp)(opacity, 0.0f, 1.0f));
 		context->FillRectangle(D2D1::RectF(x, y, x + 2.0f, y + (std::max)(metrics.height, 18.0f)), outlineBrush);
+	}
+
+	void SyncScrollOffsets(IDWriteTextLayout* layout, const D2D1_RECT_F& content) {
+		if (!layout) {
+			return;
+		}
+		DWRITE_TEXT_METRICS textMetrics{};
+		layout->GetMetrics(&textMetrics);
+		const float visibleWidth = (std::max)(1.0f, content.right - content.left);
+		const float visibleHeight = (std::max)(1.0f, content.bottom - content.top);
+		const float maxScrollX = multiline_ ? 0.0f : (std::max)(0.0f, textMetrics.widthIncludingTrailingWhitespace - visibleWidth + 8.0f);
+		const float maxScrollY = multiline_ ? (std::max)(0.0f, textMetrics.height - visibleHeight + 6.0f) : 0.0f;
+		FLOAT caretX = 0.0f;
+		FLOAT caretY = 0.0f;
+		DWRITE_HIT_TEST_METRICS caretMetrics{};
+		if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
+			if (caretX < scrollX_ + 4.0f) {
+				scrollX_ = (std::max)(0.0f, caretX - 4.0f);
+			}
+			else if (caretX + 2.0f > scrollX_ + visibleWidth - 4.0f) {
+				scrollX_ = (std::min)(maxScrollX, caretX + 2.0f - visibleWidth + 4.0f);
+			}
+			if (caretY < scrollY_ + 2.0f) {
+				scrollY_ = (std::max)(0.0f, caretY - 2.0f);
+			}
+			else if (caretY + caretMetrics.height > scrollY_ + visibleHeight - 4.0f) {
+				scrollY_ = (std::min)(maxScrollY, caretY + caretMetrics.height - visibleHeight + 4.0f);
+			}
+		}
+		scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
+		scrollY_ = (std::clamp)(scrollY_, 0.0f, maxScrollY);
+		ensureCaretVisible_ = false;
+	}
+
+	void UpdateCaretBlink() {
+		if (!focused_) {
+			return;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= nextCaretBlinkToggle_) {
+			caretTargetVisible_ = !caretTargetVisible_;
+			AnimateLinear(caretOpacityAnimation_, caretTargetVisible_ ? 1.0f : 0.0f, 0.12);
+			nextCaretBlinkToggle_ = now + std::chrono::milliseconds(530);
+		}
+	}
+
+	void ResetCaretBlink() {
+		caretTargetVisible_ = true;
+		AnimateLinear(caretOpacityAnimation_, 1.0f, 0.06);
+		nextCaretBlinkToggle_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
 	}
 
 	size_t HitTestText(D2D1_POINT_2F point) const {
 		const D2D1_RECT_F content = InflateRect(TextBounds(), 12.0f);
-		const auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), text_, content.right - content.left, content.bottom - content.top);
+		const auto layout = CreateLayout(DisplayText(), content);
 		if (!layout) {
 			return text_.size();
 		}
 		BOOL trailing = FALSE;
 		BOOL inside = FALSE;
 		DWRITE_HIT_TEST_METRICS metrics{};
-		const float localX = point.x - content.left;
-		const float localY = point.y - content.top;
+		const float localX = point.x - content.left + scrollX_;
+		const float localY = point.y - content.top + scrollY_;
 		if (FAILED(layout->HitTestPoint(localX, localY, &trailing, &inside, &metrics))) {
 			return text_.size();
 		}
@@ -1261,6 +1695,7 @@ private:
 		text_.erase(start, SelectionLength());
 		caret_ = start;
 		selectionAnchor_ = start;
+		ensureCaretVisible_ = true;
 		NotifyChanged();
 		return true;
 	}
@@ -1269,6 +1704,8 @@ private:
 		text_.replace(start, length, replacement.data(), replacement.size());
 		caret_ = start + replacement.size();
 		selectionAnchor_ = caret_;
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 		NotifyChanged();
 	}
 
@@ -1289,6 +1726,8 @@ private:
 		if (!extendSelection) {
 			selectionAnchor_ = caret_;
 		}
+		ensureCaretVisible_ = true;
+		ResetCaretBlink();
 	}
 
 	size_t MoveVertical(int direction) const {
@@ -1331,10 +1770,16 @@ private:
 	ComPtr<ID2D1SolidColorBrush> mutedBrush_;
 	ComPtr<ID2D1SolidColorBrush> selectionBrush_;
 	bool multiline_ = false;
+	float scrollX_ = 0.0f;
+	float scrollY_ = 0.0f;
 	size_t caret_ = 0;
 	size_t selectionAnchor_ = 0;
 	bool draggingSelection_ = false;
+	bool ensureCaretVisible_ = true;
 	bool imeActive_ = false;
+	bool caretTargetVisible_ = true;
+	UIAnimation caretOpacityAnimation_{};
+	std::chrono::steady_clock::time_point nextCaretBlinkToggle_ = std::chrono::steady_clock::now();
 	std::wstring imeComposition_;
 	LONG imeCursorPos_ = 0;
 	size_t compositionAnchor_ = 0;
@@ -1378,7 +1823,11 @@ public:
 		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
 		outline_->SetOpacity(0.5f + 0.5f * FocusProgress());
 		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		const bool showScrollBar = NeedsScrollBar();
 		D2D1_RECT_F content = InflateRect(bounds_, 10.0f);
+		if (showScrollBar) {
+			content.right -= 16.0f;
+		}
 		context->PushAxisAlignedClip(content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 		for (size_t row = 0; row < VisibleRows(); ++row) {
 			size_t index = topIndex_ + row;
@@ -1397,18 +1846,48 @@ public:
 			context->DrawTextW(items_[index].c_str(), static_cast<UINT32>(items_[index].size()), format_.Get(), rowRect, textBrush_.Get());
 		}
 		context->PopAxisAlignedClip();
-	}
-
-	void OnPointerMove(D2D1_POINT_2F point) override {
-		hoveredRow_ = RowFromPoint(point);
+		if (showScrollBar) {
+			const auto track = ScrollTrackBounds();
+			const auto thumb = ScrollThumbBounds();
+			outline_->SetOpacity(0.24f + 0.28f * FocusProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), outline_.Get());
+			accent_->SetOpacity(0.52f + 0.18f * HoverProgress() + 0.12f * PressProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(thumb, 8.0f, 8.0f), accent_.Get());
+		}
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override {
 		UIComponent::OnPointerDown(point);
+		if (NeedsScrollBar() && PointInRect(ScrollThumbBounds(), point)) {
+			draggingScroll_ = true;
+			dragOriginY_ = point.y;
+			originTopIndex_ = topIndex_;
+			return;
+		}
 		SelectRow(RowFromPoint(point));
 	}
 
-	void OnPointerUp(D2D1_POINT_2F point) override { UIComponent::OnPointerUp(point); }
+	void OnPointerUp(D2D1_POINT_2F point) override {
+		draggingScroll_ = false;
+		UIComponent::OnPointerUp(point);
+	}
+
+	void OnPointerMove(D2D1_POINT_2F point) override {
+		if (draggingScroll_ && NeedsScrollBar()) {
+			const auto track = ScrollTrackBounds();
+			const auto thumb = ScrollThumbBounds();
+			const float thumbHeight = thumb.bottom - thumb.top;
+			const float trackHeight = (std::max)(1.0f, (track.bottom - track.top) - thumbHeight);
+			const size_t maxOffset = items_.size() > VisibleRows() ? items_.size() - VisibleRows() : 0;
+			if (maxOffset > 0) {
+				const float deltaRatio = (point.y - dragOriginY_) / trackHeight;
+				topIndex_ = (std::min)(maxOffset, static_cast<size_t>((std::max)(0.0f, std::round(originTopIndex_ + deltaRatio * maxOffset))));
+				NotifyScrollChanged();
+			}
+			return;
+		}
+		hoveredRow_ = RowFromPoint(point);
+	}
 
 	void OnMouseWheel(int delta) override {
 		if (delta > 0 && topIndex_ > 0) {
@@ -1433,8 +1912,27 @@ public:
 	}
 
 private:
+	bool NeedsScrollBar() const {
+		return items_.size() > VisibleRows();
+	}
+
 	size_t VisibleRows() const {
 		return static_cast<size_t>((std::max)(1.0f, std::floor((bounds_.bottom - bounds_.top - 20.0f) / 22.0f)));
+	}
+
+	D2D1_RECT_F ScrollTrackBounds() const {
+		return D2D1::RectF(bounds_.right - 14.0f, bounds_.top + 10.0f, bounds_.right - 4.0f, bounds_.bottom - 10.0f);
+	}
+
+	D2D1_RECT_F ScrollThumbBounds() const {
+		const auto track = ScrollTrackBounds();
+		const size_t visibleRows = VisibleRows();
+		const size_t totalRows = (std::max)(visibleRows, items_.size());
+		const float thumbHeight = (std::max)(24.0f, (track.bottom - track.top) * (static_cast<float>(visibleRows) / static_cast<float>(totalRows)));
+		const size_t maxOffset = items_.size() > visibleRows ? items_.size() - visibleRows : 0;
+		const float normalized = maxOffset == 0 ? 0.0f : static_cast<float>(topIndex_) / static_cast<float>(maxOffset);
+		const float thumbTop = track.top + ((track.bottom - track.top) - thumbHeight) * normalized;
+		return D2D1::RectF(track.left, thumbTop, track.right, thumbTop + thumbHeight);
 	}
 
 	std::optional<size_t> RowFromPoint(D2D1_POINT_2F point) const {
@@ -1486,8 +1984,156 @@ private:
 	size_t selectedIndex_ = 0;
 	size_t topIndex_ = 0;
 	std::optional<size_t> hoveredRow_;
+	bool draggingScroll_ = false;
+	float dragOriginY_ = 0.0f;
+	size_t originTopIndex_ = 0;
 	std::function<void(std::wstring_view)> onChanged_;
 	std::function<void(float)> onScrollChanged_;
+};
+
+class ChipStrip final : public UIComponent {
+public:
+	ChipStrip(std::wstring label,
+		ComPtr<IDWriteFactory> dwriteFactory,
+		ComPtr<IDWriteTextFormat> format,
+		ComPtr<IDWriteTextFormat> captionFormat,
+		ComPtr<ID2D1SolidColorBrush> surface,
+		ComPtr<ID2D1SolidColorBrush> accent,
+		ComPtr<ID2D1SolidColorBrush> outline,
+		ComPtr<ID2D1SolidColorBrush> textBrush,
+		std::vector<std::wstring> items)
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), captionFormat_(std::move(captionFormat)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), items_(std::move(items)) {}
+
+	bool IsDynamic() const override { return true; }
+	bool IsFocusable() const override { return true; }
+
+	void Render(ID2D1DeviceContext* context) override {
+		context->DrawTextW(label_.c_str(), static_cast<UINT32>(label_.size()), captionFormat_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textBrush_.Get());
+		const bool showScroll = NeedsScrollBar();
+		D2D1_RECT_F viewport = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom);
+		if (showScroll) {
+			viewport.bottom -= 18.0f;
+		}
+		context->FillRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), surface_.Get());
+		outline_->SetOpacity(0.45f + 0.45f * FocusProgress());
+		context->DrawRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->PushAxisAlignedClip(D2D1::RectF(viewport.left + 8.0f, viewport.top + 8.0f, viewport.right - 8.0f, viewport.bottom - 8.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		float x = viewport.left + 12.0f - scrollOffset_; 
+		for (size_t index = 0; index < items_.size(); ++index) {
+			const float pillWidth = (std::max)(60.0f, detail::MeasureTextWidth(dwriteFactory_.Get(), format_.Get(), items_[index]) + 24.0f);
+			const D2D1_RECT_F pill = D2D1::RectF(x, viewport.top + 12.0f, x + pillWidth, viewport.bottom - 12.0f);
+			accent_->SetOpacity(index == selectedIndex_ ? 0.18f : 0.08f);
+			context->FillRoundedRectangle(D2D1::RoundedRect(pill, 999.0f, 999.0f), accent_.Get());
+			context->DrawTextW(items_[index].c_str(), static_cast<UINT32>(items_[index].size()), format_.Get(), pill, textBrush_.Get());
+			x += pillWidth + 10.0f;
+		}
+		context->PopAxisAlignedClip();
+		if (showScroll) {
+			const auto track = ScrollTrackBounds();
+			const auto thumb = ScrollThumbBounds();
+			outline_->SetOpacity(0.24f + 0.28f * FocusProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), outline_.Get());
+			accent_->SetOpacity(0.52f + 0.18f * HoverProgress() + 0.12f * PressProgress());
+			context->FillRoundedRectangle(D2D1::RoundedRect(thumb, 8.0f, 8.0f), accent_.Get());
+		}
+	}
+
+	void OnPointerDown(D2D1_POINT_2F point) override {
+		UIComponent::OnPointerDown(point);
+		if (NeedsScrollBar() && PointInRect(ScrollThumbBounds(), point)) {
+			draggingScroll_ = true;
+			dragOriginX_ = point.x;
+			originScrollOffset_ = scrollOffset_;
+			return;
+		}
+		const auto hit = HitChip(point);
+		if (hit) {
+			selectedIndex_ = *hit;
+		}
+	}
+
+	void OnPointerMove(D2D1_POINT_2F point) override {
+		if (draggingScroll_ && NeedsScrollBar()) {
+			const auto track = ScrollTrackBounds();
+			const auto thumb = ScrollThumbBounds();
+			const float travel = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
+			scrollOffset_ = (std::clamp)(originScrollOffset_ + (point.x - dragOriginX_) * (MaxScrollOffset() / travel), 0.0f, MaxScrollOffset());
+		}
+	}
+
+	void OnPointerUp(D2D1_POINT_2F point) override {
+		draggingScroll_ = false;
+		UIComponent::OnPointerUp(point);
+	}
+
+	void OnMouseWheel(int delta) override {
+		scrollOffset_ = (std::clamp)(scrollOffset_ + (delta > 0 ? -26.0f : 26.0f), 0.0f, MaxScrollOffset());
+	}
+
+	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
+		if (key == VK_LEFT) scrollOffset_ = (std::max)(0.0f, scrollOffset_ - 24.0f);
+		if (key == VK_RIGHT) scrollOffset_ = (std::min)(MaxScrollOffset(), scrollOffset_ + 24.0f);
+	}
+
+private:
+	bool NeedsScrollBar() const {
+		return MaxScrollOffset() > 1.0f;
+	}
+
+	float ContentWidth() const {
+		float total = 12.0f;
+		for (const auto& item : items_) {
+			total += (std::max)(60.0f, detail::MeasureTextWidth(dwriteFactory_.Get(), format_.Get(), item) + 24.0f) + 10.0f;
+		}
+		return total;
+	}
+
+	float MaxScrollOffset() const {
+		const float viewportWidth = (std::max)(1.0f, bounds_.right - bounds_.left - 16.0f);
+		return (std::max)(0.0f, ContentWidth() - viewportWidth);
+	}
+
+	D2D1_RECT_F ScrollTrackBounds() const {
+		return D2D1::RectF(bounds_.left + 10.0f, bounds_.bottom - 12.0f, bounds_.right - 10.0f, bounds_.bottom - 2.0f);
+	}
+
+	D2D1_RECT_F ScrollThumbBounds() const {
+		const auto track = ScrollTrackBounds();
+		const float maxOffset = (std::max)(1.0f, MaxScrollOffset());
+		const float viewportWidth = (std::max)(1.0f, bounds_.right - bounds_.left - 16.0f);
+		const float thumbWidth = (std::max)(24.0f, (track.right - track.left) * (viewportWidth / (viewportWidth + maxOffset)));
+		const float thumbLeft = track.left + ((track.right - track.left) - thumbWidth) * (scrollOffset_ / maxOffset);
+		return D2D1::RectF(thumbLeft, track.top, thumbLeft + thumbWidth, track.bottom);
+	}
+
+	std::optional<size_t> HitChip(D2D1_POINT_2F point) const {
+		const D2D1_RECT_F viewport = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom - (NeedsScrollBar() ? 18.0f : 0.0f));
+		float x = viewport.left + 12.0f - scrollOffset_;
+		for (size_t index = 0; index < items_.size(); ++index) {
+			const float pillWidth = (std::max)(60.0f, detail::MeasureTextWidth(dwriteFactory_.Get(), format_.Get(), items_[index]) + 24.0f);
+			const D2D1_RECT_F pill = D2D1::RectF(x, viewport.top + 12.0f, x + pillWidth, viewport.bottom - 12.0f);
+			if (PointInRect(pill, point)) {
+				return index;
+			}
+			x += pillWidth + 10.0f;
+		}
+		return std::nullopt;
+	}
+
+	std::wstring label_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
+	ComPtr<IDWriteTextFormat> format_;
+	ComPtr<IDWriteTextFormat> captionFormat_;
+	ComPtr<ID2D1SolidColorBrush> surface_;
+	ComPtr<ID2D1SolidColorBrush> accent_;
+	ComPtr<ID2D1SolidColorBrush> outline_;
+	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	std::vector<std::wstring> items_;
+	float scrollOffset_ = 0.0f;
+	bool draggingScroll_ = false;
+	float dragOriginX_ = 0.0f;
+	float originScrollOffset_ = 0.0f;
+	size_t selectedIndex_ = 0;
 };
 
 class ComboBox final : public UIComponent {
@@ -1943,14 +2589,23 @@ public:
 			return false;
 		}
 		if (key == VK_TAB) {
-			auto it = std::ranges::find(focusOrder_, focused_);
-			if (it == focusOrder_.end()) {
-				SetFocused(focusOrder_.front());
+			std::vector<UIComponent*> focusable;
+			for (auto* component : focusOrder_) {
+				if (component && component->CanFocus()) {
+					focusable.push_back(component);
+				}
+			}
+			if (focusable.empty()) {
+				return false;
+			}
+			auto it = std::ranges::find(focusable, focused_);
+			if (it == focusable.end()) {
+				SetFocused(focusable.front());
 			}
 			else {
 				++it;
-				if (it == focusOrder_.end()) {
-					it = focusOrder_.begin();
+				if (it == focusable.end()) {
+					it = focusable.begin();
 				}
 				SetFocused(*it);
 			}
@@ -2000,6 +2655,7 @@ public:
 
 private:
 	using TextBlock = detail::TextBlock;
+	using ExpandableNote = detail::ExpandableNote;
 	using CardSurface = detail::CardSurface;
 	using Button = detail::Button;
 	using ImageFrame = detail::ImageFrame;
@@ -2010,6 +2666,7 @@ private:
 	using ProgressBar = detail::ProgressBar;
 	using TextInput = detail::TextInput;
 	using ListBox = detail::ListBox;
+	using ChipStrip = detail::ChipStrip;
 	using ComboBox = detail::ComboBox;
 	using ScrollBar = detail::ScrollBar;
 	using Knob = detail::Knob;
@@ -2019,17 +2676,16 @@ private:
 		if (!graphics_.d2dContext || !graphics_.dwriteFactory) {
 			return;
 		}
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.95f, 0.96f, 0.98f, 0.95f), &panelBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(1.0f, 1.0f, 1.0f, 0.98f), &panelBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.886f, 0.91f, 0.949f, 1.0f), &outlineBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.145f, 0.388f, 0.922f, 1.0f), &accentBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.145f, 0.388f, 0.922f, 0.14f), &accentSoftBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.008f, 0.031f, 0.094f, 1.0f), &textBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.392f, 0.455f, 0.545f, 1.0f), &mutedTextBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.988f, 0.988f, 0.992f, 0.98f), &panelBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.89f, 0.89f, 0.91f, 1.0f), &outlineBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.106f, 0.165f, 0.325f, 1.0f), &accentBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.106f, 0.165f, 0.325f, 0.14f), &accentSoftBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &textBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f), &mutedTextBrush_);
 		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(1.0f, 1.0f, 1.0f, 1.0f), &surfaceBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.973f, 0.98f, 0.988f, 1.0f), &surfaceAltBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.059f, 0.09f, 0.165f, 1.0f), &primaryBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(1.0f, 1.0f, 1.0f, 1.0f), &successBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.964f, 0.965f, 0.973f, 1.0f), &surfaceAltBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &primaryBrush_);
+		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &successBrush_);
 
 		graphics_.dwriteFactory->CreateTextFormat(L"Segoe UI Semibold", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20.0f, L"en-us", &titleFormat_);
 		graphics_.dwriteFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &buttonFormat_);
@@ -2083,21 +2739,23 @@ private:
 		leftLayoutOrder_.push_back(preview.get());
 		components_.push_back(std::move(preview));
 
-		auto previewButton = std::make_unique<ImageButton>(L"Open Preview", buttonFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this]() {
+		auto previewButton = std::make_unique<ImageButton>(L"Open Preview", graphics_.dwriteFactory, buttonFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this]() {
 			SetStatus(L"Image button activated from the header-only UI host.");
 		});
+		previewButton->SetTextAlignment(HorizontalAlign::Left, VerticalAlign::Center);
 		previewButton->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 46.0f));
 		previewButton->SetZIndex(3);
 		focusOrder_.push_back(previewButton.get());
 		leftLayoutOrder_.push_back(previewButton.get());
 		components_.push_back(std::move(previewButton));
 
-		auto resetButton = std::make_unique<Button>(L"Reset Canvas", buttonFormat_, primaryBrush_, surfaceAltBrush_, outlineBrush_, surfaceBrush_, [this]() {
+		auto resetButton = std::make_unique<Button>(L"Reset Canvas", graphics_.dwriteFactory, buttonFormat_, primaryBrush_, surfaceAltBrush_, outlineBrush_, surfaceBrush_, [this]() {
 			if (callbacks_.onResetCanvas) {
 				callbacks_.onResetCanvas();
 			}
 			SetStatus(L"Reset requested from the native UI layer.");
 		}, true);
+		resetButton->SetTextAlignment(HorizontalAlign::Center, VerticalAlign::Center);
 		resetButton->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
 		resetButton->SetZIndex(3);
 		focusOrder_.push_back(resetButton.get());
@@ -2194,11 +2852,6 @@ private:
 		listBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 142.0f));
 		listBox->SetZIndex(3);
 		listBox_ = listBox.get();
-		listBox_->SetOnScrollChanged([this](float value) {
-			if (verticalScrollBar_) {
-				verticalScrollBar_->SetExternalValue(value);
-			}
-		});
 		focusOrder_.push_back(listBox_);
 		rightLayoutOrder_.push_back(listBox_);
 		components_.push_back(std::move(listBox));
@@ -2215,43 +2868,12 @@ private:
 		rightLayoutOrder_.push_back(comboBox_);
 		components_.push_back(std::move(comboBox));
 
-		auto horizontalScroll = std::make_unique<ScrollBar>(ScrollOrientation::Horizontal, surfaceAltBrush_, accentBrush_, outlineBrush_, 0.15f, 0.28f, [this](float value) {
-			previewScrollX_ = value;
-			if (preview_) {
-				preview_->SetScrollOffset(previewScrollX_, previewScrollY_);
-			}
-			std::wstringstream ss;
-			ss << L"Horizontal scrollbar: " << static_cast<int>(value * 100.0f) << L"%";
-			SetStatus(ss.str());
-		});
-		horizontalScroll->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 22.0f));
-		horizontalScroll->SetZIndex(3);
-		horizontalScrollBar_ = horizontalScroll.get();
-		focusOrder_.push_back(horizontalScrollBar_);
-		rightLayoutOrder_.push_back(horizontalScrollBar_);
-		components_.push_back(std::move(horizontalScroll));
-
-		auto verticalScroll = std::make_unique<ScrollBar>(ScrollOrientation::Vertical, surfaceAltBrush_, accentBrush_, outlineBrush_, 0.0f, 0.42f, [this](float value) {
-			previewScrollY_ = value;
-			if (preview_) {
-				preview_->SetScrollOffset(previewScrollX_, previewScrollY_);
-			}
-			if (listBox_) {
-				listBox_->SetScrollNormalized(value);
-			}
-			std::wstringstream ss;
-			ss << L"Vertical scrollbar: " << static_cast<int>(value * 100.0f) << L"%";
-			SetStatus(ss.str());
-		});
-		verticalScroll->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 92.0f));
-		verticalScroll->SetZIndex(3);
-		verticalScrollBar_ = verticalScroll.get();
-		if (preview_) {
-			preview_->SetScrollOffset(previewScrollX_, previewScrollY_);
-		}
-		focusOrder_.push_back(verticalScrollBar_);
-		rightLayoutOrder_.push_back(verticalScrollBar_);
-		components_.push_back(std::move(verticalScroll));
+		auto chipStrip = std::make_unique<ChipStrip>(L"Horizontal overflow", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, std::vector<std::wstring>{ L"Telemetry", L"Render Thread", L"Composition", L"Clipboard", L"IME", L"Selection", L"VirtualSurface", L"Animation" });
+		chipStrip->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 76.0f));
+		chipStrip->SetZIndex(3);
+		focusOrder_.push_back(chipStrip.get());
+		rightLayoutOrder_.push_back(chipStrip.get());
+		components_.push_back(std::move(chipStrip));
 
 		auto knob = std::make_unique<Knob>(L"Encoder", captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, 0.42f, [this](float value) {
 			std::wstringstream ss;
@@ -2265,10 +2887,11 @@ private:
 		rightLayoutOrder_.push_back(knob_);
 		components_.push_back(std::move(knob));
 
-		auto statusText = std::make_unique<TextBlock>(L"Bridge ready: Radix-inspired surfaces, focus rings and composite widgets are live.", captionFormat_, mutedTextBrush_, true);
-		statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 56.0f));
+		auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", bodyFormat_, captionFormat_, surfaceAltBrush_, outlineBrush_, textBrush_, mutedTextBrush_);
+		statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 84.0f));
 		statusText->SetZIndex(3);
 		statusText_ = statusText.get();
+		focusOrder_.push_back(statusText_);
 		rightLayoutOrder_.push_back(statusText_);
 		components_.push_back(std::move(statusText));
 
@@ -2283,7 +2906,7 @@ private:
 		}
 		const float gap = 24.0f;
 		const float availableWidth = viewport_.right - viewport_.left - 48.0f;
-		const bool twoColumn = availableWidth >= 560.0f;
+		const bool twoColumn = availableWidth >= 420.0f;
 		const float top = viewport_.top + 24.0f;
 		const float bottom = viewport_.bottom - 24.0f;
 		if (twoColumn) {
@@ -2295,9 +2918,9 @@ private:
 			for (auto* item : rightLayoutOrder_) {
 				item->SetVisible(true);
 			}
-			const float cardWidth = (std::min)(detail::kCardWidth, (std::max)(260.0f, (availableWidth - gap) * 0.5f));
-			const D2D1_RECT_F rightCardBounds = D2D1::RectF(viewport_.right - cardWidth - 24.0f, top, viewport_.right - 24.0f, bottom);
-			const D2D1_RECT_F leftCardBounds = D2D1::RectF(rightCardBounds.left - gap - cardWidth, top, rightCardBounds.left - gap, bottom);
+			const float cardWidth = (std::min)(detail::kCardWidth, (availableWidth - gap) * 0.5f);
+			const D2D1_RECT_F leftCardBounds = D2D1::RectF(viewport_.left + 24.0f, top, viewport_.left + 24.0f + cardWidth, bottom);
+			const D2D1_RECT_F rightCardBounds = D2D1::RectF(leftCardBounds.right + gap, top, leftCardBounds.right + gap + cardWidth, bottom);
 			leftCard_->SetBounds(leftCardBounds);
 			rightCard_->SetBounds(rightCardBounds);
 			layout_->Arrange(leftLayoutOrder_, leftCardBounds, dpiScale_);
@@ -2428,7 +3051,7 @@ private:
 
 	void SetStatus(std::wstring text) {
 		if (statusText_) {
-			statusText_->SetText(std::move(text));
+			statusText_->SetBody(std::move(text));
 		}
 	}
 
@@ -2519,16 +3142,12 @@ private:
 	CardSurface* leftCard_ = nullptr;
 	CardSurface* rightCard_ = nullptr;
 	ImageFrame* preview_ = nullptr;
-	TextBlock* statusText_ = nullptr;
+	ExpandableNote* statusText_ = nullptr;
 	TextInput* singleInput_ = nullptr;
 	TextInput* multiInput_ = nullptr;
 	ListBox* listBox_ = nullptr;
 	ComboBox* comboBox_ = nullptr;
-	ScrollBar* horizontalScrollBar_ = nullptr;
-	ScrollBar* verticalScrollBar_ = nullptr;
 	Knob* knob_ = nullptr;
-	float previewScrollX_ = 0.15f;
-	float previewScrollY_ = 0.0f;
 };
 
 }
