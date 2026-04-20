@@ -14,8 +14,9 @@ public struct RECT { public int Left; public int Top; public int Right; public i
 
 public static class Native {
     public const int SW_RESTORE = 9;
-    public const uint SWP_NOZORDER = 0x0004;
-    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint WM_MOUSEMOVE = 0x0200;
+    public const uint WM_LBUTTONDOWN = 0x0201;
+    public const uint WM_LBUTTONUP = 0x0202;
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
@@ -23,12 +24,10 @@ public static class Native {
     [DllImport("user32.dll", SetLastError = true)] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
-    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll", SetLastError = true)] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 }
 
 public static class AsyncSaver {
@@ -61,9 +60,6 @@ public static class AsyncSaver {
 
 [Native]::SetProcessDPIAware() | Out-Null
 
-$MouseEventLeftDown = 0x0002
-$MouseEventLeftUp = 0x0004
-$MouseEventMove = 0x0001
 $OutputDir = 'D:\Repo\fusion_window\artifacts'
 
 if (-not (Test-Path $OutputDir)) {
@@ -80,8 +76,6 @@ if ([Native]::IsIconic($hwnd)) {
 
 [Native]::SetForegroundWindow($hwnd) | Out-Null
 Start-Sleep -Milliseconds 300
-[Native]::SetWindowPos($hwnd, [IntPtr]::Zero, 0, 0, 1440, 1120, [Native]::SWP_NOZORDER -bor [Native]::SWP_NOACTIVATE) | Out-Null
-Start-Sleep -Milliseconds 240
 
 function Get-Rect {
     $rect = New-Object RECT
@@ -147,6 +141,49 @@ function Read-ClipboardText([int]$retries = 6, [int]$delayMs = 80) {
     return ''
 }
 
+function Write-ClipboardText([string]$value, [int]$retries = 8, [int]$delayMs = 90) {
+    for ($i = 0; $i -lt $retries; $i++) {
+        try {
+            Set-Clipboard -Value $value
+            return $true
+        }
+        catch {
+            Start-Sleep -Milliseconds $delayMs
+        }
+    }
+    return $false
+}
+
+function Test-CaretVisible([string]$imagePath, [int]$expectedX, [int]$topY, [int]$bottomY, [int]$searchRadius = 18, [int]$brightnessThreshold = 140, [int]$minDarkPixels = 12) {
+    if (-not (Test-Path $imagePath)) {
+        return $false
+    }
+
+    $bitmap = [System.Drawing.Bitmap]::FromFile($imagePath)
+    try {
+        $scanTop = [Math]::Max(0, $topY)
+        $scanBottom = [Math]::Min($bitmap.Height - 1, $bottomY)
+        for ($offset = -$searchRadius; $offset -le $searchRadius; $offset++) {
+            $x = [Math]::Max(0, [Math]::Min($bitmap.Width - 1, $expectedX + $offset))
+            $darkCount = 0
+            for ($y = $scanTop; $y -le $scanBottom; $y++) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                $brightness = ($pixel.R + $pixel.G + $pixel.B) / 3
+                if ($brightness -lt $brightnessThreshold) {
+                    $darkCount++
+                }
+            }
+            if ($darkCount -ge $minDarkPixels) {
+                return $true
+            }
+        }
+        return $false
+    }
+    finally {
+        $bitmap.Dispose()
+    }
+}
+
 function Get-ScreenPoint([int]$clientX, [int]$clientY) {
     $point = New-Object POINT
     $point.X = $clientX
@@ -155,30 +192,46 @@ function Get-ScreenPoint([int]$clientX, [int]$clientY) {
     return $point
 }
 
+function Clamp-ClientPoint([int]$clientX, [int]$clientY) {
+    $clientRect = New-Object RECT
+    [Native]::GetClientRect($hwnd, [ref]$clientRect) | Out-Null
+    $x = [Math]::Max(0, [Math]::Min([Math]::Max(0, $clientRect.Right - 1), $clientX))
+    $y = [Math]::Max(0, [Math]::Min([Math]::Max(0, $clientRect.Bottom - 1), $clientY))
+    return [pscustomobject]@{ X = $x; Y = $y }
+}
+
+function New-MouseLParam([int]$x, [int]$y) {
+    return [IntPtr](($y -shl 16) -bor ($x -band 0xFFFF))
+}
+
+function Send-ClientMouse([uint32]$message, [int]$clientX, [int]$clientY, [int]$wParam = 0) {
+    $pt = Clamp-ClientPoint $clientX $clientY
+    [Native]::SendMessageW($hwnd, $message, [IntPtr]$wParam, (New-MouseLParam $pt.X $pt.Y)) | Out-Null
+}
+
 function Click-Client([int]$clientX, [int]$clientY) {
-    $point = Get-ScreenPoint $clientX $clientY
-    [Native]::SetCursorPos($point.X, $point.Y) | Out-Null
-    [System.Windows.Forms.Application]::DoEvents()
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    Send-ClientMouse ([Native]::WM_MOUSEMOVE) $clientX $clientY
     Start-Sleep -Milliseconds 80
-    [Native]::mouse_event($MouseEventLeftDown, 0, 0, 0, [UIntPtr]::Zero)
-    [Native]::mouse_event($MouseEventLeftUp, 0, 0, 0, [UIntPtr]::Zero)
+    Send-ClientMouse ([Native]::WM_LBUTTONDOWN) $clientX $clientY 1
+    Send-ClientMouse ([Native]::WM_LBUTTONUP) $clientX $clientY 0
     Start-Sleep -Milliseconds 120
 }
 
 function Drag-Client([int]$startX, [int]$startY, [int]$endX, [int]$endY, [int]$steps = 8) {
-    $startPoint = Get-ScreenPoint $startX $startY
-    $endPoint = Get-ScreenPoint $endX $endY
-    [Native]::SetCursorPos($startPoint.X, $startPoint.Y) | Out-Null
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    $startPoint = Clamp-ClientPoint $startX $startY
+    $endPoint = Clamp-ClientPoint $endX $endY
+    Send-ClientMouse ([Native]::WM_MOUSEMOVE) $startPoint.X $startPoint.Y
     Start-Sleep -Milliseconds 60
-    [Native]::mouse_event($MouseEventLeftDown, 0, 0, 0, [UIntPtr]::Zero)
+    Send-ClientMouse ([Native]::WM_LBUTTONDOWN) $startPoint.X $startPoint.Y 1
     for ($i = 1; $i -le $steps; $i++) {
         $x = [int][Math]::Round($startPoint.X + (($endPoint.X - $startPoint.X) * $i / $steps))
         $y = [int][Math]::Round($startPoint.Y + (($endPoint.Y - $startPoint.Y) * $i / $steps))
-        [Native]::SetCursorPos($x, $y) | Out-Null
-        [Native]::mouse_event($MouseEventMove, 0, 0, 0, [UIntPtr]::Zero)
+        Send-ClientMouse ([Native]::WM_MOUSEMOVE) $x $y 1
         Start-Sleep -Milliseconds 35
     }
-    [Native]::mouse_event($MouseEventLeftUp, 0, 0, 0, [UIntPtr]::Zero)
+    Send-ClientMouse ([Native]::WM_LBUTTONUP) $endPoint.X $endPoint.Y 0
     Start-Sleep -Milliseconds 140
 }
 
@@ -329,7 +382,12 @@ if ($twoColumn) {
 
 Click-Client $singleInputX $singleInputY
 Start-Sleep -Milliseconds 120
-Set-Clipboard -Value '__pending__'
+[Native]::SetForegroundWindow($hwnd) | Out-Null
+[System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+Start-Sleep -Milliseconds 100
+Save-Capture 'native_ui_01_single_caret.png'
+Start-Sleep -Milliseconds 80
+$null = Write-ClipboardText '__pending__'
 [System.Windows.Forms.SendKeys]::SendWait('^a')
 Start-Sleep -Milliseconds 120
 [System.Windows.Forms.SendKeys]::SendWait('^c')
@@ -339,7 +397,7 @@ $copyOk = $clipboardBefore -eq 'draw hitmarker'
 
 [System.Windows.Forms.SendKeys]::SendWait('native ui selection ok')
 Start-Sleep -Milliseconds 180
-Set-Clipboard -Value '__pending__'
+$null = Write-ClipboardText '__pending__'
 [System.Windows.Forms.SendKeys]::SendWait('^a')
 Start-Sleep -Milliseconds 120
 [System.Windows.Forms.SendKeys]::SendWait('^c')
@@ -348,6 +406,12 @@ $clipboardAfter = Read-ClipboardText
 $replaceOk = $clipboardAfter -eq 'native ui selection ok'
 
 Click-Client $multiInputX $multiInputY
+Start-Sleep -Milliseconds 120
+[Native]::SetForegroundWindow($hwnd) | Out-Null
+[System.Windows.Forms.SendKeys]::SendWait('^{HOME}')
+Start-Sleep -Milliseconds 100
+Save-Capture 'native_ui_02_multi_caret.png'
+Start-Sleep -Milliseconds 80
 [System.Windows.Forms.SendKeys]::SendWait('{END}{ENTER}Clipboard and selection test passed.')
 Start-Sleep -Milliseconds 200
 
@@ -375,6 +439,9 @@ $expandCollapseOk = $true
 Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
 
+$singleCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_01_single_caret.png') ($controlLeft + (Scale-Logical 16)) ($singleBoundsTop + (Scale-Logical 26)) ($singleBoundsTop + $singleBoundsHeight - (Scale-Logical 12))
+$multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
+
 $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $null
 
 [pscustomobject]@{
@@ -382,6 +449,8 @@ $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $nu
     SelectionControlsExercised = $selectionControlsOk
     SingleInputCopyInitial = $copyOk
     SingleInputReplaceAndCopy = $replaceOk
+    SingleInputCaretVisible = $singleCaretVisible
+    MultiInputCaretVisible = $multiCaretVisible
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
     KnobExercised = $knobOk
@@ -389,6 +458,8 @@ $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $nu
     ProcessAliveAfterUiOps = $stillAlive
     Screenshots = @(
         (Join-Path $OutputDir 'native_ui_01_initial.png'),
+        (Join-Path $OutputDir 'native_ui_01_single_caret.png'),
+        (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
         (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
         (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
     ) -join ';'
