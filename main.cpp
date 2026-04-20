@@ -2000,8 +2000,8 @@ int main() {
 	WNDCLASSW wcMain = { 0 }; wcMain.lpfnWndProc = MainWndProc; wcMain.hInstance = hInstance; wcMain.hCursor = LoadCursor(NULL, IDC_ARROW); wcMain.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); wcMain.lpszClassName = L"MainClass"; RegisterClassW(&wcMain);
 	WNDCLASSW wcPanel = { 0 }; wcPanel.lpfnWndProc = PanelWndProc; wcPanel.hInstance = hInstance; wcPanel.hbrBackground = NULL; wcPanel.lpszClassName = L"PanelClass"; RegisterClassW(&wcPanel);
 
-	// 【完美适配高分屏】：初始宽度高度调大为 960x760，并自动按屏幕 DPI 放大！
-	int initW = 960; int initH = 760;
+	// 【完美适配高分屏】：初始窗口保持 960x600 逻辑像素，并自动按屏幕 DPI 放大！
+	int initW = 960; int initH = 600;
 	HDC screenDC = GetDC(NULL); int sysDpi = GetDeviceCaps(screenDC, LOGPIXELSX); ReleaseDC(NULL, screenDC);
 	initW = initW * sysDpi / 96; initH = initH * sysDpi / 96;
 
