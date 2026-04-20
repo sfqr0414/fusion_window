@@ -321,6 +321,7 @@ else {
 }
 $rightCardTop = $captionHeight + $outerMargin
 $leftCardTop = $rightCardTop
+$cardBottom = $clientBounds.Height - $outerMargin
 
 $leftControlLeft = $leftCardLeft + $stackPadding
 $leftControlWidth = $cardWidth - ($stackPadding * 2)
@@ -364,8 +365,14 @@ $noteHeight = (Scale-Logical 48)
 
 $singleInputX = $controlLeft + [int][Math]::Round($controlWidth * 0.25)
 $singleInputY = $singleBoundsTop + (Scale-Logical 36)
+$singleScrollStartX = $controlLeft + (Scale-Logical 36)
+$singleScrollEndX = $controlLeft + $controlWidth - (Scale-Logical 42)
+$singleScrollY = $singleBoundsTop + $singleBoundsHeight - (Scale-Logical 6)
 $multiInputX = $controlLeft + (Scale-Logical 24)
 $multiInputY = $multiBoundsTop + (Scale-Logical 44)
+$multiScrollX = $controlLeft + $controlWidth - (Scale-Logical 6)
+$multiScrollStartY = $multiBoundsTop + (Scale-Logical 38)
+$multiScrollEndY = $multiBoundsTop + $multiBoundsHeight - (Scale-Logical 18)
 $listBoxX = $controlLeft + (Scale-Logical 24)
 $listBoxY = $listBoundsTop + (Scale-Logical 20)
 $listScrollX = $controlLeft + $controlWidth - (Scale-Logical 10)
@@ -382,6 +389,12 @@ $noteY = $noteTop + (Scale-Logical 14)
 
 $previewButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
 $previewButtonY = $previewButtonTop + [int][Math]::Round($previewButtonHeight * 0.5)
+$leftCardScrollX = $leftCardLeft + $cardWidth - (Scale-Logical 8)
+$leftCardScrollStartY = $leftCardTop + (Scale-Logical 92)
+$leftCardScrollEndY = $cardBottom - (Scale-Logical 92)
+$rightCardScrollX = $rightCardLeft + $cardWidth - (Scale-Logical 8)
+$rightCardScrollStartY = $rightCardTop + (Scale-Logical 92)
+$rightCardScrollEndY = $cardBottom - (Scale-Logical 92)
 $previewViewportLeft = $leftControlLeft + (Scale-Logical 12)
 $previewViewportTop = $previewTop + (Scale-Logical 12)
 $previewViewportRight = $leftControlLeft + $leftControlWidth - (Scale-Logical 30)
@@ -413,6 +426,7 @@ $previewAndButtonsOk = $false
 $selectionControlsOk = $false
 $sliderOk = $false
 $scrollbarsOk = $false
+$inputScrollbarsOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
 
@@ -454,6 +468,14 @@ Start-Sleep -Milliseconds 80
 $clipboardAfter = Read-ClipboardText
 $replaceOk = $clipboardAfter -eq 'native ui selection ok'
 
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-Text 'native ui selection ok with a deliberately long single line to force the horizontal scrollbar into view for drag verification'
+Start-Sleep -Milliseconds 180
+Drag-Client $singleScrollStartX $singleScrollY $singleScrollEndX $singleScrollY
+Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_01b_single_scrolled.png'
+
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
 Click-Client ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 40))
@@ -467,7 +489,13 @@ Send-Enter
 Send-Text 'Next: richer text selection and IME support.'
 Send-Enter
 Send-Text 'Clipboard and selection test passed.'
+Send-Enter
+Send-Text 'Fourth line keeps the editor overflowing.'
+Send-Enter
+Send-Text 'Fifth line verifies the vertical scrollbar drag path.'
 Start-Sleep -Milliseconds 200
+Drag-Client $multiScrollX $multiScrollStartY $multiScrollX $multiScrollEndY
+Start-Sleep -Milliseconds 120
 
 Click-Client $listBoxX $listBoxY
 Start-Sleep -Milliseconds 120
@@ -486,7 +514,15 @@ Start-Sleep -Milliseconds 120
 Click-Client $noteX $noteY
 Start-Sleep -Milliseconds 120
 
+if ($twoColumn) {
+    Drag-Client $leftCardScrollX $leftCardScrollStartY $leftCardScrollX $leftCardScrollEndY
+    Drag-Client $leftCardScrollX $leftCardScrollEndY $leftCardScrollX $leftCardScrollStartY
+}
+Drag-Client $rightCardScrollX $rightCardScrollStartY $rightCardScrollX $rightCardScrollEndY
+Drag-Client $rightCardScrollX $rightCardScrollEndY $rightCardScrollX $rightCardScrollStartY
+
 $scrollbarsOk = $true
+$inputScrollbarsOk = $true
 $knobOk = $true
 $expandCollapseOk = $true
 
@@ -507,6 +543,7 @@ $result = [pscustomobject]@{
     MultiInputCaretVisible = $multiCaretVisible
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
+    InputScrollbarsExercised = $inputScrollbarsOk
     KnobExercised = $knobOk
     ExpandCollapseExercised = $expandCollapseOk
     ProcessAliveAfterUiOps = $stillAlive
@@ -528,6 +565,7 @@ if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
 if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
 if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
+if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
 if (-not $result.KnobExercised) { $failures += 'knob' }
 if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }
 if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }
