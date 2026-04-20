@@ -33,6 +33,8 @@ public static class Native {
     [DllImport("user32.dll", SetLastError = true)] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool GetClientRect(IntPtr hWnd, out RECT rect);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll", SetLastError = true)] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
@@ -68,6 +70,9 @@ public static class AsyncSaver {
 "@
 
 [Native]::SetProcessDPIAware() | Out-Null
+
+$MouseEventLeftDown = 0x0002
+$MouseEventLeftUp = 0x0004
 
 $OutputDir = 'D:\Repo\fusion_window\artifacts'
 
@@ -259,6 +264,19 @@ function Send-Enter([int]$delayMs = 40) {
     Start-Sleep -Milliseconds $delayMs
 }
 
+function Move-MouseScreen([int]$screenX, [int]$screenY, [int]$delayMs = 120) {
+    [Native]::SetCursorPos($screenX, $screenY) | Out-Null
+    Start-Sleep -Milliseconds $delayMs
+}
+
+function Click-ScreenLeft([int]$screenX, [int]$screenY, [int]$delayMs = 140) {
+    Move-MouseScreen $screenX $screenY 100
+    [Native]::mouse_event($MouseEventLeftDown, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 45
+    [Native]::mouse_event($MouseEventLeftUp, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds $delayMs
+}
+
 function Click-Client([int]$clientX, [int]$clientY) {
     [Native]::SetForegroundWindow($hwnd) | Out-Null
     Send-ClientMouse ([Native]::WM_MOUSEMOVE) $clientX $clientY
@@ -293,6 +311,21 @@ $dpiScale = $dpi / 96.0
 
 function Scale-Logical([double]$value) {
     return [int][Math]::Round($value * $dpiScale)
+}
+
+function Measure-MenuWidth([string]$text) {
+    $bitmap = New-Object System.Drawing.Bitmap 1, 1
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    $font = New-Object System.Drawing.Font('Microsoft YaHei UI', (14.0 * $dpiScale), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    try {
+        $size = $graphics.MeasureString($text, $font, 4096, [System.Drawing.StringFormat]::GenericTypographic)
+        return [int][Math]::Ceiling($size.Width + (Scale-Logical 20))
+    }
+    finally {
+        $font.Dispose()
+        $graphics.Dispose()
+        $bitmap.Dispose()
+    }
 }
 
 $clientBounds = Get-ClientBoundsInWindow
@@ -407,11 +440,11 @@ $previewVScrollStartY = $previewViewportTop + (Scale-Logical 16)
 $previewVScrollEndY = $previewViewportBottom - (Scale-Logical 22)
 $resetButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
 $resetButtonY = $resetButtonTop + [int][Math]::Round($controlHeight * 0.5)
-$checkboxX = $leftControlLeft + (Scale-Logical 20)
+$checkboxX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.58)
 $checkboxY = $checkboxTop + [int][Math]::Round($controlHeight * 0.5)
-$radio1X = $leftControlLeft + (Scale-Logical 20)
+$radio1X = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.58)
 $radio1Y = $radio1Top + [int][Math]::Round($controlHeight * 0.5)
-$radio2X = $leftControlLeft + (Scale-Logical 20)
+$radio2X = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.58)
 $radio2Y = $radio2Top + [int][Math]::Round($controlHeight * 0.5)
 $sliderStartX = $leftControlLeft + (Scale-Logical 24)
 $sliderEndX = $leftControlLeft + $leftControlWidth - (Scale-Logical 24)
@@ -419,16 +452,43 @@ $sliderY = $sliderTop + (Scale-Logical 26)
 $knobX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
 $knobStartY = $knobTop + (Scale-Logical 42)
 $knobEndY = $knobTop + (Scale-Logical 78)
+$menuLabels = @('文件(F)', '编辑(E)', '视图(V)', '帮助(H)')
+$menuItemWidths = @()
+foreach ($menuLabel in $menuLabels) {
+    $menuItemWidths += (Measure-MenuWidth $menuLabel)
+}
+$menuClientStartX = Scale-Logical 208
+$menuClientY = [int][Math]::Round($captionHeight * 0.5)
+$menuCenters = @()
+$menuCursorX = $menuClientStartX
+foreach ($menuWidth in $menuItemWidths) {
+    $menuCenters += [int][Math]::Round($menuCursorX + ($menuWidth * 0.5))
+    $menuCursorX += $menuWidth
+}
+$fileMenuScreenPoint = Get-ScreenPoint $menuCenters[0] $menuClientY
+$editMenuScreenPoint = Get-ScreenPoint $menuCenters[1] $menuClientY
 
 Save-Capture 'native_ui_01_initial.png'
 
 $previewAndButtonsOk = $false
 $selectionControlsOk = $false
+$menuToggleOk = $false
+$menuHoverSwitchOk = $false
 $sliderOk = $false
 $scrollbarsOk = $false
 $inputScrollbarsOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
+
+Move-MouseScreen $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
+Click-ScreenLeft $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
+Save-Capture 'native_ui_00_menu_open.png' -useCopyFromScreen
+Move-MouseScreen $editMenuScreenPoint.X $editMenuScreenPoint.Y 220
+Save-Capture 'native_ui_00_menu_hover_switch.png' -useCopyFromScreen
+Click-ScreenLeft $editMenuScreenPoint.X $editMenuScreenPoint.Y 180
+Save-Capture 'native_ui_00_menu_closed.png' -useCopyFromScreen
+$menuToggleOk = $true
+$menuHoverSwitchOk = $true
 
 if ($twoColumn) {
     Click-Client $previewButtonX $previewButtonY
@@ -472,9 +532,17 @@ Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
 Send-Text 'native ui selection ok with a deliberately long single line to force the horizontal scrollbar into view for drag verification'
 Start-Sleep -Milliseconds 180
+Save-Capture 'native_ui_01a_single_overflow.png'
+Move-MouseScreen (Get-ScreenPoint $singleScrollEndX $singleScrollY).X (Get-ScreenPoint $singleScrollEndX $singleScrollY).Y 140
+Save-Capture 'native_ui_01aa_single_hover_scrollbar.png'
 Drag-Client $singleScrollStartX $singleScrollY $singleScrollEndX $singleScrollY
 Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_01b_single_scrolled.png'
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-Text 'short text'
+Start-Sleep -Milliseconds 220
+Save-Capture 'native_ui_01c_single_collapsed.png'
 
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
@@ -494,8 +562,16 @@ Send-Text 'Fourth line keeps the editor overflowing.'
 Send-Enter
 Send-Text 'Fifth line verifies the vertical scrollbar drag path.'
 Start-Sleep -Milliseconds 200
+Move-MouseScreen (Get-ScreenPoint $multiScrollX $multiScrollStartY).X (Get-ScreenPoint $multiScrollX $multiScrollStartY).Y 140
+Save-Capture 'native_ui_02aa_multi_hover_scrollbar.png'
 Drag-Client $multiScrollX $multiScrollStartY $multiScrollX $multiScrollEndY
 Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_02a_multi_overflow.png'
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-Text 'Short note.'
+Start-Sleep -Milliseconds 220
+Save-Capture 'native_ui_02b_multi_collapsed.png'
 
 Click-Client $listBoxX $listBoxY
 Start-Sleep -Milliseconds 120
@@ -533,10 +609,23 @@ $singleCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_01_sing
 $multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
 
 $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $null
+$closedCleanly = $false
+if ($stillAlive) {
+    $null = $window.CloseMainWindow()
+    Start-Sleep -Milliseconds 300
+    try {
+        $closedCleanly = $window.WaitForExit(5000)
+    }
+    catch {
+        $closedCleanly = $false
+    }
+}
 
 $result = [pscustomobject]@{
     PreviewButtonsExercised = $previewAndButtonsOk
     SelectionControlsExercised = $selectionControlsOk
+    MenuToggleExercised = $menuToggleOk
+    MenuHoverSwitchExercised = $menuHoverSwitchOk
     SingleInputCopyInitial = $copyOk
     SingleInputReplaceAndCopy = $replaceOk
     SingleInputCaretVisible = $singleCaretVisible
@@ -547,10 +636,21 @@ $result = [pscustomobject]@{
     KnobExercised = $knobOk
     ExpandCollapseExercised = $expandCollapseOk
     ProcessAliveAfterUiOps = $stillAlive
+    ProcessClosedAfterSelftest = $closedCleanly
     Screenshots = @(
         (Join-Path $OutputDir 'native_ui_01_initial.png'),
+        (Join-Path $OutputDir 'native_ui_00_menu_open.png'),
+        (Join-Path $OutputDir 'native_ui_00_menu_hover_switch.png'),
+        (Join-Path $OutputDir 'native_ui_00_menu_closed.png'),
         (Join-Path $OutputDir 'native_ui_01_single_caret.png'),
+        (Join-Path $OutputDir 'native_ui_01a_single_overflow.png'),
+        (Join-Path $OutputDir 'native_ui_01aa_single_hover_scrollbar.png'),
+        (Join-Path $OutputDir 'native_ui_01b_single_scrolled.png'),
+        (Join-Path $OutputDir 'native_ui_01c_single_collapsed.png'),
         (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
+        (Join-Path $OutputDir 'native_ui_02aa_multi_hover_scrollbar.png'),
+        (Join-Path $OutputDir 'native_ui_02a_multi_overflow.png'),
+        (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
         (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
         (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
     ) -join ';'
@@ -559,6 +659,8 @@ $result = [pscustomobject]@{
 $failures = @()
 if (-not $result.PreviewButtonsExercised) { $failures += 'preview/buttons' }
 if (-not $result.SelectionControlsExercised) { $failures += 'selection-controls' }
+if (-not $result.MenuToggleExercised) { $failures += 'menu-toggle' }
+if (-not $result.MenuHoverSwitchExercised) { $failures += 'menu-hover-switch' }
 if (-not $result.SingleInputCopyInitial) { $failures += 'single-input-copy-initial' }
 if (-not $result.SingleInputReplaceAndCopy) { $failures += 'single-input-replace-copy' }
 if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
@@ -569,6 +671,7 @@ if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
 if (-not $result.KnobExercised) { $failures += 'knob' }
 if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }
 if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }
+if (-not $result.ProcessClosedAfterSelftest) { $failures += 'process-exit' }
 
 $result | ConvertTo-Json -Compress
 

@@ -682,6 +682,7 @@ std::atomic<bool> g_IsMenuPopupActive(false);
 std::atomic<int> g_NextMenuIndex{-1};
 std::atomic<bool> g_IsTitleMenuVisible(false);
 std::atomic<int> g_PressedMenuIndexForRender{ -1 };
+constexpr int kCloseMenuRequest = -2;
 
 POINT g_CaptionPressPoint{ 0, 0 };
 int g_PressedMenuIndex = -1;
@@ -1484,6 +1485,19 @@ LRESULT CALLBACK MenuMsgFilterHook(int code, WPARAM wParam, LPARAM lParam) {
 				}
 			}
 		}
+		else if (msg->message == WM_LBUTTONDOWN || msg->message == WM_LBUTTONUP) {
+			POINT pt = msg->pt;
+			ScreenToClient(g_hMainWindow, &pt);
+			if (IsInMenuBarBand(pt)) {
+				const int clickedIndex = GetMenuIndexFromLogicalX((float)pt.x / g_dpiScale);
+				if (clickedIndex != -1) {
+					const int activeIndex = g_PressedMenuIndexForRender.load(std::memory_order_acquire);
+					g_NextMenuIndex.store(clickedIndex == activeIndex ? kCloseMenuRequest : clickedIndex);
+					PostMessageW(g_hMainWindow, WM_CANCELMODE, 0, 0);
+					return 1;
+				}
+			}
+		}
 	}
 	return CallNextHookEx(NULL, code, wParam, lParam);
 }
@@ -1535,6 +1549,9 @@ void ShowCustomWin32Menu(HWND hwnd, int selectedIndex) {
 		DestroyMenu(hMenu);
 
 		currentIndex = g_NextMenuIndex.load();
+		if (currentIndex == kCloseMenuRequest) {
+			break;
+		}
 	}
 
 	g_PressedMenuIndexForRender.store(-1, std::memory_order_release);

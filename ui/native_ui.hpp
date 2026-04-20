@@ -212,6 +212,14 @@ public:
 		}
 	}
 
+	bool HasRunningAnimations() const {
+		if (!manager_) {
+			return false;
+		}
+		UI_ANIMATION_MANAGER_STATUS status = UI_ANIMATION_MANAGER_IDLE;
+		return SUCCEEDED(manager_->GetStatus(&status)) && status != UI_ANIMATION_MANAGER_IDLE;
+	}
+
 private:
 	static UI_ANIMATION_SECONDS NowSeconds() {
 		using clock = std::chrono::steady_clock;
@@ -291,6 +299,10 @@ public:
 	}
 
 	virtual bool IsFocusable() const {
+		return false;
+	}
+
+	virtual bool WantsFrameTick() const {
 		return false;
 	}
 
@@ -680,16 +692,16 @@ inline float ScrollbarOffsetForPointer(const ScrollbarState& state, float axisPo
 	return ((thumbStart - trackStart) / usableExtent) * maxOffset;
 }
 
-inline void DrawRadixScrollbar(ID2D1DeviceContext* context, const ScrollbarState& state, ID2D1SolidColorBrush* thumbSource, ID2D1SolidColorBrush* trackSource) {
-	if (!context || !state.Visible() || !thumbSource || !trackSource) {
+inline void DrawRadixScrollbar(ID2D1DeviceContext* context, const ScrollbarState& state, ID2D1SolidColorBrush* thumbSource, ID2D1SolidColorBrush* trackSource, float visibility = 1.0f) {
+	if (!context || !state.Visible() || !thumbSource || !trackSource || visibility <= 0.001f) {
 		return;
 	}
 	const auto track = state.TrackBounds();
 	auto thumb = state.ThumbBounds();
 	const auto trackColor = trackSource->GetColor();
 	const auto thumbColor = thumbSource->GetColor();
-	const float trackOpacity = state.dragging ? 0.22f : (state.hovered ? 0.18f : 0.14f);
-	const float thumbOpacity = state.dragging ? 0.84f : (state.hovered ? 0.74f : 0.62f);
+	const float trackOpacity = (state.dragging ? 0.22f : (state.hovered ? 0.18f : 0.14f)) * visibility;
+	const float thumbOpacity = (state.dragging ? 0.84f : (state.hovered ? 0.74f : 0.62f)) * visibility;
 	if (state.orientation == ScrollOrientation::Vertical) {
 		thumb.left += 0.5f;
 		thumb.right -= 0.5f;
@@ -909,8 +921,13 @@ inline void DrawStyledText(
 		auto layout = CreateStyledTextLayout(factory, fallbackFormat, text, rect.right - rect.left, rect.bottom - rect.top, style, ranges);
 		if (layout) {
 			layout->SetWordWrapping(wrapping);
-			auto brush = style ? CreateBrush(context, style->color) : nullptr;
-			context->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), brush ? brush.Get() : fallbackBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			ID2D1SolidColorBrush* drawBrush = fallbackBrush;
+			ComPtr<ID2D1SolidColorBrush> brush;
+			if (style && !ColorEqual(style->color, fallbackBrush->GetColor())) {
+				brush = CreateBrush(context, style->color);
+				drawBrush = brush ? brush.Get() : fallbackBrush;
+			}
+			context->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), drawBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 			return;
 		}
 	}
@@ -1134,13 +1151,22 @@ public:
 		: fill_(std::move(fill)), outline_(std::move(outline)), scrollThumb_(std::move(scrollThumb)), scrollTrack_(std::move(scrollTrack)) {}
 
 	bool IsDynamic() const override {
-		return scrollBar_.Visible() || scrollBar_.dragging;
+		return scrollBar_.dragging || ScrollBarOpacity() > 0.01f || ScrollRevealActive();
+	}
+
+	bool WantsFrameTick() const override {
+		return ScrollRevealActive();
+	}
+
+	void OnAttachAnimations() override {
+		RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
 	}
 
 	void SetContentMetrics(float contentHeight) {
 		contentHeight_ = (std::max)(contentHeight, 0.0f);
 		UpdateScrollBarViewport();
 		SetScrollOffset(scrollOffset_);
+		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 	}
 
 	float ScrollOffset() const {
@@ -1164,7 +1190,11 @@ public:
 	}
 
 	D2D1_RECT_F ContentClipBounds() const {
-		return LayoutBounds(NeedsVerticalScrollBar());
+		return LayoutBounds(ShouldReserveVerticalScrollBar());
+	}
+
+	bool ShouldReserveVerticalScrollBar() const {
+		return NeedsVerticalScrollBar() || ScrollBarOpacity() > 0.01f;
 	}
 
 	D2D1_RECT_F LayoutBounds(bool reserveScrollbar) const {
@@ -1188,14 +1218,26 @@ public:
 		if (!visible_ || !fill_ || !outline_) {
 			return;
 		}
+		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 		auto rounded = D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius);
 		context->FillRoundedRectangle(rounded, fill_.Get());
 		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f);
-		DrawRadixScrollbar(context, scrollBar_, scrollThumb_ ? scrollThumb_.Get() : outline_.Get(), scrollTrack_ ? scrollTrack_.Get() : outline_.Get());
+		DrawRadixScrollbar(context, scrollBar_, scrollThumb_ ? scrollThumb_.Get() : outline_.Get(), scrollTrack_ ? scrollTrack_.Get() : outline_.Get(), ScrollBarOpacity());
 	}
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
+		scrollBar_.hovered = NeedsVerticalScrollBar() && HitScrollBar(point);
+		if (scrollBar_.hovered) {
+			TouchScrollReveal();
+		}
 		return HitScrollBar(point) ? CursorKind::Arrow : CursorKind::Arrow;
+	}
+
+	void OnHover(bool hovered) override {
+		UIComponent::OnHover(hovered);
+		if (!hovered && !scrollBar_.dragging) {
+			scrollBar_.hovered = false;
+		}
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override {
@@ -1205,6 +1247,7 @@ public:
 		UIComponent::OnPointerDown(point);
 		scrollBar_.dragging = true;
 		scrollBar_.hovered = true;
+		TouchScrollReveal();
 		dragStartY_ = point.y;
 		startScrollOffset_ = scrollOffset_;
 		if (!scrollBar_.HitThumb(point)) {
@@ -1219,6 +1262,7 @@ public:
 		if (!scrollBar_.dragging) {
 			return;
 		}
+		TouchScrollReveal();
 		const auto track = scrollBar_.TrackBounds();
 		const auto thumb = scrollBar_.ThumbBounds();
 		const float travel = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
@@ -1236,6 +1280,9 @@ public:
 		}
 		scrollBar_.dragging = false;
 		scrollBar_.hovered = scrollBar_.HitTrack(point);
+		if (scrollBar_.hovered) {
+			TouchScrollReveal();
+		}
 		UIComponent::OnPointerUp(point);
 	}
 
@@ -1245,7 +1292,11 @@ public:
 		}
 		const float previousOffset = scrollOffset_;
 		SetScrollOffset(scrollOffset_ + (delta > 0 ? -36.0f : 36.0f));
-		return !NearlyEqual(previousOffset, scrollOffset_, 0.05f);
+		const bool changed = !NearlyEqual(previousOffset, scrollOffset_, 0.05f);
+		if (changed) {
+			TouchScrollReveal();
+		}
+		return changed;
 	}
 
 protected:
@@ -1257,6 +1308,30 @@ protected:
 	}
 
 private:
+	float ScrollBarOpacity() const {
+		return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
+	}
+
+	bool ScrollRevealActive() const {
+		return scrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	bool ShouldRevealScrollBar() const {
+		return NeedsVerticalScrollBar() && (scrollBar_.dragging || scrollBar_.hovered || ScrollRevealActive());
+	}
+
+	void TouchScrollReveal() const {
+		scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	void UpdateScrollBarAnimation(bool visible) {
+		if (visible == scrollBarVisibleTarget_) {
+			return;
+		}
+		scrollBarVisibleTarget_ = visible;
+		AnimateSlotLinear(L"scrollbarVisibility", visible ? 1.0f : 0.0f, 0.16);
+	}
+
 	void UpdateScrollBarViewport() const {
 		scrollBar_.viewport = BaseContentClipBounds();
 		scrollBar_.contentExtent = contentHeight_;
@@ -1281,6 +1356,8 @@ private:
 	float scrollOffset_ = 0.0f;
 	float dragStartY_ = 0.0f;
 	float startScrollOffset_ = 0.0f;
+	bool scrollBarVisibleTarget_ = false;
+	mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 	mutable ScrollbarState scrollBar_{ ScrollOrientation::Vertical };
 	static constexpr float kScrollbarGutter = 18.0f;
 };
@@ -1315,6 +1392,10 @@ public:
 	void SetTextStyle(const TextStyle& style) {
 		textStyle_ = style;
 		textStyleOverride_ = true;
+	}
+
+	void OnAttachAnimations() override {
+		RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
@@ -1383,6 +1464,14 @@ public:
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
 	CursorKind Cursor() const override { return CursorKind::Arrow; }
+	bool WantsFrameTick() const override {
+		return HorizontalScrollRevealActive() || VerticalScrollRevealActive();
+	}
+
+	void OnAttachAnimations() override {
+		RegisterAnimationSlot(L"horizontalScrollbarVisibility", 0.0f);
+		RegisterAnimationSlot(L"verticalScrollbarVisibility", 0.0f);
+	}
 
 	void SetScrollOffset(float x, float y) {
 		scrollX_ = Clamp01(x);
@@ -1391,6 +1480,7 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		const auto metrics = ComputeMetrics();
+		UpdateScrollBarAnimations(metrics);
 		auto rounded = D2D1::RoundedRect(bounds_, 14.0f, 14.0f);
 		context->FillRoundedRectangle(rounded, muted_.Get());
 		const float offsetX = (metrics.contentWidth - metrics.viewportWidth) * scrollX_;
@@ -1422,9 +1512,11 @@ public:
 		dragMode_ = DragMode::None;
 		if (metrics.showHorizontal && metrics.horizontalScroll.HitThumb(point)) {
 			dragMode_ = DragMode::Horizontal;
+			TouchHorizontalScrollReveal();
 		}
 		else if (metrics.showVertical && metrics.verticalScroll.HitThumb(point)) {
 			dragMode_ = DragMode::Vertical;
+			TouchVerticalScrollReveal();
 		}
 		if (dragMode_ != DragMode::None) {
 			dragOrigin_ = point;
@@ -1439,12 +1531,14 @@ public:
 		}
 		const auto metrics = ComputeMetrics();
 		if (dragMode_ == DragMode::Horizontal) {
+			TouchHorizontalScrollReveal();
 			const auto track = metrics.horizontalScroll.TrackBounds();
 			const auto thumb = metrics.horizontalScroll.ThumbBounds();
 			const float trackWidth = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
 			scrollX_ = Clamp01(originScrollX_ + (point.x - dragOrigin_.x) / trackWidth);
 			return;
 		}
+		TouchVerticalScrollReveal();
 		const auto track = metrics.verticalScroll.TrackBounds();
 		const auto thumb = metrics.verticalScroll.ThumbBounds();
 		const float trackHeight = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
@@ -1456,13 +1550,25 @@ public:
 		UIComponent::OnPointerUp(point);
 	}
 
+	void OnHover(bool hovered) override {
+		UIComponent::OnHover(hovered);
+		if (!hovered && dragMode_ == DragMode::None) {
+			horizontalScrollHovered_ = false;
+			verticalScrollHovered_ = false;
+		}
+	}
+
 	bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
 		if (!PointInRect(bounds_, point)) {
 			return false;
 		}
 		const float previous = scrollY_;
 		scrollY_ = Clamp01(scrollY_ + (delta > 0 ? -0.05f : 0.05f));
-		return !NearlyEqual(previous, scrollY_, 0.0001f);
+		const bool changed = !NearlyEqual(previous, scrollY_, 0.0001f);
+		if (changed) {
+			TouchVerticalScrollReveal();
+		}
+		return changed;
 	}
 
 	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
@@ -1481,6 +1587,10 @@ private:
 		float contentHeight = 0.0f;
 		bool showHorizontal = false;
 		bool showVertical = false;
+		bool renderHorizontal = false;
+		bool renderVertical = false;
+		float horizontalOpacity = 0.0f;
+		float verticalOpacity = 0.0f;
 		ScrollbarState horizontalScroll{ ScrollOrientation::Horizontal };
 		ScrollbarState verticalScroll{ ScrollOrientation::Vertical };
 	};
@@ -1501,41 +1611,94 @@ private:
 		metrics.contentHeight = rawHeight * 1.75f;
 		metrics.showHorizontal = metrics.contentWidth > rawWidth + 1.0f;
 		metrics.showVertical = metrics.contentHeight > rawHeight + 1.0f;
-		if (metrics.showVertical) {
+		metrics.horizontalOpacity = HorizontalScrollOpacity();
+		metrics.verticalOpacity = VerticalScrollOpacity();
+		metrics.renderHorizontal = metrics.showHorizontal || metrics.horizontalOpacity > 0.01f;
+		metrics.renderVertical = metrics.showVertical || metrics.verticalOpacity > 0.01f;
+		if (metrics.renderVertical) {
 			metrics.viewport.right -= kScrollGutter;
 		}
-		if (metrics.showHorizontal) {
+		if (metrics.renderHorizontal) {
 			metrics.viewport.bottom -= kScrollGutter;
 		}
 		metrics.viewportWidth = (std::max)(1.0f, metrics.viewport.right - metrics.viewport.left);
 		metrics.viewportHeight = (std::max)(1.0f, metrics.viewport.bottom - metrics.viewport.top);
-		if (metrics.showHorizontal) {
+		if (metrics.renderHorizontal) {
 			metrics.horizontalScroll.viewport = baseViewport;
 			metrics.horizontalScroll.contentExtent = metrics.contentWidth;
 			metrics.horizontalScroll.offset = scrollX_ * (std::max)(0.0f, metrics.contentWidth - metrics.viewportWidth);
+			metrics.horizontalScroll.hovered = horizontalScrollHovered_ || dragMode_ == DragMode::Horizontal;
+			metrics.horizontalScroll.dragging = dragMode_ == DragMode::Horizontal;
 		}
-		if (metrics.showVertical) {
+		if (metrics.renderVertical) {
 			metrics.verticalScroll.viewport = baseViewport;
 			metrics.verticalScroll.contentExtent = metrics.contentHeight;
 			metrics.verticalScroll.offset = scrollY_ * (std::max)(0.0f, metrics.contentHeight - metrics.viewportHeight);
+			metrics.verticalScroll.hovered = verticalScrollHovered_ || dragMode_ == DragMode::Vertical;
+			metrics.verticalScroll.dragging = dragMode_ == DragMode::Vertical;
 		}
 		return metrics;
 	}
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
 		const auto metrics = ComputeMetrics();
-		if ((metrics.showHorizontal && metrics.horizontalScroll.HitTrack(point)) || (metrics.showVertical && metrics.verticalScroll.HitTrack(point))) {
+		horizontalScrollHovered_ = metrics.showHorizontal && metrics.horizontalScroll.HitTrack(point);
+		verticalScrollHovered_ = metrics.showVertical && metrics.verticalScroll.HitTrack(point);
+		if (horizontalScrollHovered_) {
+			TouchHorizontalScrollReveal();
+		}
+		if (verticalScrollHovered_) {
+			TouchVerticalScrollReveal();
+		}
+		if (horizontalScrollHovered_ || verticalScrollHovered_) {
 			return CursorKind::Arrow;
 		}
 		return CursorKind::Arrow;
 	}
 
 	void DrawScrollBars(ID2D1DeviceContext* context, const Metrics& metrics) {
-		if (metrics.showHorizontal) {
-			DrawRadixScrollbar(context, metrics.horizontalScroll, accent_.Get(), outline_.Get());
+		if (metrics.renderHorizontal) {
+			DrawRadixScrollbar(context, metrics.horizontalScroll, accent_.Get(), outline_.Get(), metrics.horizontalOpacity);
 		}
-		if (metrics.showVertical) {
-			DrawRadixScrollbar(context, metrics.verticalScroll, accent_.Get(), outline_.Get());
+		if (metrics.renderVertical) {
+			DrawRadixScrollbar(context, metrics.verticalScroll, accent_.Get(), outline_.Get(), metrics.verticalOpacity);
+		}
+	}
+
+	float HorizontalScrollOpacity() const {
+		return AnimationSlotValue(L"horizontalScrollbarVisibility", 0.0f);
+	}
+
+	float VerticalScrollOpacity() const {
+		return AnimationSlotValue(L"verticalScrollbarVisibility", 0.0f);
+	}
+
+	bool HorizontalScrollRevealActive() const {
+		return horizontalScrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	bool VerticalScrollRevealActive() const {
+		return verticalScrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	void TouchHorizontalScrollReveal() const {
+		horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	void TouchVerticalScrollReveal() const {
+		verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	void UpdateScrollBarAnimations(const Metrics& metrics) {
+		const bool horizontalVisible = metrics.showHorizontal && (horizontalScrollHovered_ || dragMode_ == DragMode::Horizontal || HorizontalScrollRevealActive());
+		const bool verticalVisible = metrics.showVertical && (verticalScrollHovered_ || dragMode_ == DragMode::Vertical || VerticalScrollRevealActive());
+		if (horizontalVisible != horizontalScrollBarVisibleTarget_) {
+			horizontalScrollBarVisibleTarget_ = horizontalVisible;
+			AnimateSlotLinear(L"horizontalScrollbarVisibility", horizontalVisible ? 1.0f : 0.0f, 0.16);
+		}
+		if (verticalVisible != verticalScrollBarVisibleTarget_) {
+			verticalScrollBarVisibleTarget_ = verticalVisible;
+			AnimateSlotLinear(L"verticalScrollbarVisibility", verticalVisible ? 1.0f : 0.0f, 0.16);
 		}
 	}
 
@@ -1544,6 +1707,12 @@ private:
 	ComPtr<ID2D1SolidColorBrush> muted_;
 	float scrollX_ = 0.0f;
 	float scrollY_ = 0.0f;
+	mutable bool horizontalScrollHovered_ = false;
+	mutable bool verticalScrollHovered_ = false;
+	bool horizontalScrollBarVisibleTarget_ = false;
+	bool verticalScrollBarVisibleTarget_ = false;
+	mutable std::chrono::steady_clock::time_point horizontalScrollRevealUntil_{};
+	mutable std::chrono::steady_clock::time_point verticalScrollRevealUntil_{};
 	DragMode dragMode_ = DragMode::None;
 	D2D1_POINT_2F dragOrigin_{ 0.0f, 0.0f };
 	float originScrollX_ = 0.0f;
@@ -1771,14 +1940,6 @@ public:
 		}
 	}
 
-protected:
-	HRESULT CreateHitGeometry(ID2D1Factory1* factory, ID2D1Geometry** geometry) const override {
-		if (!factory || !geometry) {
-			return E_INVALIDARG;
-		}
-		return factory->CreateEllipseGeometry(D2D1::Ellipse(D2D1::Point2F(bounds_.left + 11.0f, bounds_.top + 18.0f), 12.0f, 12.0f), reinterpret_cast<ID2D1EllipseGeometry**>(geometry));
-	}
-
 private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
@@ -1944,9 +2105,20 @@ public:
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
 	CursorKind Cursor() const override { return CursorKind::IBeam; }
+	bool WantsFrameTick() const override {
+		return HorizontalScrollRevealActive() || VerticalScrollRevealActive();
+	}
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
 		auto visual = ComputeVisualState();
-		if ((visual.showHorizontalScroll && visual.horizontalScroll.HitTrack(point)) || (visual.showVerticalScroll && visual.verticalScroll.HitTrack(point))) {
+		horizontalScrollHovered_ = visual.showHorizontalScroll && visual.horizontalScroll.HitTrack(point);
+		verticalScrollHovered_ = visual.showVerticalScroll && visual.verticalScroll.HitTrack(point);
+		if (horizontalScrollHovered_) {
+			TouchHorizontalScrollReveal();
+		}
+		if (verticalScrollHovered_) {
+			TouchVerticalScrollReveal();
+		}
+		if (horizontalScrollHovered_ || verticalScrollHovered_) {
 			return CursorKind::Arrow;
 		}
 		return PointInRect(visual.box, point) ? CursorKind::IBeam : CursorKind::Arrow;
@@ -1969,6 +2141,8 @@ public:
 	void OnAttachAnimations() override {
 		if (animator_) {
 			animator_->Attach(caretOpacityAnimation_, 1.0f);
+			animator_->Attach(horizontalScrollVisibilityAnimation_, 0.0f);
+			animator_->Attach(verticalScrollVisibilityAnimation_, 0.0f);
 		}
 	}
 
@@ -1995,11 +2169,17 @@ public:
 		context->FillRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), surfaceBrush);
 		outlineBrush->SetOpacity(0.58f + FocusProgress() * 0.42f);
 		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), outlineBrush, focused_ ? 1.8f : 1.0f);
+		UpdateScrollbarVisibilityAnimations(visual);
 		SyncScrollOffsets(visual.layout, visual.content);
-		if (visual.showHorizontalScroll) {
+		if (!multiline_) {
+			const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
+			const float drawMaxScrollX = (std::max)(0.0f, MeasureSingleLineContentWidth(visual.renderText) - visibleWidth + 4.0f);
+			scrollX_ = (std::clamp)(scrollX_, 0.0f, drawMaxScrollX);
+		}
+		if (visual.renderHorizontalScroll) {
 			visual.horizontalScroll.offset = scrollX_;
 		}
-		if (visual.showVerticalScroll) {
+		if (visual.renderVerticalScroll) {
 			visual.verticalScroll.offset = scrollY_;
 		}
 		float originY = visual.content.top - scrollY_;
@@ -2021,7 +2201,15 @@ public:
 			context->DrawTextW(placeholder_.c_str(), static_cast<UINT32>(placeholder_.size()), format_.Get(), placeholderRect, mutedBrush);
 		}
 		else {
-			context->DrawTextLayout(origin, visual.layout, styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+			if (multiline_) {
+				context->DrawTextLayout(origin, visual.layout, styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+			}
+			else {
+				const float textHeight = (std::max)(detail::kLineHeight + 2.0f, visual.metrics.height);
+				const float textWidth = MeasureSingleLineContentWidth(visual.renderText) + 24.0f;
+				const D2D1_RECT_F textRect = D2D1::RectF(origin.x, origin.y, origin.x + textWidth, origin.y + textHeight);
+				context->DrawTextW(visual.renderText.c_str(), static_cast<UINT32>(visual.renderText.size()), format_.Get(), textRect, styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+			}
 			DrawImeUnderline(context, visual.layout, origin, outlineBrush);
 		}
 		if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
@@ -2029,11 +2217,11 @@ public:
 			DrawCaret(context, visual.layout, origin, caretColor, caretOpacityAnimation_.Value());
 		}
 		context->PopAxisAlignedClip();
-		if (visual.showHorizontalScroll) {
-			DrawScrollBar(context, visual.horizontalScroll);
+		if (visual.renderHorizontalScroll) {
+			DrawScrollBar(context, visual.horizontalScroll, visual.horizontalOpacity);
 		}
-		if (visual.showVerticalScroll) {
-			DrawScrollBar(context, visual.verticalScroll);
+		if (visual.renderVerticalScroll) {
+			DrawScrollBar(context, visual.verticalScroll, visual.verticalOpacity);
 		}
 	}
 
@@ -2042,6 +2230,8 @@ public:
 		if (visual.showHorizontalScroll && visual.horizontalScroll.HitTrack(point)) {
 			UIComponent::OnPointerDown(point);
 			scrollDragMode_ = ScrollDragMode::Horizontal;
+			horizontalScrollHovered_ = true;
+			TouchHorizontalScrollReveal();
 			ensureCaretVisible_ = false;
 			dragOrigin_ = point;
 			originScrollX_ = scrollX_;
@@ -2055,6 +2245,8 @@ public:
 		if (visual.showVerticalScroll && visual.verticalScroll.HitTrack(point)) {
 			UIComponent::OnPointerDown(point);
 			scrollDragMode_ = ScrollDragMode::Vertical;
+			verticalScrollHovered_ = true;
+			TouchVerticalScrollReveal();
 			ensureCaretVisible_ = false;
 			dragOrigin_ = point;
 			originScrollY_ = scrollY_;
@@ -2078,6 +2270,7 @@ public:
 		if (scrollDragMode_ != ScrollDragMode::None && pressed_) {
 			auto visual = ComputeVisualState();
 			if (scrollDragMode_ == ScrollDragMode::Horizontal && visual.showHorizontalScroll) {
+				TouchHorizontalScrollReveal();
 				const auto track = visual.horizontalScroll.TrackBounds();
 				const auto thumb = visual.horizontalScroll.ThumbBounds();
 				const float travel = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
@@ -2086,6 +2279,7 @@ public:
 				return;
 			}
 			if (scrollDragMode_ == ScrollDragMode::Vertical && visual.showVerticalScroll) {
+				TouchVerticalScrollReveal();
 				const auto track = visual.verticalScroll.TrackBounds();
 				const auto thumb = visual.verticalScroll.ThumbBounds();
 				const float travel = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
@@ -2103,6 +2297,8 @@ public:
 
 	void OnPointerUp(D2D1_POINT_2F point) override {
 		if (scrollDragMode_ != ScrollDragMode::None) {
+			horizontalScrollHovered_ = false;
+			verticalScrollHovered_ = false;
 			scrollDragMode_ = ScrollDragMode::None;
 			UIComponent::OnPointerUp(point);
 			return;
@@ -2111,15 +2307,43 @@ public:
 		draggingSelection_ = false;
 	}
 
+	void OnHover(bool hovered) override {
+		UIComponent::OnHover(hovered);
+		if (!hovered && scrollDragMode_ == ScrollDragMode::None) {
+			horizontalScrollHovered_ = false;
+			verticalScrollHovered_ = false;
+		}
+	}
+
 	bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
 		auto visual = ComputeVisualState();
-		if (!multiline_ || !PointInRect(visual.box, point) || !visual.showVerticalScroll) {
+		if (!PointInRect(visual.box, point)) {
 			return false;
 		}
-		const float previous = scrollY_;
-		scrollY_ = (std::clamp)(scrollY_ + (delta > 0 ? -28.0f : 28.0f), 0.0f, visual.maxScrollY);
+		if (multiline_) {
+			if (!visual.showVerticalScroll) {
+				return false;
+			}
+			const float previous = scrollY_;
+			scrollY_ = (std::clamp)(scrollY_ + (delta > 0 ? -28.0f : 28.0f), 0.0f, visual.maxScrollY);
+			ensureCaretVisible_ = false;
+			const bool changed = !NearlyEqual(previous, scrollY_, 0.05f);
+			if (changed) {
+				TouchVerticalScrollReveal();
+			}
+			return changed;
+		}
+		if (!visual.showHorizontalScroll) {
+			return false;
+		}
+		const float previous = scrollX_;
+		scrollX_ = (std::clamp)(scrollX_ + (delta > 0 ? -32.0f : 32.0f), 0.0f, visual.maxScrollX);
 		ensureCaretVisible_ = false;
-		return !NearlyEqual(previous, scrollY_, 0.05f);
+		const bool changed = !NearlyEqual(previous, scrollX_, 0.05f);
+		if (changed) {
+			TouchHorizontalScrollReveal();
+		}
+		return changed;
 	}
 
 	void OnKeyDown(WPARAM key, const KeyModifiers& modifiers) override {
@@ -2295,6 +2519,7 @@ public:
 
 private:
 	static constexpr float kScrollGutter = 18.0f;
+	static constexpr float kSingleLineScrollGutter = 12.0f;
 
 	enum class ScrollDragMode {
 		None,
@@ -2312,6 +2537,10 @@ private:
 		float maxScrollY = 0.0f;
 		bool showHorizontalScroll = false;
 		bool showVerticalScroll = false;
+		bool renderHorizontalScroll = false;
+		bool renderVerticalScroll = false;
+		float horizontalOpacity = 0.0f;
+		float verticalOpacity = 0.0f;
 		ScrollbarState horizontalScroll{ ScrollOrientation::Horizontal };
 		ScrollbarState verticalScroll{ ScrollOrientation::Vertical };
 	};
@@ -2336,9 +2565,21 @@ private:
 		VisualState state;
 		state.renderText = DisplayText();
 		state.box = TextBounds();
-		state.content = InflateRect(state.box, 12.0f);
+		state.horizontalOpacity = multiline_ ? 0.0f : horizontalScrollVisibilityAnimation_.Value();
+		state.verticalOpacity = multiline_ ? verticalScrollVisibilityAnimation_.Value() : 0.0f;
+		bool reserveHorizontalScroll = !multiline_ && state.horizontalOpacity > 0.01f;
+		bool reserveVerticalScroll = multiline_ && state.verticalOpacity > 0.01f;
 
 		auto refreshLayout = [&]() {
+			state.content = multiline_
+				? InflateRect(state.box, 12.0f)
+				: D2D1::RectF(state.box.left + 12.0f, state.box.top + 6.0f, state.box.right - 12.0f, state.box.bottom - 6.0f);
+			if (reserveVerticalScroll) {
+				state.content.right -= kScrollGutter;
+			}
+			if (reserveHorizontalScroll) {
+				state.content.bottom -= kSingleLineScrollGutter;
+			}
 			state.layout = CreateLayout(state.renderText, state.content);
 			state.metrics = {};
 			if (state.layout) {
@@ -2350,27 +2591,62 @@ private:
 		if (multiline_) {
 			state.maxScrollY = (std::max)(0.0f, state.metrics.height - (state.content.bottom - state.content.top) + 6.0f);
 			state.showVerticalScroll = state.maxScrollY > 0.5f;
-			if (state.showVerticalScroll) {
-				state.content.right -= kScrollGutter;
+			if (state.showVerticalScroll != reserveVerticalScroll) {
+				reserveVerticalScroll = state.showVerticalScroll || state.verticalOpacity > 0.01f;
 				refreshLayout();
 				state.maxScrollY = (std::max)(0.0f, state.metrics.height - (state.content.bottom - state.content.top) + 6.0f);
-				state.verticalScroll = MakeVerticalScrollState(state.box, state.maxScrollY, state.content.bottom - state.content.top);
+			}
+			state.showVerticalScroll = state.maxScrollY > 0.5f;
+			state.renderVerticalScroll = state.showVerticalScroll || state.verticalOpacity > 0.01f;
+			if (state.renderVerticalScroll) {
+				const float effectiveMaxScrollY = state.showVerticalScroll ? state.maxScrollY : 1.0f;
+				state.verticalScroll = MakeVerticalScrollState(state.box, effectiveMaxScrollY, state.content.bottom - state.content.top);
 			}
 		}
 		else {
-			float contentWidth = MeasureSingleLineContentWidth(state.layout, state.metrics, state.renderText.size());
+			float contentWidth = MeasureSingleLineContentWidth(state.renderText);
 			state.maxScrollX = (std::max)(0.0f, contentWidth - (state.content.right - state.content.left) + 8.0f);
 			state.showHorizontalScroll = state.maxScrollX > 0.5f;
-			if (state.showHorizontalScroll) {
-				state.content.bottom -= kScrollGutter;
+			if (state.showHorizontalScroll != reserveHorizontalScroll) {
+				reserveHorizontalScroll = state.showHorizontalScroll || state.horizontalOpacity > 0.01f;
 				refreshLayout();
-				contentWidth = MeasureSingleLineContentWidth(state.layout, state.metrics, state.renderText.size());
+				contentWidth = MeasureSingleLineContentWidth(state.renderText);
 				state.maxScrollX = (std::max)(0.0f, contentWidth - (state.content.right - state.content.left) + 8.0f);
-				state.horizontalScroll = MakeHorizontalScrollState(state.box, state.maxScrollX, state.content.right - state.content.left);
+			}
+			state.showHorizontalScroll = state.maxScrollX > 0.5f;
+			state.renderHorizontalScroll = state.showHorizontalScroll || state.horizontalOpacity > 0.01f;
+			if (state.renderHorizontalScroll) {
+				const float effectiveMaxScrollX = state.showHorizontalScroll ? state.maxScrollX : 1.0f;
+				state.horizontalScroll = MakeHorizontalScrollState(state.box, effectiveMaxScrollX, state.content.right - state.content.left);
 			}
 		}
 
 		return state;
+	}
+
+	void UpdateScrollbarVisibilityAnimations(const VisualState& visual) {
+		if (!multiline_) {
+			AnimateLinear(horizontalScrollVisibilityAnimation_, visual.showHorizontalScroll && (horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal || HorizontalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+		}
+		if (multiline_) {
+			AnimateLinear(verticalScrollVisibilityAnimation_, visual.showVerticalScroll && (verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical || VerticalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+		}
+	}
+
+	bool HorizontalScrollRevealActive() const {
+		return horizontalScrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	bool VerticalScrollRevealActive() const {
+		return verticalScrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	void TouchHorizontalScrollReveal() const {
+		horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	void TouchVerticalScrollReveal() const {
+		verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
 	}
 
 	std::wstring DisplayText() const {
@@ -2390,22 +2666,14 @@ private:
 	}
 
 	IDWriteTextLayout* CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
-		const float width = multiline_ ? (content.right - content.left) : 32768.0f;
+		const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, MeasureSingleLineContentWidth(renderText) + 24.0f);
 		const float height = multiline_ ? 32768.0f : (content.bottom - content.top);
 		return contentLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), renderText, width, height, styleOverride_ ? &textStyle_ : nullptr, styledRanges_, multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
 	}
 
-	float MeasureSingleLineContentWidth(IDWriteTextLayout* layout, const DWRITE_TEXT_METRICS& metrics, size_t textLength) const {
-		if (!layout) {
-			return metrics.widthIncludingTrailingWhitespace;
-		}
-		FLOAT caretX = 0.0f;
-		FLOAT caretY = 0.0f;
-		DWRITE_HIT_TEST_METRICS caretMetrics{};
-		if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(textLength), FALSE, &caretX, &caretY, &caretMetrics))) {
-			return (std::max)(1.0f, caretX + (std::max)(caretMetrics.width, 2.0f));
-		}
-		return metrics.widthIncludingTrailingWhitespace;
+	float MeasureSingleLineContentWidth(std::wstring_view renderText) const {
+		const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), renderText, styleOverride_ ? &textStyle_ : nullptr, DWRITE_WORD_WRAPPING_NO_WRAP);
+		return (std::max)(1.0f, metrics.widthIncludingTrailingWhitespace + 2.0f);
 	}
 
 	void ShiftStyledRanges(size_t start, ptrdiff_t delta, size_t removedLength = 0) {
@@ -2519,7 +2787,7 @@ private:
 		layout->GetMetrics(&textMetrics);
 		const float visibleWidth = (std::max)(1.0f, content.right - content.left);
 		const float visibleHeight = (std::max)(1.0f, content.bottom - content.top);
-		const float contentWidth = multiline_ ? 0.0f : MeasureSingleLineContentWidth(layout, textMetrics, DisplayText().size());
+		const float contentWidth = multiline_ ? 0.0f : MeasureSingleLineContentWidth(DisplayText());
 		const float maxScrollX = multiline_ ? 0.0f : (std::max)(0.0f, contentWidth - visibleWidth + 8.0f);
 		const float maxScrollY = multiline_ ? (std::max)(0.0f, textMetrics.height - visibleHeight + 6.0f) : 0.0f;
 		scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
@@ -2556,7 +2824,7 @@ private:
 		state.offset = scrollX_;
 		state.inset = 12.0f;
 		state.edgePadding = 2.0f;
-		state.hovered = focused_ || scrollDragMode_ == ScrollDragMode::Horizontal;
+		state.hovered = horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal;
 		state.dragging = scrollDragMode_ == ScrollDragMode::Horizontal;
 		return state;
 	}
@@ -2568,13 +2836,13 @@ private:
 		state.offset = scrollY_;
 		state.inset = 12.0f;
 		state.edgePadding = 2.0f;
-		state.hovered = focused_ || scrollDragMode_ == ScrollDragMode::Vertical;
+		state.hovered = verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical;
 		state.dragging = scrollDragMode_ == ScrollDragMode::Vertical;
 		return state;
 	}
 
-	void DrawScrollBar(ID2D1DeviceContext* context, const ScrollbarState& state) {
-		DrawRadixScrollbar(context, state, selectionBrush_.Get(), outline_.Get());
+	void DrawScrollBar(ID2D1DeviceContext* context, const ScrollbarState& state, float opacity) {
+		DrawRadixScrollbar(context, state, selectionBrush_.Get(), outline_.Get(), opacity);
 	}
 
 	void UpdateCaretBlink() {
@@ -2711,10 +2979,16 @@ private:
 	D2D1_POINT_2F dragOrigin_{ 0.0f, 0.0f };
 	float originScrollX_ = 0.0f;
 	float originScrollY_ = 0.0f;
+	mutable bool horizontalScrollHovered_ = false;
+	mutable bool verticalScrollHovered_ = false;
+	mutable std::chrono::steady_clock::time_point horizontalScrollRevealUntil_{};
+	mutable std::chrono::steady_clock::time_point verticalScrollRevealUntil_{};
 	bool ensureCaretVisible_ = true;
 	bool imeActive_ = false;
 	bool caretTargetVisible_ = true;
 	UIAnimation caretOpacityAnimation_{};
+	UIAnimation horizontalScrollVisibilityAnimation_{};
+	UIAnimation verticalScrollVisibilityAnimation_{};
 	std::chrono::steady_clock::time_point nextCaretBlinkToggle_ = std::chrono::steady_clock::now();
 	std::wstring imeComposition_;
 	LONG imeCursorPos_ = 0;
@@ -2769,13 +3043,15 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
+		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
 		outline_->SetOpacity(0.5f + 0.5f * FocusProgress());
 		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
 		constexpr float kRowStride = 26.0f;
 		const bool showScrollBar = NeedsScrollBar();
+		const bool renderScrollBar = showScrollBar || ScrollBarOpacity() > 0.01f;
 		D2D1_RECT_F content = InflateRect(bounds_, 10.0f);
-		if (showScrollBar) {
+		if (renderScrollBar) {
 			content.right -= kScrollGutter;
 		}
 		context->PushAxisAlignedClip(content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -2800,8 +3076,8 @@ public:
 			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 		context->PopAxisAlignedClip();
-		if (showScrollBar) {
-			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get());
+		if (renderScrollBar) {
+			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get(), ScrollBarOpacity());
 		}
 	}
 
@@ -2809,6 +3085,8 @@ public:
 		UIComponent::OnPointerDown(point);
 		if (NeedsScrollBar() && MakeScrollState().HitThumb(point)) {
 			draggingScroll_ = true;
+			scrollBarHovered_ = true;
+			TouchScrollReveal();
 			dragOriginY_ = point.y;
 			originTopIndex_ = topIndex_;
 			return;
@@ -2818,11 +3096,16 @@ public:
 
 	void OnPointerUp(D2D1_POINT_2F point) override {
 		draggingScroll_ = false;
+		scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+		if (scrollBarHovered_) {
+			TouchScrollReveal();
+		}
 		UIComponent::OnPointerUp(point);
 	}
 
 	void OnPointerMove(D2D1_POINT_2F point) override {
 		if (draggingScroll_ && NeedsScrollBar()) {
+			TouchScrollReveal();
 			const auto state = MakeScrollState();
 			const auto track = state.TrackBounds();
 			const auto thumb = state.ThumbBounds();
@@ -2839,6 +3122,13 @@ public:
 		hoveredRow_ = RowFromPoint(point);
 	}
 
+	void OnHover(bool hovered) override {
+		UIComponent::OnHover(hovered);
+		if (!hovered && !draggingScroll_) {
+			scrollBarHovered_ = false;
+		}
+	}
+
 	bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
 		if (!PointInRect(bounds_, point) || !NeedsScrollBar()) {
 			return false;
@@ -2851,7 +3141,11 @@ public:
 			++topIndex_;
 		}
 		NotifyScrollChanged();
-		return previous != topIndex_;
+		const bool changed = previous != topIndex_;
+		if (changed) {
+			TouchScrollReveal();
+		}
+		return changed;
 	}
 
 	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
@@ -2867,6 +3161,30 @@ public:
 	}
 
 private:
+	float ScrollBarOpacity() const {
+		return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
+	}
+
+	bool ScrollRevealActive() const {
+		return scrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	void TouchScrollReveal() const {
+		scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	bool ShouldRevealScrollBar() const {
+		return NeedsScrollBar() && (scrollBarHovered_ || draggingScroll_ || ScrollRevealActive());
+	}
+
+	void UpdateScrollBarAnimation(bool visible) {
+		if (visible == scrollBarVisibleTarget_) {
+			return;
+		}
+		scrollBarVisibleTarget_ = visible;
+		AnimateSlotLinear(L"scrollbarVisibility", visible ? 1.0f : 0.0f, 0.16);
+	}
+
 	bool NeedsScrollBar() const {
 		return items_.size() > VisibleRows();
 	}
@@ -2882,7 +3200,7 @@ private:
 		state.offset = static_cast<float>(topIndex_) * 26.0f;
 		state.inset = 10.0f;
 		state.edgePadding = 2.0f;
-		state.hovered = hoveredRow_.has_value() || draggingScroll_ || focused_;
+		state.hovered = scrollBarHovered_ || draggingScroll_;
 		state.dragging = draggingScroll_;
 		return state;
 	}
@@ -2890,7 +3208,9 @@ private:
 	CursorKind Cursor() const override { return CursorKind::Arrow; }
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
-		if (NeedsScrollBar() && MakeScrollState().HitTrack(point)) {
+		scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+		if (scrollBarHovered_) {
+			TouchScrollReveal();
 			return CursorKind::Arrow;
 		}
 		return CursorKind::Arrow;
@@ -2948,9 +3268,12 @@ private:
 	size_t selectedIndex_ = 0;
 	size_t topIndex_ = 0;
 	std::optional<size_t> hoveredRow_;
+	mutable bool scrollBarHovered_ = false;
 	bool draggingScroll_ = false;
+	bool scrollBarVisibleTarget_ = false;
 	float dragOriginY_ = 0.0f;
 	size_t originTopIndex_ = 0;
+	mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 	std::function<void(std::wstring_view)> onChanged_;
 	std::function<void(float)> onScrollChanged_;
 	static constexpr float kScrollGutter = 18.0f;
@@ -2971,6 +3294,7 @@ public:
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+	bool WantsFrameTick() const override { return ScrollRevealActive(); }
 
 	void SetLabelStyle(const TextStyle& style) {
 		labelStyle_ = style;
@@ -2982,12 +3306,18 @@ public:
 		itemStyleOverride_ = true;
 	}
 
+	void OnAttachAnimations() override {
+		RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
+	}
+
 	void Render(ID2D1DeviceContext* context) override {
 		DrawStyledText(context, dwriteFactory_.Get(), captionFormat_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
+		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 		const bool showScroll = NeedsScrollBar();
+		const bool renderScroll = showScroll || ScrollBarOpacity() > 0.01f;
 		D2D1_RECT_F viewport = D2D1::RectF(bounds_.left, bounds_.top + 22.0f, bounds_.right, bounds_.bottom);
 		D2D1_RECT_F contentViewport = viewport;
-		if (showScroll) {
+		if (renderScroll) {
 			contentViewport.bottom -= kScrollGutter;
 		}
 		context->FillRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), surface_.Get());
@@ -3010,8 +3340,8 @@ public:
 			x += pillWidth + 12.0f;
 		}
 		context->PopAxisAlignedClip();
-		if (showScroll) {
-			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get());
+		if (renderScroll) {
+			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get(), ScrollBarOpacity());
 		}
 	}
 
@@ -3019,6 +3349,8 @@ public:
 		UIComponent::OnPointerDown(point);
 		if (NeedsScrollBar() && MakeScrollState().HitThumb(point)) {
 			draggingScroll_ = true;
+			scrollBarHovered_ = true;
+			TouchScrollReveal();
 			dragOriginX_ = point.x;
 			originScrollOffset_ = scrollOffset_;
 			return;
@@ -3031,6 +3363,7 @@ public:
 
 	void OnPointerMove(D2D1_POINT_2F point) override {
 		if (draggingScroll_ && NeedsScrollBar()) {
+			TouchScrollReveal();
 			const auto state = MakeScrollState();
 			const auto track = state.TrackBounds();
 			const auto thumb = state.ThumbBounds();
@@ -3041,7 +3374,18 @@ public:
 
 	void OnPointerUp(D2D1_POINT_2F point) override {
 		draggingScroll_ = false;
+		scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+		if (scrollBarHovered_) {
+			TouchScrollReveal();
+		}
 		UIComponent::OnPointerUp(point);
+	}
+
+	void OnHover(bool hovered) override {
+		UIComponent::OnHover(hovered);
+		if (!hovered && !draggingScroll_) {
+			scrollBarHovered_ = false;
+		}
 	}
 
 	bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
@@ -3050,7 +3394,11 @@ public:
 		}
 		const float previous = scrollOffset_;
 		scrollOffset_ = (std::clamp)(scrollOffset_ + (delta > 0 ? -26.0f : 26.0f), 0.0f, MaxScrollOffset());
-		return !NearlyEqual(previous, scrollOffset_, 0.05f);
+		const bool changed = !NearlyEqual(previous, scrollOffset_, 0.05f);
+		if (changed) {
+			TouchScrollReveal();
+		}
+		return changed;
 	}
 
 	void OnKeyDown(WPARAM key, const KeyModifiers&) override {
@@ -3059,6 +3407,30 @@ public:
 	}
 
 private:
+	float ScrollBarOpacity() const {
+		return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
+	}
+
+	bool ScrollRevealActive() const {
+		return scrollRevealUntil_ > std::chrono::steady_clock::now();
+	}
+
+	void TouchScrollReveal() const {
+		scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+	}
+
+	bool ShouldRevealScrollBar() const {
+		return NeedsScrollBar() && (draggingScroll_ || scrollBarHovered_ || ScrollRevealActive());
+	}
+
+	void UpdateScrollBarAnimation(bool visible) {
+		if (visible == scrollBarVisibleTarget_) {
+			return;
+		}
+		scrollBarVisibleTarget_ = visible;
+		AnimateSlotLinear(L"scrollbarVisibility", visible ? 1.0f : 0.0f, 0.16);
+	}
+
 	bool NeedsScrollBar() const {
 		return MaxScrollOffset() > 1.0f;
 	}
@@ -3084,13 +3456,15 @@ private:
 		state.offset = scrollOffset_;
 		state.inset = 10.0f;
 		state.edgePadding = 2.0f;
-		state.hovered = draggingScroll_ || focused_;
+		state.hovered = draggingScroll_ || scrollBarHovered_;
 		state.dragging = draggingScroll_;
 		return state;
 	}
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
-		if (NeedsScrollBar() && MakeScrollState().HitTrack(point)) {
+		scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+		if (scrollBarHovered_) {
+			TouchScrollReveal();
 			return CursorKind::Arrow;
 		}
 		return CursorKind::Hand;
@@ -3129,9 +3503,12 @@ private:
 	std::vector<std::wstring> items_;
 	float scrollOffset_ = 0.0f;
 	bool draggingScroll_ = false;
+	mutable bool scrollBarHovered_ = false;
+	bool scrollBarVisibleTarget_ = false;
 	float dragOriginX_ = 0.0f;
 	float originScrollOffset_ = 0.0f;
 	size_t selectedIndex_ = 0;
+	mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 	static constexpr float kScrollGutter = 18.0f;
 };
 
@@ -3521,7 +3898,7 @@ public:
 	}
 
 	bool NeedsContinuousRedraw() const {
-		return focused_ != nullptr || captured_ != nullptr || dynamicDirty_;
+		return focused_ != nullptr || captured_ != nullptr || dynamicDirty_ || animationSystem_.HasRunningAnimations() || HasPendingFrameTicks();
 	}
 
 	D2D1_RECT_F VisibleUiBounds() const {
@@ -3828,12 +4205,12 @@ private:
 		}
 		float contentHeight = layout_->Arrange(items, card->LayoutBounds(false), dpiScale_, card->ScrollOffset());
 		card->SetContentMetrics(contentHeight);
-		const bool needsScrollBar = card->NeedsVerticalScrollBar();
+		const bool needsScrollBar = card->ShouldReserveVerticalScrollBar();
 		const float arrangedOffset = card->ScrollOffset();
 		contentHeight = layout_->Arrange(items, card->LayoutBounds(needsScrollBar), dpiScale_, arrangedOffset);
 		card->SetContentMetrics(contentHeight);
 		if (card->ScrollOffset() != arrangedOffset) {
-			layout_->Arrange(items, card->LayoutBounds(card->NeedsVerticalScrollBar()), dpiScale_, card->ScrollOffset());
+			layout_->Arrange(items, card->LayoutBounds(card->ShouldReserveVerticalScrollBar()), dpiScale_, card->ScrollOffset());
 		}
 	}
 
@@ -4220,6 +4597,15 @@ private:
 
 	bool PointInViewport(D2D1_POINT_2F point) const {
 		return UIComponent::PointInRect(viewport_, point);
+	}
+
+	bool HasPendingFrameTicks() const {
+		for (const auto& component : components_) {
+			if (component && component->Visible() && component->WantsFrameTick()) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	void SetStatus(std::wstring text) {
