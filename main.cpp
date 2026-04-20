@@ -419,6 +419,9 @@ std::atomic<int> g_UiVisualLeft{ 0 };
 std::atomic<int> g_UiVisualTop{ 0 };
 std::atomic<int> g_UiVisualRight{ 0 };
 std::atomic<int> g_UiVisualBottom{ 0 };
+std::atomic<bool> g_InjectedCtrlDown{ false };
+std::atomic<bool> g_InjectedShiftDown{ false };
+std::atomic<bool> g_InjectedAltDown{ false };
 
 RECT GetCaptionButtonBounds(HWND hwnd) {
 	RECT rc{ 0, 0, 0, 0 };
@@ -1849,7 +1852,27 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		g_RenderEvent.Notify();
 		return 0;
 	}
+	case WM_KEYUP:
+	case WM_SYSKEYUP: {
+		if (wParam == VK_CONTROL) {
+			g_InjectedCtrlDown.store(false, std::memory_order_relaxed);
+			return 0;
+		}
+		if (wParam == VK_SHIFT) {
+			g_InjectedShiftDown.store(false, std::memory_order_relaxed);
+			return 0;
+		}
+		if (wParam == VK_MENU) {
+			g_InjectedAltDown.store(false, std::memory_order_relaxed);
+			return 0;
+		}
+		break;
+	}
 	case WM_SYSKEYDOWN: {
+		if (wParam == VK_MENU) {
+			g_InjectedAltDown.store(true, std::memory_order_relaxed);
+			return 0;
+		}
 		if (wParam == 'F') { ShowCustomWin32Menu(hwnd, 0); return 0; }
 		if (wParam == 'E') { ShowCustomWin32Menu(hwnd, 1); return 0; }
 		if (wParam == 'V') { ShowCustomWin32Menu(hwnd, 2); return 0; }
@@ -1857,9 +1880,21 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		break;
 	}
 	case WM_KEYDOWN: {
-		const bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-		const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-		const bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0;
+		if (wParam == VK_CONTROL) {
+			g_InjectedCtrlDown.store(true, std::memory_order_relaxed);
+			return 0;
+		}
+		if (wParam == VK_SHIFT) {
+			g_InjectedShiftDown.store(true, std::memory_order_relaxed);
+			return 0;
+		}
+		if (wParam == VK_MENU) {
+			g_InjectedAltDown.store(true, std::memory_order_relaxed);
+			return 0;
+		}
+		const bool ctrlDown = ((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_InjectedCtrlDown.load(std::memory_order_relaxed);
+		const bool shiftDown = ((GetKeyState(VK_SHIFT) & 0x8000) != 0) || g_InjectedShiftDown.load(std::memory_order_relaxed);
+		const bool altDown = ((GetKeyState(VK_MENU) & 0x8000) != 0) || g_InjectedAltDown.load(std::memory_order_relaxed);
 		if ((wParam == 'C' || wParam == 'c') && !ctrlDown) { g_CommandQueue.push(CmdResetCanvas{}); g_RenderEvent.Notify(); return 0; }
 		g_CommandQueue.push(CmdKeyDown{ wParam, ctrlDown, shiftDown, altDown });
 		g_RenderEvent.Notify();
@@ -1965,8 +2000,8 @@ int main() {
 	WNDCLASSW wcMain = { 0 }; wcMain.lpfnWndProc = MainWndProc; wcMain.hInstance = hInstance; wcMain.hCursor = LoadCursor(NULL, IDC_ARROW); wcMain.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); wcMain.lpszClassName = L"MainClass"; RegisterClassW(&wcMain);
 	WNDCLASSW wcPanel = { 0 }; wcPanel.lpfnWndProc = PanelWndProc; wcPanel.hInstance = hInstance; wcPanel.hbrBackground = NULL; wcPanel.lpszClassName = L"PanelClass"; RegisterClassW(&wcPanel);
 
-	// 【完美适配高分屏】：初始宽度高度调大为 960x600，并自动按屏幕 DPI 放大！
-	int initW = 960; int initH = 600;
+	// 【完美适配高分屏】：初始宽度高度调大为 960x760，并自动按屏幕 DPI 放大！
+	int initW = 960; int initH = 760;
 	HDC screenDC = GetDC(NULL); int sysDpi = GetDeviceCaps(screenDC, LOGPIXELSX); ReleaseDC(NULL, screenDC);
 	initW = initW * sysDpi / 96; initH = initH * sysDpi / 96;
 

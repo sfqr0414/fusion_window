@@ -17,6 +17,15 @@ public static class Native {
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
+    public const uint WM_KEYDOWN = 0x0100;
+    public const uint WM_KEYUP = 0x0101;
+    public const uint WM_CHAR = 0x0102;
+    public const int VK_CONTROL = 0x11;
+    public const int VK_SHIFT = 0x10;
+    public const int VK_MENU = 0x12;
+    public const int VK_HOME = 0x24;
+    public const int VK_END = 0x23;
+    public const int VK_RETURN = 0x0D;
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
@@ -209,6 +218,47 @@ function Send-ClientMouse([uint32]$message, [int]$clientX, [int]$clientY, [int]$
     [Native]::SendMessageW($hwnd, $message, [IntPtr]$wParam, (New-MouseLParam $pt.X $pt.Y)) | Out-Null
 }
 
+function Send-KeyDown([int]$virtualKey) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    [Native]::SendMessageW($hwnd, [Native]::WM_KEYDOWN, [IntPtr]$virtualKey, [IntPtr]::Zero) | Out-Null
+}
+
+function Send-KeyUp([int]$virtualKey) {
+    [Native]::SendMessageW($hwnd, [Native]::WM_KEYUP, [IntPtr]$virtualKey, [IntPtr]::Zero) | Out-Null
+}
+
+function Send-KeyPress([int]$virtualKey, [int]$delayMs = 40) {
+    Send-KeyDown $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-KeyUp $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+}
+
+function Send-KeyChord([int]$modifierVirtualKey, [int]$virtualKey, [int]$delayMs = 45) {
+    Send-KeyDown $modifierVirtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-KeyDown $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-KeyUp $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-KeyUp $modifierVirtualKey
+    Start-Sleep -Milliseconds $delayMs
+}
+
+function Send-Text([string]$text, [int]$delayMs = 22) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    foreach ($ch in $text.ToCharArray()) {
+        [Native]::SendMessageW($hwnd, [Native]::WM_CHAR, [IntPtr][int][char]$ch, [IntPtr]::Zero) | Out-Null
+        Start-Sleep -Milliseconds $delayMs
+    }
+}
+
+function Send-Enter([int]$delayMs = 40) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    [Native]::SendMessageW($hwnd, [Native]::WM_CHAR, [IntPtr][Native]::VK_RETURN, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds $delayMs
+}
+
 function Click-Client([int]$clientX, [int]$clientY) {
     [Native]::SetForegroundWindow($hwnd) | Out-Null
     Send-ClientMouse ([Native]::WM_MOUSEMOVE) $clientX $clientY
@@ -251,7 +301,7 @@ $panelWidth = (Scale-Logical 200)
 $captionHeight = (Scale-Logical 32)
 $outerMargin = (Scale-Logical 24)
 $stackPadding = (Scale-Logical 24)
-$stackGap = (Scale-Logical 12)
+$stackGap = (Scale-Logical 8)
 $interCardGap = (Scale-Logical 24)
 $minNarrowCardWidth = (Scale-Logical 300)
 $maxNarrowCardWidth = (Scale-Logical 344)
@@ -298,24 +348,24 @@ $progressTop = $sliderTop + $sliderHeight + $stackGap
 $progressHeight = (Scale-Logical 40)
 
 $singleBoundsTop = $rightCardTop + $stackPadding
-$singleBoundsHeight = (Scale-Logical 60)
+$singleBoundsHeight = (Scale-Logical 56)
 $multiBoundsTop = $singleBoundsTop + $singleBoundsHeight + $stackGap
-$multiBoundsHeight = (Scale-Logical 118)
+$multiBoundsHeight = (Scale-Logical 96)
 $listBoundsTop = $multiBoundsTop + $multiBoundsHeight + $stackGap
-$listBoundsHeight = (Scale-Logical 142)
+$listBoundsHeight = (Scale-Logical 108)
 $comboBoundsTop = $listBoundsTop + $listBoundsHeight + $stackGap
-$comboBoundsHeight = (Scale-Logical 38)
+$comboBoundsHeight = (Scale-Logical 36)
 $chipStripTop = $comboBoundsTop + $comboBoundsHeight + $stackGap
-$chipStripHeight = (Scale-Logical 76)
+$chipStripHeight = (Scale-Logical 56)
 $knobTop = $chipStripTop + $chipStripHeight + $stackGap
-$knobHeight = (Scale-Logical 136)
+$knobHeight = (Scale-Logical 104)
 $noteTop = $knobTop + $knobHeight + $stackGap
-$noteHeight = (Scale-Logical 84)
+$noteHeight = (Scale-Logical 48)
 
 $singleInputX = $controlLeft + [int][Math]::Round($controlWidth * 0.25)
-$singleInputY = $singleBoundsTop + (Scale-Logical 40)
+$singleInputY = $singleBoundsTop + (Scale-Logical 36)
 $multiInputX = $controlLeft + (Scale-Logical 24)
-$multiInputY = $multiBoundsTop + (Scale-Logical 54)
+$multiInputY = $multiBoundsTop + (Scale-Logical 44)
 $listBoxX = $controlLeft + (Scale-Logical 24)
 $listBoxY = $listBoundsTop + (Scale-Logical 20)
 $listScrollX = $controlLeft + $controlWidth - (Scale-Logical 10)
@@ -326,9 +376,9 @@ $comboY = $comboBoundsTop + [int][Math]::Round($comboBoundsHeight * 0.5)
 $comboPopupItemY = ($comboBoundsTop + $comboBoundsHeight + (Scale-Logical 6) + (Scale-Logical 6) + (Scale-Logical 11) + (Scale-Logical 22))
 $chipStripStartX = $controlLeft + (Scale-Logical 28)
 $chipStripEndX = $controlLeft + $controlWidth - (Scale-Logical 40)
-$chipStripY = $chipStripTop + $chipStripHeight - (Scale-Logical 8)
+$chipStripY = $chipStripTop + $chipStripHeight - (Scale-Logical 10)
 $noteX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
-$noteY = $noteTop + (Scale-Logical 18)
+$noteY = $noteTop + (Scale-Logical 14)
 
 $previewButtonX = $leftControlLeft + [int][Math]::Round($leftControlWidth * 0.5)
 $previewButtonY = $previewButtonTop + [int][Math]::Round($previewButtonHeight * 0.5)
@@ -354,8 +404,8 @@ $sliderStartX = $leftControlLeft + (Scale-Logical 24)
 $sliderEndX = $leftControlLeft + $leftControlWidth - (Scale-Logical 24)
 $sliderY = $sliderTop + (Scale-Logical 26)
 $knobX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
-$knobStartY = $knobTop + (Scale-Logical 52)
-$knobEndY = $knobTop + (Scale-Logical 92)
+$knobStartY = $knobTop + (Scale-Logical 42)
+$knobEndY = $knobTop + (Scale-Logical 78)
 
 Save-Capture 'native_ui_01_initial.png'
 
@@ -382,37 +432,41 @@ if ($twoColumn) {
 
 Click-Client $singleInputX $singleInputY
 Start-Sleep -Milliseconds 120
-[Native]::SetForegroundWindow($hwnd) | Out-Null
-[System.Windows.Forms.SendKeys]::SendWait('{HOME}')
+Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
 Start-Sleep -Milliseconds 100
 Save-Capture 'native_ui_01_single_caret.png'
 Start-Sleep -Milliseconds 80
 $null = Write-ClipboardText '__pending__'
-[System.Windows.Forms.SendKeys]::SendWait('^a')
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
-[System.Windows.Forms.SendKeys]::SendWait('^c')
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
 Start-Sleep -Milliseconds 120
 $clipboardBefore = Read-ClipboardText
 $copyOk = $clipboardBefore -eq 'draw hitmarker'
 
-[System.Windows.Forms.SendKeys]::SendWait('native ui selection ok')
+Send-Text 'native ui selection ok'
 Start-Sleep -Milliseconds 180
 $null = Write-ClipboardText '__pending__'
-[System.Windows.Forms.SendKeys]::SendWait('^a')
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
-[System.Windows.Forms.SendKeys]::SendWait('^c')
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
 Start-Sleep -Milliseconds 80
 $clipboardAfter = Read-ClipboardText
 $replaceOk = $clipboardAfter -eq 'native ui selection ok'
 
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
-[Native]::SetForegroundWindow($hwnd) | Out-Null
-[System.Windows.Forms.SendKeys]::SendWait('^{HOME}')
+Click-Client ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 40))
 Start-Sleep -Milliseconds 100
 Save-Capture 'native_ui_02_multi_caret.png'
 Start-Sleep -Milliseconds 80
-[System.Windows.Forms.SendKeys]::SendWait('{END}{ENTER}Clipboard and selection test passed.')
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-Text 'Header-only migration complete.'
+Send-Enter
+Send-Text 'Next: richer text selection and IME support.'
+Send-Enter
+Send-Text 'Clipboard and selection test passed.'
 Start-Sleep -Milliseconds 200
 
 Click-Client $listBoxX $listBoxY
@@ -421,7 +475,7 @@ Start-Sleep -Milliseconds 120
 Click-Client $comboX $comboY
 Start-Sleep -Milliseconds 160
 Save-Capture 'native_ui_02_combo_open.png'
-Click-Client $comboX $comboPopupItemY
+Send-KeyPress 27
 Start-Sleep -Milliseconds 180
 
 Drag-Client $chipStripStartX $chipStripY $chipStripEndX $chipStripY
@@ -444,7 +498,7 @@ $multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi
 
 $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $null
 
-[pscustomobject]@{
+$result = [pscustomobject]@{
     PreviewButtonsExercised = $previewAndButtonsOk
     SelectionControlsExercised = $selectionControlsOk
     SingleInputCopyInitial = $copyOk
@@ -463,4 +517,23 @@ $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $nu
         (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
         (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
     ) -join ';'
+}
+
+$failures = @()
+if (-not $result.PreviewButtonsExercised) { $failures += 'preview/buttons' }
+if (-not $result.SelectionControlsExercised) { $failures += 'selection-controls' }
+if (-not $result.SingleInputCopyInitial) { $failures += 'single-input-copy-initial' }
+if (-not $result.SingleInputReplaceAndCopy) { $failures += 'single-input-replace-copy' }
+if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
+if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
+if (-not $result.SliderExercised) { $failures += 'slider' }
+if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
+if (-not $result.KnobExercised) { $failures += 'knob' }
+if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }
+if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }
+
+$result | ConvertTo-Json -Compress
+
+if ($failures.Count -gt 0) {
+    throw ('native UI selftest failed: ' + ($failures -join ', '))
 }
