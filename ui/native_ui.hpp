@@ -658,6 +658,31 @@ inline ComPtr<ID2D1SolidColorBrush> CreateBrush(ID2D1DeviceContext* context, con
 	return brush;
 }
 
+inline void DrawStyledText(
+	ID2D1DeviceContext* context,
+	IDWriteFactory* factory,
+	IDWriteTextFormat* fallbackFormat,
+	ID2D1SolidColorBrush* fallbackBrush,
+	std::wstring_view text,
+	const D2D1_RECT_F& rect,
+	const TextStyle* style = nullptr,
+	std::span<const StyledTextRange> ranges = {},
+	DWRITE_WORD_WRAPPING wrapping = DWRITE_WORD_WRAPPING_NO_WRAP) {
+	if (!context || !fallbackFormat || !fallbackBrush || rect.right <= rect.left || rect.bottom <= rect.top) {
+		return;
+	}
+	if (factory) {
+		auto layout = CreateStyledTextLayout(factory, fallbackFormat, text, rect.right - rect.left, rect.bottom - rect.top, style, ranges);
+		if (layout) {
+			layout->SetWordWrapping(wrapping);
+			auto brush = style ? CreateBrush(context, style->color) : nullptr;
+			context->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), brush ? brush.Get() : fallbackBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			return;
+		}
+	}
+	context->DrawTextW(text.data(), static_cast<UINT32>(text.size()), fallbackFormat, rect, fallbackBrush);
+}
+
 inline DWRITE_TEXT_ALIGNMENT ToDWrite(HorizontalAlign align) {
 	switch (align) {
 	case HorizontalAlign::Left:
@@ -773,8 +798,8 @@ private:
 
 class ExpandableNote final : public UIComponent {
 public:
-	ExpandableNote(std::wstring title, std::wstring body, ComPtr<IDWriteTextFormat> titleFormat, ComPtr<IDWriteTextFormat> bodyFormat, ComPtr<ID2D1SolidColorBrush> surface, ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> textBrush, ComPtr<ID2D1SolidColorBrush> mutedBrush)
-		: title_(std::move(title)), body_(std::move(body)), titleFormat_(std::move(titleFormat)), bodyFormat_(std::move(bodyFormat)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)) {}
+	ExpandableNote(std::wstring title, std::wstring body, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> titleFormat, ComPtr<IDWriteTextFormat> bodyFormat, ComPtr<ID2D1SolidColorBrush> surface, ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> textBrush, ComPtr<ID2D1SolidColorBrush> mutedBrush)
+		: title_(std::move(title)), body_(std::move(body)), dwriteFactory_(std::move(dwriteFactory)), titleFormat_(std::move(titleFormat)), bodyFormat_(std::move(bodyFormat)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)), titleStyle_(CaptureTextStyle(titleFormat_.Get(), textBrush_.Get())), bodyStyle_(CaptureTextStyle(bodyFormat_.Get(), mutedBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -788,6 +813,16 @@ public:
 		body_ = std::move(body);
 	}
 
+	void SetTitleStyle(const TextStyle& style) {
+		titleStyle_ = style;
+		titleStyleOverride_ = true;
+	}
+
+	void SetBodyStyle(const TextStyle& style) {
+		bodyStyle_ = style;
+		bodyStyleOverride_ = true;
+	}
+
 	void OnAttachAnimations() override {
 		RegisterAnimationSlot(L"expand", expanded_ ? 1.0f : 0.0f);
 	}
@@ -797,7 +832,7 @@ public:
 		outline_->SetOpacity(0.4f + 0.5f * FocusProgress());
 		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
 		const D2D1_RECT_F headerRect = D2D1::RectF(bounds_.left + 14.0f, bounds_.top + 8.0f, bounds_.right - 28.0f, bounds_.top + 30.0f);
-		context->DrawTextW(title_.c_str(), static_cast<UINT32>(title_.size()), titleFormat_.Get(), headerRect, textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), titleFormat_.Get(), textBrush_.Get(), title_, headerRect, titleStyleOverride_ ? &titleStyle_ : nullptr);
 		const float expand = AnimationSlotValue(L"expand", 0.0f);
 		const float arrowCenterX = bounds_.right - 16.0f;
 		const float arrowCenterY = bounds_.top + 18.0f;
@@ -811,8 +846,15 @@ public:
 		const float visibleHeight = (bodyRect.bottom - bodyRect.top) * expand;
 		const D2D1_RECT_F clip = D2D1::RectF(bodyRect.left, bodyRect.top, bodyRect.right, bodyRect.top + visibleHeight);
 		context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-		mutedBrush_->SetOpacity(expand);
-		context->DrawTextW(body_.c_str(), static_cast<UINT32>(body_.size()), bodyFormat_.Get(), bodyRect, mutedBrush_.Get());
+		if (bodyStyleOverride_) {
+			TextStyle animatedBodyStyle = bodyStyle_;
+			animatedBodyStyle.color.a *= expand;
+			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush_.Get(), body_, bodyRect, &animatedBodyStyle, {}, DWRITE_WORD_WRAPPING_WRAP);
+		}
+		else {
+			mutedBrush_->SetOpacity(expand);
+			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush_.Get(), body_, bodyRect, nullptr, {}, DWRITE_WORD_WRAPPING_WRAP);
+		}
 		context->PopAxisAlignedClip();
 	}
 
@@ -837,12 +879,17 @@ public:
 private:
 	std::wstring title_;
 	std::wstring body_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> titleFormat_;
 	ComPtr<IDWriteTextFormat> bodyFormat_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	ComPtr<ID2D1SolidColorBrush> mutedBrush_;
+	TextStyle titleStyle_{};
+	TextStyle bodyStyle_{};
+	bool titleStyleOverride_ = false;
+	bool bodyStyleOverride_ = false;
 	bool expanded_ = true;
 };
 
@@ -884,7 +931,7 @@ public:
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void()> onClick,
 		bool primary)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), primaryFill_(std::move(primaryFill)), secondaryFill_(std::move(secondaryFill)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), primary_(primary) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), primaryFill_(std::move(primaryFill)), secondaryFill_(std::move(secondaryFill)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), primary_(primary), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -900,6 +947,11 @@ public:
 		textPaddingY_ = topBottom;
 	}
 
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
+
 	void Render(ID2D1DeviceContext* context) override {
 		auto rounded = D2D1::RoundedRect(bounds_, 12.0f, 12.0f);
 		auto* fill = primary_ ? primaryFill_.Get() : secondaryFill_.Get();
@@ -912,11 +964,11 @@ public:
 		textBrush_->SetOpacity(enabled_ ? 1.0f : 0.5f);
 		const D2D1_RECT_F textRect = D2D1::RectF(bounds_.left + textPaddingX_, bounds_.top + textPaddingY_, bounds_.right - textPaddingX_, bounds_.bottom - textPaddingY_);
 		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top);
-		if (layout) {
-			layout->SetTextAlignment(ToDWrite(horizontalAlign_));
-			layout->SetParagraphAlignment(ToDWrite(verticalAlign_));
-			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout.Get(), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		if (textStyleOverride_) {
+			textStyle_.horizontalAlign = horizontalAlign_;
+			textStyle_.verticalAlign = verticalAlign_;
 		}
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override {
@@ -951,6 +1003,8 @@ private:
 	VerticalAlign verticalAlign_ = VerticalAlign::Center;
 	float textPaddingX_ = 14.0f;
 	float textPaddingY_ = 6.0f;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 };
 
 class ImageFrame final : public UIComponent {
@@ -1131,7 +1185,7 @@ public:
 		ComPtr<ID2D1SolidColorBrush> outline,
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void()> onClick)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1140,6 +1194,11 @@ public:
 	void SetTextAlignment(HorizontalAlign horizontal, VerticalAlign vertical) {
 		horizontalAlign_ = horizontal;
 		verticalAlign_ = vertical;
+	}
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
@@ -1157,11 +1216,11 @@ public:
 		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(imageRect.right - 12.0f, imageRect.top + 12.0f), 4.0f, 4.0f), accent_.Get());
 		const D2D1_RECT_F textRect = D2D1::RectF(imageRect.right + 12.0f, bounds_.top + 6.0f, bounds_.right - 12.0f, bounds_.bottom - 6.0f);
 		auto layout = CreateTextLayout(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top);
-		if (layout) {
-			layout->SetTextAlignment(ToDWrite(horizontalAlign_));
-			layout->SetParagraphAlignment(ToDWrite(verticalAlign_));
-			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout.Get(), textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+		if (textStyleOverride_) {
+			textStyle_.horizontalAlign = horizontalAlign_;
+			textStyle_.verticalAlign = verticalAlign_;
 		}
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -1189,11 +1248,14 @@ private:
 	std::function<void()> onClick_;
 	HorizontalAlign horizontalAlign_ = HorizontalAlign::Left;
 	VerticalAlign verticalAlign_ = VerticalAlign::Center;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 };
 
 class Checkbox final : public UIComponent {
 public:
 	Checkbox(std::wstring text,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
@@ -1201,10 +1263,15 @@ public:
 		ComPtr<ID2D1SolidColorBrush> outline,
 		bool initialValue,
 		std::function<void(bool)> onChanged)
-		: text_(std::move(text)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), checked_(initialValue), onChanged_(std::move(onChanged)) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), checked_(initialValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	void OnAttachAnimations() override {
 		if (animator_) {
@@ -1222,7 +1289,7 @@ public:
 			accent_->SetOpacity(0.45f + 0.35f * check + 0.2f * HoverProgress());
 			context->FillRoundedRectangle(D2D1::RoundedRect(InflateRect(box, 3.0f), 4.0f, 4.0f), accent_.Get());
 		}
-		context->DrawTextW(text_.c_str(), static_cast<UINT32>(text_.size()), format_.Get(), D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -1248,11 +1315,14 @@ public:
 
 private:
 	std::wstring text_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 	bool checked_ = false;
 	UIAnimation checkAnimation_{};
 	std::function<void(bool)> onChanged_;
@@ -1261,6 +1331,7 @@ private:
 class RadioButton final : public UIComponent {
 public:
 	RadioButton(std::wstring text,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
@@ -1269,10 +1340,15 @@ public:
 		std::shared_ptr<int> selectedValue,
 		int ownValue,
 		std::function<void(int)> onChanged)
-		: text_(std::move(text)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), selectedValue_(std::move(selectedValue)), ownValue_(ownValue), onChanged_(std::move(onChanged)) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), selectedValue_(std::move(selectedValue)), ownValue_(ownValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	void OnAttachAnimations() override {
 		if (animator_) {
@@ -1292,7 +1368,7 @@ public:
 			accent_->SetOpacity(0.5f + 0.3f * selected + 0.2f * HoverProgress());
 			context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f + selected * 2.0f, 3.0f + selected * 2.0f), accent_.Get());
 		}
-		context->DrawTextW(text_.c_str(), static_cast<UINT32>(text_.size()), format_.Get(), D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -1326,11 +1402,14 @@ protected:
 
 private:
 	std::wstring text_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 	std::shared_ptr<int> selectedValue_;
 	int ownValue_ = 0;
 	UIAnimation selectionAnimation_{};
@@ -1340,6 +1419,7 @@ private:
 class Slider final : public UIComponent {
 public:
 	Slider(std::wstring label,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
@@ -1347,10 +1427,15 @@ public:
 		ComPtr<ID2D1SolidColorBrush> outline,
 		float initialValue,
 		std::function<void(float)> onChanged)
-		: label_(std::move(label)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), value_(Clamp01(initialValue)), onChanged_(std::move(onChanged)) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), value_(Clamp01(initialValue)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	void OnAttachAnimations() override {
 		if (animator_) {
@@ -1359,7 +1444,7 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		context->DrawTextW(label_.c_str(), static_cast<UINT32>(label_.size()), format_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 		D2D1_RECT_F track = TrackBounds();
 		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), surface_.Get());
 		const float value = valueAnimation_.Value();
@@ -1397,11 +1482,14 @@ private:
 	}
 
 	std::wstring label_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 	float value_ = 0.0f;
 	UIAnimation valueAnimation_{};
 	std::function<void(float)> onChanged_;
@@ -1410,21 +1498,27 @@ private:
 class ProgressBar final : public UIComponent {
 public:
 	ProgressBar(std::wstring label,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		UIAnimation* animation)
-		: label_(std::move(label)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), animation_(animation) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), animation_(animation), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	void Render(ID2D1DeviceContext* context) override {
 		std::wstringstream ss;
 		float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
 		ss << label_ << L"  " << static_cast<int>(progress * 100.0f) << L"%";
 		auto text = ss.str();
-		context->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 		D2D1_RECT_F track = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.top + 32.0f);
 		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), surface_.Get());
 		D2D1_RECT_F fill = D2D1::RectF(track.left, track.top, track.left + (track.right - track.left) * progress, track.bottom);
@@ -1433,11 +1527,14 @@ public:
 
 private:
 	std::wstring label_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
 	UIAnimation* animation_ = nullptr;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 };
 
 class TextInput final : public UIComponent {
@@ -1493,6 +1590,7 @@ public:
 		const D2D1_RECT_F labelRect = D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f);
 		auto labelLayout = CreateStyledTextLayout(dwriteFactory_.Get(), format_.Get(), label_, labelRect.right - labelRect.left, labelRect.bottom - labelRect.top, labelStyleOverride_ ? &labelStyle_ : nullptr);
 		auto labelBrush = labelStyleOverride_ ? CreateBrush(context, labelStyle_.color) : nullptr;
+		auto styledTextBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
 		if (labelLayout) {
 			context->DrawTextLayout(D2D1::Point2F(labelRect.left, labelRect.top), labelLayout.Get(), labelBrush ? labelBrush.Get() : mutedBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 		}
@@ -1515,12 +1613,11 @@ public:
 			context->DrawTextW(placeholder_.c_str(), static_cast<UINT32>(placeholder_.size()), format_.Get(), content, mutedBrush);
 		}
 		else {
-			auto styledBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
-			context->DrawTextLayout(origin, layout.Get(), styledBrush ? styledBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			context->DrawTextLayout(origin, layout.Get(), styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 			DrawImeUnderline(context, layout.Get(), origin, outlineBrush);
 		}
 		if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
-			DrawCaret(context, layout.Get(), origin, outlineBrush, caretOpacityAnimation_.Value());
+			DrawCaret(context, layout.Get(), origin, styledTextBrush ? styledTextBrush.Get() : textBrush, caretOpacityAnimation_.Value());
 		}
 		context->PopAxisAlignedClip();
 	}
@@ -1843,7 +1940,7 @@ private:
 		}
 	}
 
-	void DrawCaret(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* outlineBrush, float opacity) {
+	void DrawCaret(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* caretBrush, float opacity) {
 		FLOAT x = origin.x;
 		FLOAT y = origin.y;
 		DWRITE_HIT_TEST_METRICS metrics{};
@@ -1852,8 +1949,12 @@ private:
 			x = origin.x + 1.0f;
 			y = origin.y + 2.0f;
 		}
-		outlineBrush->SetOpacity((std::clamp)(opacity, 0.0f, 1.0f));
-		context->FillRectangle(D2D1::RectF(x, y, x + 2.0f, y + (std::max)(metrics.height, 18.0f)), outlineBrush);
+		else {
+			x += origin.x;
+			y += origin.y;
+		}
+		caretBrush->SetOpacity((std::clamp)(opacity, 0.0f, 1.0f));
+		context->FillRectangle(D2D1::RectF(x, y, x + 2.0f, y + (std::max)(metrics.height, 18.0f)), caretBrush);
 	}
 
 	void SyncScrollOffsets(IDWriteTextLayout* layout, const D2D1_RECT_F& content) {
@@ -2039,16 +2140,22 @@ private:
 class ListBox final : public UIComponent {
 public:
 	ListBox(std::vector<std::wstring> items,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
 		ComPtr<ID2D1SolidColorBrush> outline,
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void(std::wstring_view)> onChanged)
-		: items_(std::move(items)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)) {}
+		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	void SetOnScrollChanged(std::function<void(float)> onScrollChanged) {
 		onScrollChanged_ = std::move(onScrollChanged);
@@ -2092,7 +2199,7 @@ public:
 				accent_->SetOpacity(0.08f + 0.08f * HoverProgress());
 				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), accent_.Get());
 			}
-			context->DrawTextW(items_[index].c_str(), static_cast<UINT32>(items_[index].size()), format_.Get(), rowRect, textBrush_.Get());
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], rowRect, textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 		context->PopAxisAlignedClip();
 		if (showScrollBar) {
@@ -2225,11 +2332,14 @@ private:
 	}
 
 	std::vector<std::wstring> items_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 	size_t selectedIndex_ = 0;
 	size_t topIndex_ = 0;
 	std::optional<size_t> hoveredRow_;
@@ -2256,8 +2366,18 @@ public:
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
 
+	void SetLabelStyle(const TextStyle& style) {
+		labelStyle_ = style;
+		labelStyleOverride_ = true;
+	}
+
+	void SetItemStyle(const TextStyle& style) {
+		itemStyle_ = style;
+		itemStyleOverride_ = true;
+	}
+
 	void Render(ID2D1DeviceContext* context) override {
-		context->DrawTextW(label_.c_str(), static_cast<UINT32>(label_.size()), captionFormat_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), captionFormat_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
 		const bool showScroll = NeedsScrollBar();
 		D2D1_RECT_F viewport = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom);
 		if (showScroll) {
@@ -2273,7 +2393,7 @@ public:
 			const D2D1_RECT_F pill = D2D1::RectF(x, viewport.top + 12.0f, x + pillWidth, viewport.bottom - 12.0f);
 			accent_->SetOpacity(index == selectedIndex_ ? 0.18f : 0.08f);
 			context->FillRoundedRectangle(D2D1::RoundedRect(pill, 999.0f, 999.0f), accent_.Get());
-			context->DrawTextW(items_[index].c_str(), static_cast<UINT32>(items_[index].size()), format_.Get(), pill, textBrush_.Get());
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], pill, itemStyleOverride_ ? &itemStyle_ : nullptr);
 			x += pillWidth + 10.0f;
 		}
 		context->PopAxisAlignedClip();
@@ -2377,6 +2497,10 @@ private:
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	TextStyle labelStyle_{};
+	TextStyle itemStyle_{};
+	bool labelStyleOverride_ = false;
+	bool itemStyleOverride_ = false;
 	std::vector<std::wstring> items_;
 	float scrollOffset_ = 0.0f;
 	bool draggingScroll_ = false;
@@ -2388,16 +2512,22 @@ private:
 class ComboBox final : public UIComponent {
 public:
 	ComboBox(std::vector<std::wstring> items,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
 		ComPtr<ID2D1SolidColorBrush> outline,
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		std::function<void(std::wstring_view)> onChanged)
-		: items_(std::move(items)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)) {}
+		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetTextStyle(const TextStyle& style) {
+		textStyle_ = style;
+		textStyleOverride_ = true;
+	}
 
 	bool HitTest(ID2D1Factory1*, D2D1_POINT_2F point) const override {
 		return PointInRect(bounds_, point) || (open_ && PointInRect(PopupBounds(), point));
@@ -2410,7 +2540,7 @@ public:
 		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + (std::max)(FocusProgress(), openAmount));
 		if (!items_.empty()) {
 			const std::wstring& selected = items_[selectedIndex_];
-			context->DrawTextW(selected.c_str(), static_cast<UINT32>(selected.size()), format_.Get(), D2D1::RectF(bounds_.left + 12.0f, bounds_.top, bounds_.right - 28.0f, bounds_.bottom), textBrush_.Get());
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), selected, D2D1::RectF(bounds_.left + 12.0f, bounds_.top, bounds_.right - 28.0f, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 		context->DrawLine(D2D1::Point2F(bounds_.right - 18.0f, bounds_.top + 14.0f), D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), outline_.Get(), 1.8f);
 		context->DrawLine(D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), D2D1::Point2F(bounds_.right - 6.0f, bounds_.top + 14.0f), outline_.Get(), 1.8f);
@@ -2426,7 +2556,7 @@ public:
 				accent_->SetOpacity(0.18f);
 				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), accent_.Get());
 			}
-			context->DrawTextW(items_[index].c_str(), static_cast<UINT32>(items_[index].size()), format_.Get(), rowRect, textBrush_.Get());
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], rowRect, textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 	}
 
@@ -2513,11 +2643,14 @@ private:
 	}
 
 	std::vector<std::wstring> items_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	TextStyle textStyle_{};
+	bool textStyleOverride_ = false;
 	size_t selectedIndex_ = 0;
 	bool open_ = false;
 	UIAnimation openAnimation_{};
@@ -2618,6 +2751,7 @@ private:
 class Knob final : public UIComponent {
 public:
 	Knob(std::wstring label,
+		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<ID2D1SolidColorBrush> surface,
 		ComPtr<ID2D1SolidColorBrush> accent,
@@ -2625,10 +2759,20 @@ public:
 		ComPtr<ID2D1SolidColorBrush> textBrush,
 		float value,
 		std::function<void(float)> onChanged)
-		: label_(std::move(label)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), value_(Clamp01(value)), onChanged_(std::move(onChanged)) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), value_(Clamp01(value)), onChanged_(std::move(onChanged)), labelStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())), valueStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
+
+	void SetLabelStyle(const TextStyle& style) {
+		labelStyle_ = style;
+		labelStyleOverride_ = true;
+	}
+
+	void SetValueStyle(const TextStyle& style) {
+		valueStyle_ = style;
+		valueStyleOverride_ = true;
+	}
 
 	void OnAttachAnimations() override {
 		if (animator_) {
@@ -2637,7 +2781,7 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		context->DrawTextW(label_.c_str(), static_cast<UINT32>(label_.size()), format_.Get(), D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
 		D2D1_POINT_2F center{ (bounds_.left + bounds_.right) * 0.5f, bounds_.top + 70.0f };
 		const float radius = 36.0f;
 		context->FillEllipse(D2D1::Ellipse(center, radius, radius), surface_.Get());
@@ -2651,7 +2795,7 @@ public:
 		std::wstringstream ss;
 		ss << static_cast<int>(value * 100.0f);
 		auto valueText = ss.str();
-		context->DrawTextW(valueText.c_str(), static_cast<UINT32>(valueText.size()), format_.Get(), D2D1::RectF(bounds_.left, center.y + 42.0f, bounds_.right, bounds_.bottom), textBrush_.Get());
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), valueText, D2D1::RectF(bounds_.left, center.y + 42.0f, bounds_.right, bounds_.bottom), valueStyleOverride_ ? &valueStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); anchor_ = point; anchorValue_ = value_; }
@@ -2675,11 +2819,16 @@ private:
 	}
 
 	std::wstring label_;
+	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<ID2D1SolidColorBrush> surface_;
 	ComPtr<ID2D1SolidColorBrush> accent_;
 	ComPtr<ID2D1SolidColorBrush> outline_;
 	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	TextStyle labelStyle_{};
+	TextStyle valueStyle_{};
+	bool labelStyleOverride_ = false;
+	bool valueStyleOverride_ = false;
 	float value_ = 0.0f;
 	UIAnimation valueAnimation_{};
 	D2D1_POINT_2F anchor_{ 0.0f, 0.0f };
@@ -2957,7 +3106,7 @@ private:
 	}
 
 	void BuildDemoScene() {
-		layout_ = std::make_unique<VerticalStackLayout>(24.0f, 12.0f);
+		layout_ = std::make_unique<VerticalStackLayout>(24.0f, 8.0f);
 		components_.clear();
 		leftLayoutOrder_.clear();
 		rightLayoutOrder_.clear();
@@ -3023,7 +3172,7 @@ private:
 		leftLayoutOrder_.push_back(resetButton.get());
 		components_.push_back(std::move(resetButton));
 
-		auto checkbox = std::make_unique<Checkbox>(L"Mirror show-grid state", bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, true, [this](bool checked) {
+		auto checkbox = std::make_unique<Checkbox>(L"Mirror show-grid state", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, true, [this](bool checked) {
 			if (callbacks_.onGridChanged) {
 				callbacks_.onGridChanged(checked);
 			}
@@ -3035,7 +3184,7 @@ private:
 		leftLayoutOrder_.push_back(checkbox.get());
 		components_.push_back(std::move(checkbox));
 
-		auto radio0 = std::make_unique<RadioButton>(L"Aim style 0: ring", bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 0, [this](int value) {
+		auto radio0 = std::make_unique<RadioButton>(L"Aim style 0: ring", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 0, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to ring mode.");
 		});
@@ -3045,7 +3194,7 @@ private:
 		leftLayoutOrder_.push_back(radio0.get());
 		components_.push_back(std::move(radio0));
 
-		auto radio1 = std::make_unique<RadioButton>(L"Aim style 1: dot", bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 1, [this](int value) {
+		auto radio1 = std::make_unique<RadioButton>(L"Aim style 1: dot", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 1, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to dot mode.");
 		});
@@ -3055,7 +3204,7 @@ private:
 		leftLayoutOrder_.push_back(radio1.get());
 		components_.push_back(std::move(radio1));
 
-		auto radio2 = std::make_unique<RadioButton>(L"Aim style 2: triangle", bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 2, [this](int value) {
+		auto radio2 = std::make_unique<RadioButton>(L"Aim style 2: triangle", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 2, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to triangle mode.");
 		});
@@ -3065,7 +3214,7 @@ private:
 		leftLayoutOrder_.push_back(radio2.get());
 		components_.push_back(std::move(radio2));
 
-		auto slider = std::make_unique<Slider>(L"Aim radius", captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, outlineBrush_, 0.2f, [this](float value) {
+		auto slider = std::make_unique<Slider>(L"Aim radius", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, outlineBrush_, 0.2f, [this](float value) {
 			if (callbacks_.onAimRadiusChanged) callbacks_.onAimRadiusChanged(5.0f + value * 75.0f);
 			std::wstringstream ss;
 			ss << L"Aim radius updated to " << static_cast<int>(5.0f + value * 75.0f) << L" px.";
@@ -3077,7 +3226,7 @@ private:
 		leftLayoutOrder_.push_back(slider.get());
 		components_.push_back(std::move(slider));
 
-		auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, &progressAnimation_);
+		auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, &progressAnimation_);
 		progress->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f));
 		progress->SetZIndex(3);
 		leftLayoutOrder_.push_back(progress.get());
@@ -3088,7 +3237,7 @@ private:
 			status.append(value);
 			SetStatus(status);
 		});
-		singleInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 60.0f));
+		singleInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 56.0f));
 		singleInput->SetZIndex(3);
 		singleInput_ = singleInput.get();
 		focusOrder_.push_back(singleInput_);
@@ -3098,31 +3247,31 @@ private:
 		auto multiInput = std::make_unique<TextInput>(L"Multiline editor", L"Notes...", L"Header-only migration complete.\nNext: richer text selection and IME support.", graphics_.dwriteFactory, fieldFormat_, surfaceBrush_, outlineBrush_, textBrush_, mutedTextBrush_, accentBrush_, true, [this](std::wstring_view) {
 			SetStatus(L"Multiline editor changed.");
 		});
-		multiInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 118.0f));
+		multiInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 96.0f));
 		multiInput->SetZIndex(3);
 		multiInput_ = multiInput.get();
 		focusOrder_.push_back(multiInput_);
 		rightLayoutOrder_.push_back(multiInput_);
 		components_.push_back(std::move(multiInput));
 
-		auto listBox = std::make_unique<ListBox>(std::vector<std::wstring>{ L"Aster", L"Beryl", L"Cinder", L"Delta", L"Ember", L"Flint", L"Grove", L"Halo", L"Iris", L"Juniper", L"Kite", L"Lumen" }, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
+		auto listBox = std::make_unique<ListBox>(std::vector<std::wstring>{ L"Aster", L"Beryl", L"Cinder", L"Delta", L"Ember", L"Flint", L"Grove", L"Halo", L"Iris", L"Juniper", L"Kite", L"Lumen" }, graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
 			std::wstring status = L"List box selected: ";
 			status.append(value);
 			SetStatus(status);
 		});
-		listBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 142.0f));
+		listBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 108.0f));
 		listBox->SetZIndex(3);
 		listBox_ = listBox.get();
 		focusOrder_.push_back(listBox_);
 		rightLayoutOrder_.push_back(listBox_);
 		components_.push_back(std::move(listBox));
 
-		auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release" }, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
+		auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release" }, graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
 			std::wstring status = L"Combo box selected: ";
 			status.append(value);
 			SetStatus(status);
 		});
-		comboBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 38.0f));
+		comboBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 36.0f));
 		comboBox->SetZIndex(10);
 		comboBox_ = comboBox.get();
 		focusOrder_.push_back(comboBox_);
@@ -3130,26 +3279,26 @@ private:
 		components_.push_back(std::move(comboBox));
 
 		auto chipStrip = std::make_unique<ChipStrip>(L"Horizontal overflow", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, std::vector<std::wstring>{ L"Telemetry", L"Render Thread", L"Composition", L"Clipboard", L"IME", L"Selection", L"VirtualSurface", L"Animation" });
-		chipStrip->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 76.0f));
+		chipStrip->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 56.0f));
 		chipStrip->SetZIndex(3);
 		focusOrder_.push_back(chipStrip.get());
 		rightLayoutOrder_.push_back(chipStrip.get());
 		components_.push_back(std::move(chipStrip));
 
-		auto knob = std::make_unique<Knob>(L"Encoder", captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, 0.42f, [this](float value) {
+		auto knob = std::make_unique<Knob>(L"Encoder", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, 0.42f, [this](float value) {
 			std::wstringstream ss;
 			ss << L"Knob rotated to " << static_cast<int>(value * 100.0f) << L"%.";
 			SetStatus(ss.str());
 		});
-		knob->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 136.0f));
+		knob->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 104.0f));
 		knob->SetZIndex(3);
 		knob_ = knob.get();
 		focusOrder_.push_back(knob_);
 		rightLayoutOrder_.push_back(knob_);
 		components_.push_back(std::move(knob));
 
-		auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", bodyFormat_, captionFormat_, surfaceAltBrush_, outlineBrush_, textBrush_, mutedTextBrush_);
-		statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 84.0f));
+		auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltBrush_, outlineBrush_, textBrush_, mutedTextBrush_);
+		statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 48.0f));
 		statusText->SetZIndex(3);
 		statusText_ = statusText.get();
 		focusOrder_.push_back(statusText_);
