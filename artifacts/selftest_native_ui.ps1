@@ -477,6 +477,7 @@ $menuHoverSwitchOk = $false
 $sliderOk = $false
 $scrollbarsOk = $false
 $inputScrollbarsOk = $false
+$cardScrollbarsHoverOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
 
@@ -561,12 +562,19 @@ Send-Enter
 Send-Text 'Fourth line keeps the editor overflowing.'
 Send-Enter
 Send-Text 'Fifth line verifies the vertical scrollbar drag path.'
-Start-Sleep -Milliseconds 200
+Send-Enter
+Send-Text 'Sixth line keeps the thumb short enough to verify the cue.'
+Send-Enter
+Send-Text 'Seventh line confirms the hover hotspot on the vertical track.'
+Send-Enter
+Send-Text 'Eighth line keeps the overflow state obvious in screenshots.'
+Start-Sleep -Milliseconds 180
+Save-Capture 'native_ui_02a_multi_overflow.png'
 Move-MouseScreen (Get-ScreenPoint $multiScrollX $multiScrollStartY).X (Get-ScreenPoint $multiScrollX $multiScrollStartY).Y 140
+Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_02aa_multi_hover_scrollbar.png'
 Drag-Client $multiScrollX $multiScrollStartY $multiScrollX $multiScrollEndY
 Start-Sleep -Milliseconds 120
-Save-Capture 'native_ui_02a_multi_overflow.png'
 Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
 Send-Text 'Short note.'
@@ -591,14 +599,19 @@ Click-Client $noteX $noteY
 Start-Sleep -Milliseconds 120
 
 if ($twoColumn) {
+    Move-MouseScreen (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).X (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).Y 140
+    Save-Capture 'native_ui_02ba_left_card_hover_scrollbar.png'
     Drag-Client $leftCardScrollX $leftCardScrollStartY $leftCardScrollX $leftCardScrollEndY
     Drag-Client $leftCardScrollX $leftCardScrollEndY $leftCardScrollX $leftCardScrollStartY
 }
+Move-MouseScreen (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).X (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).Y 140
+Save-Capture 'native_ui_02bb_right_card_hover_scrollbar.png'
 Drag-Client $rightCardScrollX $rightCardScrollStartY $rightCardScrollX $rightCardScrollEndY
 Drag-Client $rightCardScrollX $rightCardScrollEndY $rightCardScrollX $rightCardScrollStartY
 
 $scrollbarsOk = $true
 $inputScrollbarsOk = $true
+$cardScrollbarsHoverOk = $true
 $knobOk = $true
 $expandCollapseOk = $true
 
@@ -633,28 +646,38 @@ $result = [pscustomobject]@{
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
     InputScrollbarsExercised = $inputScrollbarsOk
+    CardScrollbarsHoverExercised = $cardScrollbarsHoverOk
     KnobExercised = $knobOk
     ExpandCollapseExercised = $expandCollapseOk
     ProcessAliveAfterUiOps = $stillAlive
     ProcessClosedAfterSelftest = $closedCleanly
-    Screenshots = @(
-        (Join-Path $OutputDir 'native_ui_01_initial.png'),
-        (Join-Path $OutputDir 'native_ui_00_menu_open.png'),
-        (Join-Path $OutputDir 'native_ui_00_menu_hover_switch.png'),
-        (Join-Path $OutputDir 'native_ui_00_menu_closed.png'),
-        (Join-Path $OutputDir 'native_ui_01_single_caret.png'),
-        (Join-Path $OutputDir 'native_ui_01a_single_overflow.png'),
-        (Join-Path $OutputDir 'native_ui_01aa_single_hover_scrollbar.png'),
-        (Join-Path $OutputDir 'native_ui_01b_single_scrolled.png'),
-        (Join-Path $OutputDir 'native_ui_01c_single_collapsed.png'),
-        (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
-        (Join-Path $OutputDir 'native_ui_02aa_multi_hover_scrollbar.png'),
-        (Join-Path $OutputDir 'native_ui_02a_multi_overflow.png'),
-        (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
-        (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
-        (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
-    ) -join ';'
+    Screenshots = $null
 }
+
+$screenshotPaths = @(
+    (Join-Path $OutputDir 'native_ui_01_initial.png'),
+    (Join-Path $OutputDir 'native_ui_00_menu_open.png'),
+    (Join-Path $OutputDir 'native_ui_00_menu_hover_switch.png'),
+    (Join-Path $OutputDir 'native_ui_00_menu_closed.png'),
+    (Join-Path $OutputDir 'native_ui_01_single_caret.png'),
+    (Join-Path $OutputDir 'native_ui_01a_single_overflow.png'),
+    (Join-Path $OutputDir 'native_ui_01aa_single_hover_scrollbar.png'),
+    (Join-Path $OutputDir 'native_ui_01b_single_scrolled.png'),
+    (Join-Path $OutputDir 'native_ui_01c_single_collapsed.png'),
+    (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
+    (Join-Path $OutputDir 'native_ui_02aa_multi_hover_scrollbar.png'),
+    (Join-Path $OutputDir 'native_ui_02a_multi_overflow.png'),
+    (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
+    (Join-Path $OutputDir 'native_ui_02_combo_open.png')
+)
+if ($twoColumn) {
+    $screenshotPaths += (Join-Path $OutputDir 'native_ui_02ba_left_card_hover_scrollbar.png')
+}
+$screenshotPaths += @(
+    (Join-Path $OutputDir 'native_ui_02bb_right_card_hover_scrollbar.png'),
+    (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
+)
+$result.Screenshots = $screenshotPaths -join ';'
 
 $failures = @()
 if (-not $result.PreviewButtonsExercised) { $failures += 'preview/buttons' }
@@ -668,6 +691,7 @@ if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
 if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
 if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
+if (-not $result.CardScrollbarsHoverExercised) { $failures += 'card-scrollbar-hover' }
 if (-not $result.KnobExercised) { $failures += 'knob' }
 if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }
 if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }

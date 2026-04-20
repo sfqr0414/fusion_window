@@ -1163,7 +1163,14 @@ public:
 	}
 
 	void SetContentMetrics(float contentHeight) {
+		const float previousContentHeight = contentHeight_;
+		const bool hadOverflow = ActualNeedsVerticalScrollBar(previousContentHeight);
 		contentHeight_ = (std::max)(contentHeight, 0.0f);
+		const bool hasOverflow = ActualNeedsVerticalScrollBar(contentHeight_);
+		if (hadOverflow != hasOverflow) {
+			hintedContentHeight_ = hasOverflow ? contentHeight_ : previousContentHeight;
+			TouchScrollReveal();
+		}
 		UpdateScrollBarViewport();
 		SetScrollOffset(scrollOffset_);
 		UpdateScrollBarAnimation(ShouldRevealScrollBar());
@@ -1185,8 +1192,7 @@ public:
 	}
 
 	bool NeedsVerticalScrollBar() const {
-		UpdateScrollBarViewport();
-		return scrollBar_.Visible();
+		return ActualNeedsVerticalScrollBar(contentHeight_);
 	}
 
 	D2D1_RECT_F ContentClipBounds() const {
@@ -1194,7 +1200,8 @@ public:
 	}
 
 	bool ShouldReserveVerticalScrollBar() const {
-		return NeedsVerticalScrollBar() || ScrollBarOpacity() > 0.01f;
+		UpdateScrollBarViewport();
+		return scrollBar_.Visible() || ScrollBarOpacity() > 0.01f;
 	}
 
 	D2D1_RECT_F LayoutBounds(bool reserveScrollbar) const {
@@ -1226,7 +1233,7 @@ public:
 	}
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
-		scrollBar_.hovered = NeedsVerticalScrollBar() && HitScrollBar(point);
+		scrollBar_.hovered = scrollBar_.Visible() && HitScrollBar(point);
 		if (scrollBar_.hovered) {
 			TouchScrollReveal();
 		}
@@ -1316,8 +1323,17 @@ private:
 		return scrollRevealUntil_ > std::chrono::steady_clock::now();
 	}
 
+	bool OverflowHintActive() const {
+		return hintedContentHeight_ > 0.0f && ScrollRevealActive();
+	}
+
+	bool ActualNeedsVerticalScrollBar(float contentHeight) const {
+		return contentHeight > ContentViewportHeight() + 0.5f;
+	}
+
 	bool ShouldRevealScrollBar() const {
-		return NeedsVerticalScrollBar() && (scrollBar_.dragging || scrollBar_.hovered || ScrollRevealActive());
+		UpdateScrollBarViewport();
+		return scrollBar_.Visible() && (scrollBar_.dragging || scrollBar_.hovered || ScrollRevealActive());
 	}
 
 	void TouchScrollReveal() const {
@@ -1334,7 +1350,7 @@ private:
 
 	void UpdateScrollBarViewport() const {
 		scrollBar_.viewport = BaseContentClipBounds();
-		scrollBar_.contentExtent = contentHeight_;
+		scrollBar_.contentExtent = OverflowHintActive() ? (std::max)(contentHeight_, hintedContentHeight_) : contentHeight_;
 		scrollBar_.offset = scrollOffset_;
 	}
 
@@ -1357,6 +1373,7 @@ private:
 	float dragStartY_ = 0.0f;
 	float startScrollOffset_ = 0.0f;
 	bool scrollBarVisibleTarget_ = false;
+	float hintedContentHeight_ = 0.0f;
 	mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 	mutable ScrollbarState scrollBar_{ ScrollOrientation::Vertical };
 	static constexpr float kScrollbarGutter = 18.0f;
@@ -2110,8 +2127,8 @@ public:
 	}
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
 		auto visual = ComputeVisualState();
-		horizontalScrollHovered_ = visual.showHorizontalScroll && visual.horizontalScroll.HitTrack(point);
-		verticalScrollHovered_ = visual.showVerticalScroll && visual.verticalScroll.HitTrack(point);
+		horizontalScrollHovered_ = visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point);
+		verticalScrollHovered_ = visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point);
 		if (horizontalScrollHovered_) {
 			TouchHorizontalScrollReveal();
 		}
@@ -2149,6 +2166,14 @@ public:
 	void Render(ID2D1DeviceContext* context) override {
 		UpdateCaretBlink();
 		auto visual = ComputeVisualState();
+		float horizontalScrollOpacity = visual.horizontalOpacity;
+		float verticalScrollOpacity = visual.verticalOpacity;
+		if (!multiline_ && HorizontalOverflowHintActive() && horizontalScrollOpacity < 0.01f) {
+			horizontalScrollOpacity = 1.0f;
+		}
+		if (multiline_ && VerticalOverflowHintActive() && verticalScrollOpacity < 0.01f) {
+			verticalScrollOpacity = 1.0f;
+		}
 		auto* textBrush = textBrush_.Get();
 		auto* mutedBrush = mutedBrush_.Get();
 		auto* surfaceBrush = surface_.Get();
@@ -2218,10 +2243,26 @@ public:
 		}
 		context->PopAxisAlignedClip();
 		if (visual.renderHorizontalScroll) {
-			DrawScrollBar(context, visual.horizontalScroll, visual.horizontalOpacity);
+			DrawScrollBar(context, visual.horizontalScroll, horizontalScrollOpacity);
 		}
-		if (visual.renderVerticalScroll) {
-			DrawScrollBar(context, visual.verticalScroll, visual.verticalOpacity);
+		if (multiline_) {
+			const bool forceVerticalCue = scrollY_ > 0.5f || VerticalOverflowHintActive();
+			if (visual.renderVerticalScroll || forceVerticalCue) {
+				auto verticalScroll = visual.verticalScroll;
+				float effectiveVerticalOpacity = verticalScrollOpacity;
+				if (forceVerticalCue && effectiveVerticalOpacity < 0.01f) {
+					effectiveVerticalOpacity = VerticalOverflowHintActive() ? 1.0f : 0.85f;
+				}
+				if (!verticalScroll.Visible()) {
+					const float fallbackMaxScrollY = (std::max)((std::max)(visual.maxScrollY, verticalHintMaxScroll_), scrollY_ + 1.0f);
+					verticalScroll = MakeVerticalScrollState(visual.box, fallbackMaxScrollY, visual.content.bottom - visual.content.top);
+					verticalScroll.offset = (std::clamp)(scrollY_, 0.0f, fallbackMaxScrollY);
+				}
+				DrawScrollBar(context, verticalScroll, effectiveVerticalOpacity);
+			}
+		}
+		else if (visual.renderVerticalScroll) {
+			DrawScrollBar(context, visual.verticalScroll, verticalScrollOpacity);
 		}
 	}
 
@@ -2561,14 +2602,42 @@ private:
 		return D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom);
 	}
 
+	float MeasureMultilineContentHeight(IDWriteTextLayout* layout, const DWRITE_TEXT_METRICS& metrics) const {
+		if (!layout) {
+			return 0.0f;
+		}
+		std::array<DWRITE_LINE_METRICS, 16> stackMetrics{};
+		UINT32 actualCount = 0;
+		HRESULT hr = layout->GetLineMetrics(stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
+		if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER) {
+			std::vector<DWRITE_LINE_METRICS> lineMetrics(actualCount);
+			hr = layout->GetLineMetrics(lineMetrics.data(), actualCount, &actualCount);
+			if (SUCCEEDED(hr)) {
+				float totalHeight = 0.0f;
+				for (UINT32 index = 0; index < actualCount; ++index) {
+					totalHeight += lineMetrics[index].height;
+				}
+				return (std::max)(totalHeight, metrics.height);
+			}
+		}
+		else if (SUCCEEDED(hr)) {
+			float totalHeight = 0.0f;
+			for (UINT32 index = 0; index < actualCount; ++index) {
+				totalHeight += stackMetrics[index].height;
+			}
+			return (std::max)(totalHeight, metrics.height);
+		}
+		return metrics.height;
+	}
+
 	VisualState ComputeVisualState() const {
 		VisualState state;
 		state.renderText = DisplayText();
 		state.box = TextBounds();
 		state.horizontalOpacity = multiline_ ? 0.0f : horizontalScrollVisibilityAnimation_.Value();
 		state.verticalOpacity = multiline_ ? verticalScrollVisibilityAnimation_.Value() : 0.0f;
-		bool reserveHorizontalScroll = !multiline_ && state.horizontalOpacity > 0.01f;
-		bool reserveVerticalScroll = multiline_ && state.verticalOpacity > 0.01f;
+		bool reserveHorizontalScroll = !multiline_ && (state.horizontalOpacity > 0.01f || HorizontalOverflowHintActive());
+		bool reserveVerticalScroll = multiline_ && (state.verticalOpacity > 0.01f || VerticalOverflowHintActive());
 
 		auto refreshLayout = [&]() {
 			state.content = multiline_
@@ -2589,18 +2658,25 @@ private:
 
 		refreshLayout();
 		if (multiline_) {
-			state.maxScrollY = (std::max)(0.0f, state.metrics.height - (state.content.bottom - state.content.top) + 6.0f);
+			const float contentHeight = MeasureMultilineContentHeight(state.layout, state.metrics);
+			state.maxScrollY = (std::max)(0.0f, contentHeight - (state.content.bottom - state.content.top) + 6.0f);
 			state.showVerticalScroll = state.maxScrollY > 0.5f;
 			if (state.showVerticalScroll != reserveVerticalScroll) {
 				reserveVerticalScroll = state.showVerticalScroll || state.verticalOpacity > 0.01f;
 				refreshLayout();
-				state.maxScrollY = (std::max)(0.0f, state.metrics.height - (state.content.bottom - state.content.top) + 6.0f);
+				const float reservedContentHeight = MeasureMultilineContentHeight(state.layout, state.metrics);
+				state.maxScrollY = (std::max)(0.0f, reservedContentHeight - (state.content.bottom - state.content.top) + 6.0f);
 			}
 			state.showVerticalScroll = state.maxScrollY > 0.5f;
-			state.renderVerticalScroll = state.showVerticalScroll || state.verticalOpacity > 0.01f;
+			UpdateVerticalOverflowCue(state.showVerticalScroll, state.maxScrollY);
+			const float hintedMaxScrollY = VerticalOverflowHintActive() ? (std::max)(state.maxScrollY, verticalHintMaxScroll_) : state.maxScrollY;
+			state.renderVerticalScroll = state.showVerticalScroll || VerticalOverflowHintActive() || state.verticalOpacity > 0.01f;
 			if (state.renderVerticalScroll) {
-				const float effectiveMaxScrollY = state.showVerticalScroll ? state.maxScrollY : 1.0f;
+				const float effectiveMaxScrollY = (std::max)(1.0f, hintedMaxScrollY);
 				state.verticalScroll = MakeVerticalScrollState(state.box, effectiveMaxScrollY, state.content.bottom - state.content.top);
+				if (!state.showVerticalScroll) {
+					state.verticalScroll.offset = 0.0f;
+				}
 			}
 		}
 		else {
@@ -2614,10 +2690,15 @@ private:
 				state.maxScrollX = (std::max)(0.0f, contentWidth - (state.content.right - state.content.left) + 8.0f);
 			}
 			state.showHorizontalScroll = state.maxScrollX > 0.5f;
-			state.renderHorizontalScroll = state.showHorizontalScroll || state.horizontalOpacity > 0.01f;
+			UpdateHorizontalOverflowCue(state.showHorizontalScroll, state.maxScrollX);
+			const float hintedMaxScrollX = HorizontalOverflowHintActive() ? (std::max)(state.maxScrollX, horizontalHintMaxScroll_) : state.maxScrollX;
+			state.renderHorizontalScroll = state.showHorizontalScroll || HorizontalOverflowHintActive() || state.horizontalOpacity > 0.01f;
 			if (state.renderHorizontalScroll) {
-				const float effectiveMaxScrollX = state.showHorizontalScroll ? state.maxScrollX : 1.0f;
+				const float effectiveMaxScrollX = (std::max)(1.0f, hintedMaxScrollX);
 				state.horizontalScroll = MakeHorizontalScrollState(state.box, effectiveMaxScrollX, state.content.right - state.content.left);
+				if (!state.showHorizontalScroll) {
+					state.horizontalScroll.offset = 0.0f;
+				}
 			}
 		}
 
@@ -2626,10 +2707,46 @@ private:
 
 	void UpdateScrollbarVisibilityAnimations(const VisualState& visual) {
 		if (!multiline_) {
-			AnimateLinear(horizontalScrollVisibilityAnimation_, visual.showHorizontalScroll && (horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal || HorizontalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+			AnimateLinear(horizontalScrollVisibilityAnimation_, visual.renderHorizontalScroll && (horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal || HorizontalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
 		}
 		if (multiline_) {
-			AnimateLinear(verticalScrollVisibilityAnimation_, visual.showVerticalScroll && (verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical || VerticalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+			AnimateLinear(verticalScrollVisibilityAnimation_, visual.renderVerticalScroll && (verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical || VerticalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+		}
+	}
+
+	bool HorizontalOverflowHintActive() const {
+		return horizontalHintMaxScroll_ > 0.5f && HorizontalScrollRevealActive();
+	}
+
+	bool VerticalOverflowHintActive() const {
+		return verticalHintMaxScroll_ > 0.5f && VerticalScrollRevealActive();
+	}
+
+	void UpdateHorizontalOverflowCue(bool overflowing, float maxScroll) const {
+		if (overflowing) {
+			lastHorizontalMaxScroll_ = maxScroll;
+		}
+		if (overflowing != previousHorizontalOverflow_) {
+			horizontalHintMaxScroll_ = overflowing ? maxScroll : lastHorizontalMaxScroll_;
+			TouchHorizontalScrollReveal();
+			previousHorizontalOverflow_ = overflowing;
+		}
+		else if (overflowing) {
+			horizontalHintMaxScroll_ = maxScroll;
+		}
+	}
+
+	void UpdateVerticalOverflowCue(bool overflowing, float maxScroll) const {
+		if (overflowing) {
+			lastVerticalMaxScroll_ = maxScroll;
+		}
+		if (overflowing != previousVerticalOverflow_) {
+			verticalHintMaxScroll_ = overflowing ? maxScroll : lastVerticalMaxScroll_;
+			TouchVerticalScrollReveal();
+			previousVerticalOverflow_ = overflowing;
+		}
+		else if (overflowing) {
+			verticalHintMaxScroll_ = maxScroll;
 		}
 	}
 
@@ -2788,8 +2905,9 @@ private:
 		const float visibleWidth = (std::max)(1.0f, content.right - content.left);
 		const float visibleHeight = (std::max)(1.0f, content.bottom - content.top);
 		const float contentWidth = multiline_ ? 0.0f : MeasureSingleLineContentWidth(DisplayText());
+		const float contentHeight = multiline_ ? MeasureMultilineContentHeight(layout, textMetrics) : 0.0f;
 		const float maxScrollX = multiline_ ? 0.0f : (std::max)(0.0f, contentWidth - visibleWidth + 8.0f);
-		const float maxScrollY = multiline_ ? (std::max)(0.0f, textMetrics.height - visibleHeight + 6.0f) : 0.0f;
+		const float maxScrollY = multiline_ ? (std::max)(0.0f, contentHeight - visibleHeight + 6.0f) : 0.0f;
 		scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
 		scrollY_ = (std::clamp)(scrollY_, 0.0f, maxScrollY);
 		if (!ensureCaretVisible_) {
@@ -2820,7 +2938,7 @@ private:
 	ScrollbarState MakeHorizontalScrollState(const D2D1_RECT_F& box, float maxScrollX, float visibleWidth) const {
 		ScrollbarState state{ ScrollOrientation::Horizontal };
 		state.viewport = box;
-		state.contentExtent = visibleWidth + (std::max)(0.0f, maxScrollX);
+		state.contentExtent = (box.right - box.left) + (std::max)(0.0f, maxScrollX);
 		state.offset = scrollX_;
 		state.inset = 12.0f;
 		state.edgePadding = 2.0f;
@@ -2832,7 +2950,7 @@ private:
 	ScrollbarState MakeVerticalScrollState(const D2D1_RECT_F& box, float maxScrollY, float visibleHeight) const {
 		ScrollbarState state{ ScrollOrientation::Vertical };
 		state.viewport = box;
-		state.contentExtent = visibleHeight + (std::max)(0.0f, maxScrollY);
+		state.contentExtent = (box.bottom - box.top) + (std::max)(0.0f, maxScrollY);
 		state.offset = scrollY_;
 		state.inset = 12.0f;
 		state.edgePadding = 2.0f;
@@ -2983,6 +3101,12 @@ private:
 	mutable bool verticalScrollHovered_ = false;
 	mutable std::chrono::steady_clock::time_point horizontalScrollRevealUntil_{};
 	mutable std::chrono::steady_clock::time_point verticalScrollRevealUntil_{};
+	mutable bool previousHorizontalOverflow_ = false;
+	mutable bool previousVerticalOverflow_ = false;
+	mutable float lastHorizontalMaxScroll_ = 0.0f;
+	mutable float lastVerticalMaxScroll_ = 0.0f;
+	mutable float horizontalHintMaxScroll_ = 0.0f;
+	mutable float verticalHintMaxScroll_ = 0.0f;
 	bool ensureCaretVisible_ = true;
 	bool imeActive_ = false;
 	bool caretTargetVisible_ = true;
@@ -3933,14 +4057,21 @@ public:
 		switch (msg) {
 		case WM_MOUSEMOVE: {
 			if (!PointInViewport(point)) {
+				UpdateCardHoverState(point, nullptr);
 				ClearHover();
 				currentCursor_ = CursorKind::None;
 				dynamicDirty_ = true;
 				return;
 			}
 			UIComponent* target = captured_ ? captured_ : ResolvePointerTarget(point, true);
+			UpdateCardHoverState(point, target);
 			SetHovered(target == leftCard_ || target == rightCard_ ? nullptr : target);
-			currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
+			if (CardScrollTarget(point)) {
+				currentCursor_ = CursorKind::Arrow;
+			}
+			else {
+				currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
+			}
 			if (captured_) {
 				captured_->OnPointerMove(point);
 				if (captured_ == leftCard_ || captured_ == rightCard_) {
@@ -3959,6 +4090,7 @@ public:
 			if (auto* cardScrollTarget = CardScrollTarget(point)) {
 				SetFocused(nullptr);
 				captured_ = cardScrollTarget;
+				UpdateCardHoverState(point, cardScrollTarget);
 				currentCursor_ = CursorKind::Arrow;
 				cardScrollTarget->OnPointerDown(point);
 				layoutDirty_ = true;
@@ -3966,6 +4098,7 @@ public:
 				return;
 			}
 			UIComponent* target = ResolvePointerTarget(point, true);
+			UpdateCardHoverState(point, target);
 			currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
 			SetFocused(target && target->IsFocusable() ? target : nullptr);
 			captured_ = target;
@@ -3983,13 +4116,20 @@ public:
 				}
 				captured_ = nullptr;
 				UIComponent* target = PointInViewport(point) ? ResolvePointerTarget(point, true) : nullptr;
+				UpdateCardHoverState(point, target);
 				SetHovered(target == leftCard_ || target == rightCard_ ? nullptr : target);
-				currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : (PointInViewport(point) ? CursorKind::Arrow : CursorKind::None);
+				if (PointInViewport(point) && CardScrollTarget(point)) {
+					currentCursor_ = CursorKind::Arrow;
+				}
+				else {
+					currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : (PointInViewport(point) ? CursorKind::Arrow : CursorKind::None);
+				}
 				dynamicDirty_ = true;
 			}
 			return;
 		}
 		case WM_MOUSELEAVE: {
+			UpdateCardHoverState(point, nullptr);
 			ClearHover();
 			currentCursor_ = CursorKind::None;
 			dynamicDirty_ = true;
@@ -4178,6 +4318,25 @@ private:
 			return leftCard_;
 		}
 		return nullptr;
+	}
+
+	void UpdateCardHoverState(D2D1_POINT_2F point, UIComponent* target) {
+		auto updateCard = [&](CardSurface* card) {
+			if (!card || !card->Visible()) {
+				return;
+			}
+			if (captured_ == card) {
+				return;
+			}
+			if (target == card || UIComponent::PointInRect(card->Bounds(), point)) {
+				card->CursorAt(point);
+			}
+			else {
+				card->OnHover(false);
+			}
+		};
+		updateCard(leftCard_);
+		updateCard(rightCard_);
 	}
 
 	void RenderCard(ID2D1DeviceContext* context, CardSurface* card, const std::vector<UIComponent*>& items) {
