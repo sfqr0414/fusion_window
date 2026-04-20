@@ -365,6 +365,8 @@ namespace std {
 #include <wrl.h>
 #include <uianimation.h> 
 
+#include "ui/native_ui.hpp"
+
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -377,7 +379,8 @@ namespace std {
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "avrt.lib")
 #pragma comment(lib, "Synchronization.lib")
-// #pragma comment(lib, "UIAnimation.lib") 
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
 
 using namespace Microsoft::WRL;
 
@@ -403,6 +406,19 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg
 float g_dpiScale = 1.0f;
 std::atomic<int> g_CaptionHeight{ 32 };
 inline int S(int val) { return (int)(val * g_dpiScale + 0.5f); }
+
+enum class UiCursorState : int {
+	CanvasHidden = 0,
+	Arrow = 1,
+	Hand = 2,
+	IBeam = 3,
+};
+
+std::atomic<int> g_UiCursorState{ static_cast<int>(UiCursorState::CanvasHidden) };
+std::atomic<int> g_UiVisualLeft{ 0 };
+std::atomic<int> g_UiVisualTop{ 0 };
+std::atomic<int> g_UiVisualRight{ 0 };
+std::atomic<int> g_UiVisualBottom{ 0 };
 
 RECT GetCaptionButtonBounds(HWND hwnd) {
 	RECT rc{ 0, 0, 0, 0 };
@@ -549,9 +565,9 @@ struct CmdSetAimRadius { float radius; };
 struct CmdSetAimStyle { int style; };
 struct CmdAddHitMark { float x; float y; };
 struct CmdResetCanvas {};
-struct CmdKeyDown { WPARAM key; };
+struct CmdKeyDown { WPARAM key; bool ctrl; bool shift; bool alt; };
 struct CmdWin32Msg { HWND hwnd; UINT msg; WPARAM wParam; LPARAM lParam; };
-struct CmdUpdateAnim { float menuAlpha; std::array<float, 4> hoverAlpha; };
+struct CmdUpdateAnim { float menuAlpha; float progress; std::array<float, 4> hoverAlpha; };
 struct CmdExit {};
 struct CmdUpdateTitleBar {
 	HICON hIcon;
@@ -823,7 +839,7 @@ public:
 			double val = 0; g_VarHoverAlpha[i]->GetValue(&val);
 			hoverA[i] = static_cast<float>(val);
 		}
-		g_CommandQueue.push(CmdUpdateAnim{ static_cast<float>(menuA), hoverA });
+		g_CommandQueue.push(CmdUpdateAnim{ static_cast<float>(menuA), static_cast<float>(progressVal) / 100.0f, hoverA });
 		g_RenderEvent.Notify();
 
 		UI_ANIMATION_MANAGER_STATUS status; g_AnimManager->GetStatus(&status);
@@ -983,10 +999,21 @@ public:
 	}
 
 	void Run() {
+		EnsureUiHost();
 		RunLoop();
 	}
 
 private:
+	void EnsureUiHost() {
+		if (uiHost || !d2dFactory || !d2dDevice || !d2dContext || !dwriteFactory) {
+			return;
+		}
+		uiHost = std::make_unique<fusion::ui::DemoUiHost>(
+			fusion::ui::GraphicsContext{ d2dFactory, d2dDevice, d2dContext, dwriteFactory },
+			static_cast<Derived*>(this)->CreateUiCallbacks());
+		utils::console("ui host created\n");
+	}
+
 	void InitializeThread() {
 		DWORD_PTR pCoreMask = GetPCoreMask();
 		if (pCoreMask) SetThreadAffinityMask(GetCurrentThread(), pCoreMask);
@@ -1044,6 +1071,10 @@ private:
 		dcompDevice->CreateVirtualSurface(currentWidth, max(64, g_CaptionHeight.load()), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &titleSurface);
 		titleVisual->SetContent(titleSurface.Get());
 		rootVisual->AddVisual(titleVisual.Get(), TRUE, mainVisual.Get());
+		dcompDevice->CreateVisual(&uiVisual);
+		dcompDevice->CreateVirtualSurface(currentWidth, currentHeight, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &uiSurface);
+		uiVisual->SetContent(uiSurface.Get());
+		rootVisual->AddVisual(uiVisual.Get(), TRUE, titleVisual.Get());
 		dcompTarget->SetRoot(rootVisual.Get()); dcompDevice->Commit();
 	}
 
@@ -1108,6 +1139,9 @@ private:
 					if (titleSurface) {
 						titleSurface->Resize(pendingResizeW, max(64, g_CaptionHeight.load()));
 					}
+						if (uiSurface) {
+							uiSurface->Resize(pendingResizeW, pendingResizeH);
+						}
 					CreateTarget();
 					}
 				}
@@ -1132,6 +1166,44 @@ private:
 			static_cast<Derived*>(this)->OnRender(logicalW, logicalH, captionHeightLogical, panelLogicalW);
 
 			d2dContext->EndDraw();
+
+			if (uiHost && uiSurface) {
+				ComPtr<ID2D1DeviceContext> d2dContextForUi;
+				POINT uiOffset{};
+				RECT uiUpdateRect = { 0, g_CaptionHeight.load(), currentWidth, currentHeight };
+				if (SUCCEEDED(uiSurface->BeginDraw(&uiUpdateRect, IID_PPV_ARGS(&d2dContextForUi), &uiOffset))) {
+					d2dContextForUi->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
+					d2dContextForUi->SetTransform(D2D1::Matrix3x2F::Translation(uiOffset.x / g_dpiScale, uiOffset.y / g_dpiScale));
+					d2dContextForUi->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
+					ComPtr<ID2D1SolidColorBrush> uiDebugBrush;
+					d2dContextForUi->CreateSolidColorBrush(D2D1::ColorF(1.0f, 0.15f, 0.35f, 0.9f), &uiDebugBrush);
+					if (uiDebugBrush) {
+						d2dContextForUi->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(contentRect.right - 180.0f, contentRect.top + 24.0f, contentRect.right - 24.0f, contentRect.top + 96.0f), 18.0f, 18.0f), uiDebugBrush.Get());
+					}
+					uiHost->SetViewport(contentRect, g_dpiScale);
+					uiHost->Render(d2dContextForUi.Get());
+					const auto uiBounds = uiHost->VisibleUiBounds();
+					g_UiVisualLeft.store(static_cast<int>(uiBounds.left * g_dpiScale), std::memory_order_relaxed);
+					g_UiVisualTop.store(static_cast<int>(uiBounds.top * g_dpiScale), std::memory_order_relaxed);
+					g_UiVisualRight.store(static_cast<int>(uiBounds.right * g_dpiScale), std::memory_order_relaxed);
+					g_UiVisualBottom.store(static_cast<int>(uiBounds.bottom * g_dpiScale), std::memory_order_relaxed);
+					switch (uiHost->CurrentCursor()) {
+					case fusion::ui::CursorKind::Hand:
+						g_UiCursorState.store(static_cast<int>(UiCursorState::Hand), std::memory_order_relaxed);
+						break;
+					case fusion::ui::CursorKind::IBeam:
+						g_UiCursorState.store(static_cast<int>(UiCursorState::IBeam), std::memory_order_relaxed);
+						break;
+					case fusion::ui::CursorKind::Arrow:
+						g_UiCursorState.store(static_cast<int>(UiCursorState::Arrow), std::memory_order_relaxed);
+						break;
+					default:
+						g_UiCursorState.store(static_cast<int>(UiCursorState::CanvasHidden), std::memory_order_relaxed);
+						break;
+					}
+					uiSurface->EndDraw();
+				}
+			}
 
 			if (titleSurface) {
 				ComPtr<ID2D1DeviceContext> d2dContextForTitle;
@@ -1194,15 +1266,27 @@ private:
 			else if constexpr (std::is_same_v<T, CmdResetCanvas>) hitMarks.clear();
 			else if constexpr (std::is_same_v<T, CmdUpdateAnim>) {
 				currentMenuAlpha = arg.menuAlpha; currentHoverAlphas = arg.hoverAlpha;
+				if (uiHost) {
+					uiHost->SetAnimationProgress(arg.progress);
+				}
 			}
 			else if constexpr (std::is_same_v<T, CmdKeyDown>) {
-				if (arg.key == 'C' || arg.key == 'c') hitMarks.clear();
+				const bool consumedByUi = uiHost && uiHost->HandleKeyDown(arg.key, fusion::ui::KeyModifiers{ arg.ctrl, arg.shift, arg.alt });
+				if (consumedByUi) {
+					return;
+				}
+				if ((arg.key == 'C' || arg.key == 'c') && !arg.ctrl) hitMarks.clear();
 				if (arg.key == VK_SPACE) {
 					POINT pt; GetCursorPos(&pt); ScreenToClient(g_hCanvas, &pt);
 					if (pt.x > (int)(200 * g_dpiScale)) hitMarks.push_back({ (float)pt.x / g_dpiScale, (float)pt.y / g_dpiScale });
 				}
 			}
-			else if constexpr (std::is_same_v<T, CmdWin32Msg>) guiBridge->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
+			else if constexpr (std::is_same_v<T, CmdWin32Msg>) {
+				guiBridge->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
+				if (uiHost) {
+					uiHost->HandleWin32Message(arg.hwnd, arg.msg, arg.wParam, arg.lParam);
+				}
+			}
 			else if constexpr (std::is_same_v<T, CmdExit>) g_isRunning.store(false, std::memory_order_relaxed);
 			else if constexpr (std::is_same_v<T, CmdUpdateTitleBar>) {
 				cachedWindowTitle = arg.title.data();
@@ -1236,12 +1320,14 @@ protected:
 
 	ComPtr<IDCompositionDesktopDevice> dcompDevice; 
 	ComPtr<IDCompositionTarget> dcompTarget; 
-	ComPtr<IDCompositionVisual2> rootVisual, mainVisual, titleVisual;
+	ComPtr<IDCompositionVisual2> rootVisual, mainVisual, titleVisual, uiVisual;
 	ComPtr<IDCompositionVirtualSurface> titleSurface;
+	ComPtr<IDCompositionVirtualSurface> uiSurface;
 
 	ComPtr<ID2D1Bitmap1> d2dTargetBitmap;
 	ComPtr<ID2D1SolidColorBrush> brushGrid, brushAim, brushHit, brushMenuText, brushBackground, brushPaint, brushTitleText;
 	std::unique_ptr<ImGuiBridge> guiBridge;
+	std::unique_ptr<fusion::ui::DemoUiHost> uiHost;
 
 	int currentWidth = 0; int currentHeight = 0;
 	bool showGrid = true; float aimRadius = 18.0f; int aimStyle = 0;
@@ -1256,6 +1342,15 @@ protected:
 // 默认绘制实现，保留原本绘制逻辑
 class FusionRenderer : public RenderThreadScope<FusionRenderer> {
 public:
+	fusion::ui::HostCallbacks CreateUiCallbacks() {
+		return fusion::ui::HostCallbacks{
+			[this](bool show) { showGrid = show; },
+			[this](int style) { aimStyle = style; },
+			[this](float radius) { aimRadius = radius; },
+			[this]() { hitMarks.clear(); }
+		};
+	}
+
 	void OnRender(float logicalW, float logicalH, float captionHeightLogical, float panelLogicalW) {
 		// grid
 		if (showGrid) {
@@ -1748,7 +1843,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_RBUTTONDOWN:
 	case WM_RBUTTONUP:
 	case WM_MOUSEWHEEL:
-	case WM_CHAR: {
+	case WM_CHAR:
+	case WM_IME_STARTCOMPOSITION:
+	case WM_IME_COMPOSITION:
+	case WM_IME_ENDCOMPOSITION: {
 		g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
 		g_RenderEvent.Notify();
 		return 0;
@@ -1761,8 +1859,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		break;
 	}
 	case WM_KEYDOWN: {
-		if (wParam == 'C' || wParam == 'c') { g_CommandQueue.push(CmdResetCanvas{}); g_RenderEvent.Notify(); return 0; }
-		g_CommandQueue.push(CmdKeyDown{ wParam });
+		const bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+		const bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+		const bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0;
+		if ((wParam == 'C' || wParam == 'c') && !ctrlDown) { g_CommandQueue.push(CmdResetCanvas{}); g_RenderEvent.Notify(); return 0; }
+		g_CommandQueue.push(CmdKeyDown{ wParam, ctrlDown, shiftDown, altDown });
 		g_RenderEvent.Notify();
 		return 0;
 	}
@@ -1777,6 +1878,26 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_SETCURSOR: {
 		if (LOWORD(lParam) == HTCLIENT) {
 			POINT pt; GetCursorPos(&pt); ScreenToClient(hwnd, &pt);
+			const RECT uiRect{
+				g_UiVisualLeft.load(std::memory_order_relaxed),
+				g_UiVisualTop.load(std::memory_order_relaxed),
+				g_UiVisualRight.load(std::memory_order_relaxed),
+				g_UiVisualBottom.load(std::memory_order_relaxed)
+			};
+			if (PtInRect(&uiRect, pt)) {
+				switch (static_cast<UiCursorState>(g_UiCursorState.load(std::memory_order_relaxed))) {
+				case UiCursorState::Hand:
+					SetCursor(LoadCursor(NULL, IDC_HAND));
+					return TRUE;
+				case UiCursorState::IBeam:
+					SetCursor(LoadCursor(NULL, IDC_IBEAM));
+					return TRUE;
+				case UiCursorState::Arrow:
+				default:
+					SetCursor(LoadCursor(NULL, IDC_ARROW));
+					return TRUE;
+				}
+			}
 			if (pt.x > GetPanelWidth() && pt.y > g_CaptionHeight.load() && !g_ImGuiWantCaptureMouse.load(std::memory_order_relaxed)) {
 				SetCursor(NULL); return TRUE;
 			}
