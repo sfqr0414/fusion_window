@@ -1174,7 +1174,11 @@ private:
 
 			d2dContext->EndDraw();
 
-			if (uiHost && uiSurface) {
+			if (uiHost) {
+				uiHost->SetViewport(contentRect, g_dpiScale);
+			}
+
+			if (uiHost && uiSurface && (receivedResizeCmd || uiHost->NeedsContinuousRedraw())) {
 				ComPtr<ID2D1DeviceContext> d2dContextForUi;
 				POINT uiOffset{};
 				RECT uiUpdateRect = { 0, 0, currentWidth, currentHeight };
@@ -1182,7 +1186,6 @@ private:
 					d2dContextForUi->SetDpi(96.0f * g_dpiScale, 96.0f * g_dpiScale);
 					d2dContextForUi->SetTransform(D2D1::Matrix3x2F::Translation(uiOffset.x / g_dpiScale, uiOffset.y / g_dpiScale));
 					d2dContextForUi->Clear(D2D1::ColorF(0.f, 0.f, 0.f, 0.f));
-					uiHost->SetViewport(contentRect, g_dpiScale);
 					uiHost->Render(d2dContextForUi.Get());
 					const auto uiBounds = uiHost->VisibleUiBounds();
 					g_UiVisualLeft.store(static_cast<int>(uiBounds.left * g_dpiScale), std::memory_order_relaxed);
