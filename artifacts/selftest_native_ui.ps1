@@ -472,6 +472,8 @@ $fileMenuScreenPoint = Get-ScreenPoint $menuCenters[0] $menuClientY
 $editMenuScreenPoint = Get-ScreenPoint $menuCenters[1] $menuClientY
 
 Save-Capture 'native_ui_01_initial.png'
+Start-Sleep -Milliseconds 220
+Save-Capture 'native_ui_00a_dirty_idle.png'
 
 $previewAndButtonsOk = $false
 $selectionControlsOk = $false
@@ -483,6 +485,11 @@ $inputScrollbarsOk = $false
 $cardScrollbarsHoverOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
+
+$dirtyProbeX = if ($twoColumn) { $previewButtonX } else { $singleInputX }
+$dirtyProbeY = if ($twoColumn) { $previewButtonY } else { $singleInputY }
+Move-MouseScreen (Get-ScreenPoint $dirtyProbeX $dirtyProbeY).X (Get-ScreenPoint $dirtyProbeX $dirtyProbeY).Y 180
+Save-Capture 'native_ui_00b_dirty_hover.png'
 
 Move-MouseScreen $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
 Click-ScreenLeft $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
@@ -674,6 +681,8 @@ $expandCollapseOk = $true
 Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
 
+$dirtyRenderScreenshotsCaptured = (Test-Path (Join-Path $OutputDir 'native_ui_00a_dirty_idle.png')) -and (Test-Path (Join-Path $OutputDir 'native_ui_00b_dirty_hover.png'))
+
 $singleCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_01_single_caret.png') ($controlLeft + (Scale-Logical 16)) ($singleBoundsTop + (Scale-Logical 26)) ($singleBoundsTop + $singleBoundsHeight - (Scale-Logical 12))
 $multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
 
@@ -695,6 +704,7 @@ $result = [pscustomobject]@{
     SelectionControlsExercised = $selectionControlsOk
     MenuToggleExercised = $menuToggleOk
     MenuHoverSwitchExercised = $menuHoverSwitchOk
+    DirtyRenderScreenshotsCaptured = $dirtyRenderScreenshotsCaptured
     SingleInputCopyInitial = $copyOk
     SingleInputReplaceAndCopy = $replaceOk
     SingleInputCaretVisible = $singleCaretVisible
@@ -714,6 +724,8 @@ $result = [pscustomobject]@{
 
 $screenshotPaths = @(
     (Join-Path $OutputDir 'native_ui_01_initial.png'),
+    (Join-Path $OutputDir 'native_ui_00a_dirty_idle.png'),
+    (Join-Path $OutputDir 'native_ui_00b_dirty_hover.png'),
     (Join-Path $OutputDir 'native_ui_00_menu_open.png'),
     (Join-Path $OutputDir 'native_ui_00_menu_hover_switch.png'),
     (Join-Path $OutputDir 'native_ui_00_menu_closed.png'),
@@ -744,6 +756,7 @@ if (-not $result.PreviewButtonsExercised) { $failures += 'preview/buttons' }
 if (-not $result.SelectionControlsExercised) { $failures += 'selection-controls' }
 if (-not $result.MenuToggleExercised) { $failures += 'menu-toggle' }
 if (-not $result.MenuHoverSwitchExercised) { $failures += 'menu-hover-switch' }
+if (-not $result.DirtyRenderScreenshotsCaptured) { $failures += 'dirty-render-screenshots' }
 if (-not $result.SingleInputCopyInitial) { $failures += 'single-input-copy-initial' }
 if (-not $result.SingleInputReplaceAndCopy) { $failures += 'single-input-replace-copy' }
 if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
