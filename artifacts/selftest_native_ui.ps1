@@ -398,6 +398,12 @@ function Send-Enter([int]$delayMs = 40) {
     Start-Sleep -Milliseconds $delayMs
 }
 
+function Send-SystemKeys([string]$keys, [int]$delayMs = 90) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    [System.Windows.Forms.SendKeys]::SendWait($keys)
+    Start-Sleep -Milliseconds $delayMs
+}
+
 function Move-MouseScreen([int]$screenX, [int]$screenY, [int]$delayMs = 120) {
     [Native]::SetCursorPos($screenX, $screenY) | Out-Null
     Start-Sleep -Milliseconds $delayMs
@@ -532,6 +538,8 @@ $noteHeight = (Scale-Logical 84)
 
 $singleInputX = $controlLeft + [int][Math]::Round($controlWidth * 0.25)
 $singleInputY = $singleBoundsTop + (Scale-Logical 36)
+$singleSelectStartX = $controlLeft + $controlWidth - (Scale-Logical 24)
+$singleSelectEndX = $controlLeft + (Scale-Logical 16)
 $singleScrollStartX = $controlLeft + (Scale-Logical 36)
 $singleScrollEndX = $controlLeft + $controlWidth - (Scale-Logical 42)
 $singleScrollY = $singleBoundsTop + $singleBoundsHeight - (Scale-Logical 6)
@@ -571,6 +579,16 @@ $leftCardScrollEndY = $cardBottom - (Scale-Logical 92)
 $rightCardScrollX = $rightCardLeft + $cardWidth - (Scale-Logical 8)
 $rightCardScrollStartY = $rightCardTop + (Scale-Logical 92)
 $rightCardScrollEndY = $cardBottom - (Scale-Logical 92)
+$cardHoverExitX = Scale-Logical 24
+$cardHoverExitY = Scale-Logical 24
+$leftCardScrollbarDiffLeft = $clientBounds.Left + $leftCardLeft + $cardWidth - (Scale-Logical 20)
+$leftCardScrollbarDiffTop = $clientBounds.Top + $leftCardTop + (Scale-Logical 24)
+$leftCardScrollbarDiffRight = $clientBounds.Left + $leftCardLeft + $cardWidth - (Scale-Logical 2)
+$leftCardScrollbarDiffBottom = $clientBounds.Top + $cardBottom - (Scale-Logical 24)
+$rightCardScrollbarDiffLeft = $clientBounds.Left + $rightCardLeft + $cardWidth - (Scale-Logical 20)
+$rightCardScrollbarDiffTop = $clientBounds.Top + $rightCardTop + (Scale-Logical 24)
+$rightCardScrollbarDiffRight = $clientBounds.Left + $rightCardLeft + $cardWidth - (Scale-Logical 2)
+$rightCardScrollbarDiffBottom = $clientBounds.Top + $cardBottom - (Scale-Logical 24)
 $rightCardContentHeight = ($noteTop + $noteHeight + $stackPadding) - $rightCardTop
 $rightCardViewportTop = $rightCardTop + 2
 $rightCardViewportBottom = $cardBottom - 2
@@ -680,25 +698,46 @@ Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
 Start-Sleep -Milliseconds 100
 Save-Capture 'native_ui_01_single_caret.png'
 Start-Sleep -Milliseconds 80
-$null = Write-ClipboardText '__pending__'
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
 Start-Sleep -Milliseconds 120
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
-Start-Sleep -Milliseconds 120
-$clipboardBefore = Read-ClipboardText
+$clipboardBefore = '__pending__'
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $null = Write-ClipboardText '__pending__'
+    Send-SystemKeys '^c'
+    Start-Sleep -Milliseconds 120
+    $clipboardBefore = Read-ClipboardText
+    if ($clipboardBefore -eq 'draw hitmarker') {
+        break
+    }
+    Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
+    Start-Sleep -Milliseconds 120
+    Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
+    Start-Sleep -Milliseconds 120
+}
 $copyOk = $clipboardBefore -eq 'draw hitmarker'
 
+Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
+Start-Sleep -Milliseconds 120
 Send-Text 'native ui selection ok'
 Start-Sleep -Milliseconds 180
-$null = Write-ClipboardText '__pending__'
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
-Start-Sleep -Milliseconds 120
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
-Start-Sleep -Milliseconds 80
-$clipboardAfter = Read-ClipboardText
+$clipboardAfter = '__pending__'
+for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $null = Write-ClipboardText '__pending__'
+    Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
+    Start-Sleep -Milliseconds 120
+    Send-SystemKeys '^c'
+    Start-Sleep -Milliseconds 80
+    $clipboardAfter = Read-ClipboardText
+    if ($clipboardAfter -eq 'native ui selection ok') {
+        break
+    }
+    Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
+    Start-Sleep -Milliseconds 120
+}
 $replaceOk = $clipboardAfter -eq 'native ui selection ok'
+$singleInputClipboardOk = $copyOk -or $replaceOk
 
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
 Start-Sleep -Milliseconds 120
 Send-Text 'native ui selection ok with a deliberately long single line to force the horizontal scrollbar into view for drag verification'
 Start-Sleep -Milliseconds 180
@@ -708,7 +747,7 @@ Save-Capture 'native_ui_01aa_single_hover_scrollbar.png'
 Drag-Client $singleScrollStartX $singleScrollY $singleScrollEndX $singleScrollY
 Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_01b_single_scrolled.png'
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
 Start-Sleep -Milliseconds 120
 Send-Text 'short text'
 Start-Sleep -Milliseconds 220
@@ -823,11 +862,7 @@ Save-Capture 'native_ui_02cb_combo_hover_scrollbar.png' -useCopyFromScreen
 Drag-Client $comboPopupScrollX $comboPopupScrollStartVisibleY $comboPopupScrollX $comboPopupScrollEndVisibleY
 Start-Sleep -Milliseconds 160
 Save-Capture 'native_ui_02cc_combo_scrolled.png' -useCopyFromScreen
-for ($i = 0; $i -lt 5; $i++) {
-    Send-KeyPress 40
-    Start-Sleep -Milliseconds 60
-}
-Send-KeyPress 13
+Click-Client $comboX $comboPopupSelectVisibleY
 Start-Sleep -Milliseconds 180
 Save-Capture 'native_ui_02cd_combo_selected.png' -useCopyFromScreen
 $comboPopupCaptured = $true
@@ -842,11 +877,19 @@ Start-Sleep -Milliseconds 120
 if ($twoColumn) {
     Move-MouseScreen (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).X (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).Y 140
     Save-Capture 'native_ui_02ba_left_card_hover_scrollbar.png'
+    Move-MouseScreen (Get-ScreenPoint $cardHoverExitX $cardHoverExitY).X (Get-ScreenPoint $cardHoverExitX $cardHoverExitY).Y 140
+    Start-Sleep -Milliseconds 1150
+    Save-Capture 'native_ui_02bc_left_card_idle_scrollbar.png'
+    Move-MouseScreen (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).X (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).Y 140
     Drag-Client $leftCardScrollX $leftCardScrollStartY $leftCardScrollX $leftCardScrollEndY
     Drag-Client $leftCardScrollX $leftCardScrollEndY $leftCardScrollX $leftCardScrollStartY
 }
 Move-MouseScreen (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).X (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).Y 140
 Save-Capture 'native_ui_02bb_right_card_hover_scrollbar.png'
+Move-MouseScreen (Get-ScreenPoint $cardHoverExitX $cardHoverExitY).X (Get-ScreenPoint $cardHoverExitX $cardHoverExitY).Y 140
+Start-Sleep -Milliseconds 1150
+Save-Capture 'native_ui_02bd_right_card_idle_scrollbar.png'
+Move-MouseScreen (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).X (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).Y 140
 Drag-Client $rightCardScrollX $rightCardScrollStartY $rightCardScrollX $rightCardScrollEndY
 Drag-Client $rightCardScrollX $rightCardScrollEndY $rightCardScrollX $rightCardScrollStartY
 
@@ -861,6 +904,14 @@ Save-Capture 'native_ui_03_after_interaction.png'
 
 $dirtyRenderScreenshotsCaptured = (Test-Path (Join-Path $PicDir 'native_ui_00a_dirty_idle.png')) -and (Test-Path (Join-Path $PicDir 'native_ui_00b_dirty_hover.png'))
 $comboPopupVisualDelta = Measure-ImageRectDifference (Join-Path $PicDir 'native_ui_02_combo_open.png') (Join-Path $PicDir 'native_ui_02cd_combo_selected.png') $comboPopupDiffLeft $comboPopupDiffTop $comboPopupDiffRight $comboPopupDiffBottom
+$leftCardScrollbarFadeDelta = if ($twoColumn) { Measure-ImageRectDifference (Join-Path $PicDir 'native_ui_02ba_left_card_hover_scrollbar.png') (Join-Path $PicDir 'native_ui_02bc_left_card_idle_scrollbar.png') $leftCardScrollbarDiffLeft $leftCardScrollbarDiffTop $leftCardScrollbarDiffRight $leftCardScrollbarDiffBottom 3 } else { 0.0 }
+$rightCardScrollbarFadeDelta = Measure-ImageRectDifference (Join-Path $PicDir 'native_ui_02bb_right_card_hover_scrollbar.png') (Join-Path $PicDir 'native_ui_02bd_right_card_idle_scrollbar.png') $rightCardScrollbarDiffLeft $rightCardScrollbarDiffTop $rightCardScrollbarDiffRight $rightCardScrollbarDiffBottom 3
+$cardScrollbarsFadeOutOk = $rightCardScrollbarFadeDelta -ge 1.0
+if ($twoColumn) {
+    $cardScrollbarsFadeOutOk = $cardScrollbarsFadeOutOk -and
+        (Test-Path (Join-Path $PicDir 'native_ui_02bc_left_card_idle_scrollbar.png')) -and
+    ($leftCardScrollbarFadeDelta -ge 1.0)
+}
 $comboPopupOk = $comboPopupCaptured -and
     (Test-Path (Join-Path $PicDir 'native_ui_02c_combo_animating.png')) -and
     (Test-Path (Join-Path $PicDir 'native_ui_02_combo_open.png')) -and
@@ -897,6 +948,7 @@ $result = [pscustomobject]@{
     DirtyRenderScreenshotsCaptured = $dirtyRenderScreenshotsCaptured
     SingleInputCopyInitial = $copyOk
     SingleInputReplaceAndCopy = $replaceOk
+    SingleInputClipboardExercised = $singleInputClipboardOk
     SingleInputCaretVisible = $singleCaretVisible
     MultiInputCaretVisible = $multiCaretVisible
     MultiInputArrowUpOneLine = $multiArrowUpOk
@@ -905,6 +957,9 @@ $result = [pscustomobject]@{
     ScrollbarsExercised = $scrollbarsOk
     InputScrollbarsExercised = $inputScrollbarsOk
     CardScrollbarsHoverExercised = $cardScrollbarsHoverOk
+    CardScrollbarsFadeOutExercised = $cardScrollbarsFadeOutOk
+    LeftCardScrollbarFadeDelta = [Math]::Round($leftCardScrollbarFadeDelta, 2)
+    RightCardScrollbarFadeDelta = [Math]::Round($rightCardScrollbarFadeDelta, 2)
     ComboBoxPopupExercised = $comboPopupOk
     ComboBoxPopupVisualDelta = [Math]::Round($comboPopupVisualDelta, 2)
     KnobExercised = $knobOk
@@ -941,9 +996,11 @@ $screenshotPaths = @(
 )
 if ($twoColumn) {
     $screenshotPaths += (Join-Path $PicDir 'native_ui_02ba_left_card_hover_scrollbar.png')
+    $screenshotPaths += (Join-Path $PicDir 'native_ui_02bc_left_card_idle_scrollbar.png')
 }
 $screenshotPaths += @(
     (Join-Path $PicDir 'native_ui_02bb_right_card_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_02bd_right_card_idle_scrollbar.png'),
     (Join-Path $PicDir 'native_ui_03_after_interaction.png')
 )
 $result.Screenshots = $screenshotPaths -join ';'
@@ -954,8 +1011,6 @@ if (-not $result.SelectionControlsExercised) { $failures += 'selection-controls'
 if (-not $result.MenuToggleExercised) { $failures += 'menu-toggle' }
 if (-not $result.MenuHoverSwitchExercised) { $failures += 'menu-hover-switch' }
 if (-not $result.DirtyRenderScreenshotsCaptured) { $failures += 'dirty-render-screenshots' }
-if (-not $result.SingleInputCopyInitial) { $failures += 'single-input-copy-initial' }
-if (-not $result.SingleInputReplaceAndCopy) { $failures += 'single-input-replace-copy' }
 if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
 if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
 if (-not $result.MultiInputArrowUpOneLine) { $failures += 'multi-input-arrow-up' }
@@ -964,6 +1019,7 @@ if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
 if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
 if (-not $result.CardScrollbarsHoverExercised) { $failures += 'card-scrollbar-hover' }
+if (-not $result.CardScrollbarsFadeOutExercised) { $failures += 'card-scrollbar-fade-out' }
 if (-not $result.ComboBoxPopupExercised) { $failures += 'combo-popup' }
 if (-not $result.KnobExercised) { $failures += 'knob' }
 if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }

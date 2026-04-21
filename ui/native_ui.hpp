@@ -4,6 +4,8 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cwctype>
 #include <functional>
@@ -107,7 +109,7 @@ namespace fusion::ui {
 			variable_ = std::move(variable);
 		}
 
-		void SetObservedValue(float value) {
+		void ObserveValue(float value) {
 			cachedValue_ = value;
 		}
 
@@ -160,7 +162,7 @@ namespace fusion::ui {
 		}
 
 		void Attach(UIAnimation& animation, float initialValue) {
-			animation.SetObservedValue(initialValue);
+			animation.ObserveValue(initialValue);
 			if (!manager_) {
 				return;
 			}
@@ -174,7 +176,7 @@ namespace fusion::ui {
 		}
 
 		void Animate(UIAnimation& animation, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
-			animation.SetObservedValue(target);
+			animation.ObserveValue(target);
 			if (!manager_ || !library_ || !animation.Variable()) {
 				return;
 			}
@@ -195,7 +197,7 @@ namespace fusion::ui {
 		}
 
 		void AnimateLinear(UIAnimation& animation, float target, double duration = 0.16) {
-			animation.SetObservedValue(target);
+			animation.ObserveValue(target);
 			if (!manager_ || !library_ || !animation.Variable()) {
 				return;
 			}
@@ -241,21 +243,202 @@ namespace fusion::ui {
 		ComPtr<IUIAnimationTransitionLibrary> library_;
 	};
 
+	class PropertyCallback {
+	public:
+		static constexpr size_t InlineBytes = sizeof(void*) * 4;
+
+		PropertyCallback() = default;
+		PropertyCallback(std::nullptr_t) {}
+		PropertyCallback(const PropertyCallback&) = delete;
+		PropertyCallback& operator=(const PropertyCallback&) = delete;
+
+		PropertyCallback(PropertyCallback&& other) noexcept {
+			MoveFrom(std::move(other));
+		}
+
+		PropertyCallback& operator=(PropertyCallback&& other) noexcept {
+			if (this != &other) {
+				Reset();
+				MoveFrom(std::move(other));
+			}
+			return *this;
+		}
+
+		~PropertyCallback() {
+			Reset();
+		}
+
+		template <typename Callback>
+			requires (std::is_invocable_r_v<void, std::decay_t<Callback>&> && sizeof(std::decay_t<Callback>) <= InlineBytes && alignof(std::decay_t<Callback>) <= alignof(std::max_align_t))
+		PropertyCallback(Callback&& callback) {
+			Emplace(std::forward<Callback>(callback));
+		}
+
+		explicit operator bool() const {
+			return invoke_ != nullptr;
+		}
+
+		void operator()() {
+			if (invoke_) {
+				invoke_(storage_);
+			}
+		}
+
+		template <typename Owner>
+		static PropertyCallback Bind(Owner* owner, void (Owner::*method)()) {
+			return PropertyCallback([owner, method]() {
+				(owner->*method)();
+			});
+		}
+
+	private:
+		template <typename Callback>
+		void Emplace(Callback&& callback) {
+			using Stored = std::decay_t<Callback>;
+			new (storage_) Stored(std::forward<Callback>(callback));
+			invoke_ = [](void* storage) {
+				(*static_cast<Stored*>(storage))();
+			};
+			destroy_ = [](void* storage) {
+				static_cast<Stored*>(storage)->~Stored();
+			};
+			move_ = [](void* source, void* destination) {
+				new (destination) Stored(std::move(*static_cast<Stored*>(source)));
+				static_cast<Stored*>(source)->~Stored();
+			};
+		}
+
+		void MoveFrom(PropertyCallback&& other) {
+			if (!other.invoke_) {
+				return;
+			}
+			other.move_(other.storage_, storage_);
+			invoke_ = other.invoke_;
+			destroy_ = other.destroy_;
+			move_ = other.move_;
+			other.invoke_ = nullptr;
+			other.destroy_ = nullptr;
+			other.move_ = nullptr;
+		}
+
+		void Reset() {
+			if (destroy_) {
+				destroy_(storage_);
+			}
+			invoke_ = nullptr;
+			destroy_ = nullptr;
+			move_ = nullptr;
+		}
+
+		alignas(std::max_align_t) unsigned char storage_[InlineBytes]{};
+		void (*invoke_)(void*) = nullptr;
+		void (*destroy_)(void*) = nullptr;
+		void (*move_)(void*, void*) = nullptr;
+	};
+
+	struct PropertyCallbackToken {
+		uint32_t id = 0;
+
+		explicit operator bool() const {
+			return id != 0;
+		}
+	};
+
+	inline bool ColorEqualValue(const D2D1_COLOR_F& lhs, const D2D1_COLOR_F& rhs) {
+		return std::fabs(lhs.r - rhs.r) <= 0.001f
+			&& std::fabs(lhs.g - rhs.g) <= 0.001f
+			&& std::fabs(lhs.b - rhs.b) <= 0.001f
+			&& std::fabs(lhs.a - rhs.a) <= 0.001f;
+	}
+
+	inline bool TextStyleEqualValue(const TextStyle& lhs, const TextStyle& rhs) {
+		return lhs.fontFamily == rhs.fontFamily
+			&& std::fabs(lhs.fontSize - rhs.fontSize) <= 0.01f
+			&& lhs.weight == rhs.weight
+			&& lhs.style == rhs.style
+			&& lhs.stretch == rhs.stretch
+			&& ColorEqualValue(lhs.color, rhs.color)
+			&& lhs.underline == rhs.underline
+			&& lhs.strikethrough == rhs.strikethrough
+			&& lhs.horizontalAlign == rhs.horizontalAlign
+			&& lhs.verticalAlign == rhs.verticalAlign
+			&& lhs.locale == rhs.locale;
+	}
+
+	inline bool StyledRangesEqualValue(std::span<const StyledTextRange> lhs, std::span<const StyledTextRange> rhs) {
+		if (lhs.size() != rhs.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < lhs.size(); ++index) {
+			if (lhs[index].start != rhs[index].start
+				|| lhs[index].length != rhs[index].length
+				|| !TextStyleEqualValue(lhs[index].style, rhs[index].style)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	inline bool RectEqualValue(const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) {
+		return std::fabs(lhs.left - rhs.left) <= 0.01f
+			&& std::fabs(lhs.top - rhs.top) <= 0.01f
+			&& std::fabs(lhs.right - rhs.right) <= 0.01f
+			&& std::fabs(lhs.bottom - rhs.bottom) <= 0.01f;
+	}
+
+	struct ColorEqualComparator {
+		bool operator()(const D2D1_COLOR_F& lhs, const D2D1_COLOR_F& rhs) const {
+			return ColorEqualValue(lhs, rhs);
+		}
+	};
+
+	struct TextStyleEqualComparator {
+		bool operator()(const TextStyle& lhs, const TextStyle& rhs) const {
+			return TextStyleEqualValue(lhs, rhs);
+		}
+	};
+
+	struct StyledRangesEqualComparator {
+		bool operator()(const std::vector<StyledTextRange>& lhs, const std::vector<StyledTextRange>& rhs) const {
+			return StyledRangesEqualValue(lhs, rhs);
+		}
+	};
+
+	struct RectEqualComparator {
+		bool operator()(const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) const {
+			return RectEqualValue(lhs, rhs);
+		}
+	};
+
 	template <typename T, typename Equal = std::equal_to<>>
 	class Property {
 	public:
 		Property() = default;
-		Property(T initialValue)
+		explicit Property(T initialValue)
 			: value_(std::move(initialValue)) {
 		}
-		Property(T initialValue, std::function<void()> onDirty, Equal equal = Equal{})
+
+		template <typename Callback>
+			requires std::is_invocable_r_v<void, std::decay_t<Callback>&>
+		Property(T initialValue, Callback&& onDirty, Equal equal = Equal{})
 			: value_(std::move(initialValue)), equal_(std::move(equal)) {
-			if (onDirty) {
-				onDirtyCallbacks_.push_back(std::move(onDirty));
-			}
+			AddOnDirty(std::forward<Callback>(onDirty));
 		}
 
+		Property(const Property&) = delete;
+		Property& operator=(const Property&) = delete;
+		Property(Property&&) = delete;
+		Property& operator=(Property&&) = delete;
+
 		const T& Get() const {
+			return value_;
+		}
+
+		T& ValueRef() {
+			return value_;
+		}
+
+		const T& ValueRef() const {
 			return value_;
 		}
 
@@ -272,12 +455,12 @@ namespace fusion::ui {
 		}
 
 		Property& operator=(const T& value) {
-			Set(value);
+			Assign(value);
 			return *this;
 		}
 
 		Property& operator=(T&& value) {
-			Set(std::move(value));
+			Assign(std::move(value));
 			return *this;
 		}
 
@@ -300,17 +483,57 @@ namespace fusion::ui {
 			}
 		}
 
-		void BindOnDirty(std::function<void()> onDirty) {
-			onDirtyCallbacks_.clear();
-			if (onDirty) {
-				onDirtyCallbacks_.push_back(std::move(onDirty));
-			}
+		template <typename Callback>
+			requires std::is_invocable_r_v<void, std::decay_t<Callback>&>
+		PropertyCallbackToken BindOnDirty(Callback&& onDirty) {
+			ClearCallbacks();
+			return AddOnDirty(std::forward<Callback>(onDirty));
 		}
 
-		void AddOnDirty(std::function<void()> onDirty) {
-			if (onDirty) {
-				onDirtyCallbacks_.push_back(std::move(onDirty));
+		template <typename Callback>
+			requires std::is_invocable_r_v<void, std::decay_t<Callback>&>
+		PropertyCallbackToken AddOnDirty(Callback&& onDirty) {
+			PropertyCallback callback(std::forward<Callback>(onDirty));
+			if (!callback) {
+				return {};
 			}
+			PropertyCallbackToken token{ nextCallbackId_++ };
+			if (!primaryCallback_) {
+				primaryCallback_ = std::move(callback);
+				primaryCallbackId_ = token.id;
+				return token;
+			}
+			auto node = std::make_unique<CallbackNode>();
+			node->token = token;
+			node->callback = std::move(callback);
+			node->next = std::move(extraCallbacks_);
+			extraCallbacks_ = std::move(node);
+			return token;
+		}
+
+		bool RemoveOnDirty(PropertyCallbackToken token) {
+			if (!token) {
+				return false;
+			}
+			if (primaryCallbackId_ == token.id) {
+				primaryCallback_ = {};
+				primaryCallbackId_ = 0;
+				if (extraCallbacks_) {
+					primaryCallback_ = std::move(extraCallbacks_->callback);
+					primaryCallbackId_ = extraCallbacks_->token.id;
+					extraCallbacks_ = std::move(extraCallbacks_->next);
+				}
+				return true;
+			}
+			auto* link = &extraCallbacks_;
+			while (*link) {
+				if ((*link)->token.id == token.id) {
+					*link = std::move((*link)->next);
+					return true;
+				}
+				link = &((*link)->next);
+			}
+			return false;
 		}
 
 		void UseEqualComparator(Equal equal) {
@@ -318,16 +541,31 @@ namespace fusion::ui {
 		}
 
 	private:
+		struct CallbackNode {
+			PropertyCallbackToken token{};
+			PropertyCallback callback{};
+			std::unique_ptr<CallbackNode> next{};
+		};
+
 		void NotifyDirty() {
-			for (auto& callback : onDirtyCallbacks_) {
-				if (callback) {
-					callback();
+			if (primaryCallback_) {
+				primaryCallback_();
+			}
+			for (auto* node = extraCallbacks_.get(); node; node = node->next.get()) {
+				if (node->callback) {
+					node->callback();
 				}
 			}
 		}
 
+		void ClearCallbacks() {
+			primaryCallback_ = {};
+			primaryCallbackId_ = 0;
+			extraCallbacks_.reset();
+		}
+
 		template <typename Value>
-		void Set(Value&& value) {
+		void Assign(Value&& value) {
 			if (equal_(value_, value)) {
 				return;
 			}
@@ -336,52 +574,48 @@ namespace fusion::ui {
 		}
 
 		T value_{};
-		std::vector<std::function<void()>> onDirtyCallbacks_{};
+		PropertyCallback primaryCallback_{};
+		uint32_t primaryCallbackId_ = 0;
+		uint32_t nextCallbackId_ = 1;
+		std::unique_ptr<CallbackNode> extraCallbacks_{};
 		Equal equal_{};
 	};
 
-	using ColorProperty = Property<D2D1_COLOR_F, std::function<bool(const D2D1_COLOR_F&, const D2D1_COLOR_F&)>>;
-	using TextStyleProperty = Property<TextStyle, std::function<bool(const TextStyle&, const TextStyle&)>>;
-	using StyledRangesProperty = Property<std::vector<StyledTextRange>, std::function<bool(const std::vector<StyledTextRange>&, const std::vector<StyledTextRange>&)>>;
+	using RectProperty = Property<D2D1_RECT_F, RectEqualComparator>;
+	using ColorProperty = Property<D2D1_COLOR_F, ColorEqualComparator>;
+	using TextStyleProperty = Property<TextStyle, TextStyleEqualComparator>;
+	using StyledRangesProperty = Property<std::vector<StyledTextRange>, StyledRangesEqualComparator>;
 
-	namespace detail {
-		bool TextStyleEqual(const TextStyle& lhs, const TextStyle& rhs);
-		bool StyledRangesEqual(std::span<const StyledTextRange> lhs, std::span<const StyledTextRange> rhs);
+	template <typename Callback>
+	inline ColorProperty MakeColorProperty(const D2D1_COLOR_F& initialValue, Callback&& onDirty) {
+		return ColorProperty(initialValue, std::forward<Callback>(onDirty), ColorEqualComparator{});
 	}
 
-	inline ColorProperty MakeColorProperty(const D2D1_COLOR_F& initialValue, std::function<void()> onDirty) {
-		return ColorProperty(initialValue, std::move(onDirty), [](const D2D1_COLOR_F& lhs, const D2D1_COLOR_F& rhs) {
-			return std::fabs(lhs.r - rhs.r) <= 0.001f
-				&& std::fabs(lhs.g - rhs.g) <= 0.001f
-				&& std::fabs(lhs.b - rhs.b) <= 0.001f
-				&& std::fabs(lhs.a - rhs.a) <= 0.001f;
-		});
+	template <typename Callback>
+	inline TextStyleProperty MakeTextStyleProperty(const TextStyle& initialValue, Callback&& onDirty) {
+		return TextStyleProperty(initialValue, std::forward<Callback>(onDirty), TextStyleEqualComparator{});
 	}
 
-	inline TextStyleProperty MakeTextStyleProperty(const TextStyle& initialValue, std::function<void()> onDirty) {
-		return TextStyleProperty(initialValue, std::move(onDirty), [](const TextStyle& lhs, const TextStyle& rhs) {
-			return detail::TextStyleEqual(lhs, rhs);
-		});
-	}
-
-	inline StyledRangesProperty MakeStyledRangesProperty(std::vector<StyledTextRange> initialValue, std::function<void()> onDirty) {
-		return StyledRangesProperty(std::move(initialValue), std::move(onDirty), [](const std::vector<StyledTextRange>& lhs, const std::vector<StyledTextRange>& rhs) {
-			return detail::StyledRangesEqual(lhs, rhs);
-		});
+	template <typename Callback>
+	inline StyledRangesProperty MakeStyledRangesProperty(std::vector<StyledTextRange> initialValue, Callback&& onDirty) {
+		return StyledRangesProperty(std::move(initialValue), std::forward<Callback>(onDirty), StyledRangesEqualComparator{});
 	}
 
 	class UIComponent {
 	public:
 		UIComponent()
-			: zIndex_(0, [this]() { MarkGeometryChanged(); }),
-			visible_(true, [this]() { OnVisiblePropertyChanged(); }),
-			enabled_(true, [this]() { MarkContentChanged(); }),
-			hovered_(false, [this]() { MarkCacheDirty(); }),
-			pressed_(false, [this]() { MarkCacheDirty(); }),
-			focused_(false, [this]() { MarkCacheDirty(); }),
+			: boundsProperty_(D2D1::RectF(), PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged), RectEqualComparator{}),
+			zIndex_(0, PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged)),
+			visible_(true, PropertyCallback::Bind(this, &UIComponent::OnVisiblePropertyChanged)),
+			enabled_(true, PropertyCallback::Bind(this, &UIComponent::MarkContentChanged)),
+			hovered_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
+			pressed_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
+			focused_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
+			bounds(boundsProperty_),
 			zIndex(zIndex_),
 			visible(visible_),
-			enabled(enabled_) {
+			enabled(enabled_),
+			bounds_(boundsProperty_.ValueRef()) {
 		}
 
 		virtual ~UIComponent() = default;
@@ -398,17 +632,6 @@ namespace fusion::ui {
 				animator_->Attach(animation, animation.Value());
 			}
 			OnAttachAnimations();
-		}
-
-		void SetBounds(const D2D1_RECT_F& bounds) {
-			if (std::fabs(bounds.left - bounds_.left) <= 0.01f
-				&& std::fabs(bounds.top - bounds_.top) <= 0.01f
-				&& std::fabs(bounds.right - bounds_.right) <= 0.01f
-				&& std::fabs(bounds.bottom - bounds_.bottom) <= 0.01f) {
-				return;
-			}
-			bounds_ = bounds;
-			MarkGeometryChanged();
 		}
 
 		const D2D1_RECT_F& Bounds() const {
@@ -574,7 +797,7 @@ namespace fusion::ui {
 		void RegisterAnimationSlot(std::wstring key, float initialValue = 0.0f) {
 			auto [it, inserted] = customAnimations_.try_emplace(std::move(key), UIAnimation(initialValue));
 			if (!inserted) {
-				it->second.SetObservedValue(initialValue);
+				it->second.ObserveValue(initialValue);
 			}
 			if (animator_) {
 				animator_->Attach(it->second, it->second.Value());
@@ -601,7 +824,7 @@ namespace fusion::ui {
 				animator_->AnimateLinear(animation->second, target, duration);
 			}
 			else {
-				animation->second.SetObservedValue(target);
+				animation->second.ObserveValue(target);
 			}
 		}
 
@@ -650,7 +873,7 @@ namespace fusion::ui {
 				animator_->Animate(animation, target, duration, accel, decel);
 			}
 			else {
-				animation.SetObservedValue(target);
+				animation.ObserveValue(target);
 			}
 		}
 
@@ -663,7 +886,7 @@ namespace fusion::ui {
 				animator_->AnimateLinear(animation, target, duration);
 			}
 			else {
-				animation.SetObservedValue(target);
+				animation.ObserveValue(target);
 			}
 		}
 
@@ -703,11 +926,15 @@ namespace fusion::ui {
 		}
 
 	public:
+		RectProperty& bounds;
 		Property<int>& zIndex;
 		Property<bool>& visible;
 		Property<bool>& enabled;
 
 	protected:
+		D2D1_RECT_F& bounds_;
+		RectProperty boundsProperty_;
+
 		void OnVisiblePropertyChanged() {
 			if (!visible_) {
 				hovered_ = false;
@@ -720,7 +947,6 @@ namespace fusion::ui {
 			MarkContentChanged();
 		}
 
-		D2D1_RECT_F bounds_{ D2D1::RectF() };
 		Property<int> zIndex_;
 		Property<bool> visible_;
 		Property<bool> enabled_;
@@ -793,7 +1019,7 @@ namespace fusion::ui {
 					|| std::fabs(currentBounds.top - arrangedBounds.top) > 0.01f
 					|| std::fabs(currentBounds.right - arrangedBounds.right) > 0.01f
 					|| std::fabs(currentBounds.bottom - arrangedBounds.bottom) > 0.01f) {
-					item->SetBounds(arrangedBounds);
+					item->bounds = arrangedBounds;
 				}
 				y += height + gap_;
 				contentHeight += height;
@@ -1588,6 +1814,7 @@ namespace fusion::ui {
 				if (!visible_) {
 					return;
 				}
+				UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				auto rounded = D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius);
 				context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, fillColor_));
 				context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.0f);
@@ -1607,7 +1834,7 @@ namespace fusion::ui {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !scrollBar_.dragging) {
 					AssignAndDirty(scrollBar_.hovered, false);
-					UpdateScrollBarAnimation(false);
+					UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				}
 			}
 
@@ -5608,7 +5835,7 @@ namespace fusion::ui {
 		}
 
 		void UpdateAnimationProgress(float normalizedProgress) {
-			progressAnimation_.SetObservedValue((std::clamp)(normalizedProgress, 0.0f, 1.0f));
+			progressAnimation_.ObserveValue((std::clamp)(normalizedProgress, 0.0f, 1.0f));
 			if (progressBar_) {
 				progressBar_->MarkDirty();
 			}
@@ -5771,7 +5998,7 @@ namespace fusion::ui {
 				return false;
 			}
 			lastLayoutBounds_[component] = bounds;
-			component->SetBounds(bounds);
+			component->bounds = bounds;
 			QueueHitIndexUpdate(component);
 			return true;
 		}
@@ -5965,25 +6192,25 @@ namespace fusion::ui {
 			auto selectedAimStyle = std::make_shared<Property<int>>(0);
 
 			auto leftCard = std::make_unique<CardSurface>(panelColor, outlineColor, accentColor, accentSoftColor);
-			leftCard->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f));
+			leftCard->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f);
 			leftCard->zIndex = 0;
 			leftCard_ = leftCard.get();
 			components_.push_back(std::move(leftCard));
 
 			auto rightCard = std::make_unique<CardSurface>(panelColor, outlineColor, accentColor, accentSoftColor);
-			rightCard->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f));
+			rightCard->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f);
 			rightCard->zIndex = 0;
 			rightCard_ = rightCard.get();
 			components_.push_back(std::move(rightCard));
 
 			auto title = std::make_unique<TextBlock>(L"Command Surface", graphics_.dwriteFactory, titleFormat_, textColor);
-			title->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 34.0f));
+			title->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 34.0f);
 			title->zIndex = 1;
 			leftLayoutOrder_.push_back(title.get());
 			components_.push_back(std::move(title));
 
 			auto subtitle = std::make_unique<TextBlock>(L"Radix / shadcn inspired tokens, focus rings, clipped surfaces and composite widgets.", graphics_.dwriteFactory, captionFormat_, mutedTextColor);
-			subtitle->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 32.0f));
+			subtitle->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 32.0f);
 			subtitle->zIndex = 1;
 			subtitle->styledRanges = {
 				StyledTextRange{ 0, 16, TextStyle{.fontFamily = L"Segoe UI", .fontSize = 12.0f, .weight = DWRITE_FONT_WEIGHT_SEMI_BOLD, .style = DWRITE_FONT_STYLE_NORMAL, .stretch = DWRITE_FONT_STRETCH_NORMAL, .color = detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f), .underline = false, .strikethrough = false, .horizontalAlign = HorizontalAlign::Left, .verticalAlign = VerticalAlign::Top, .locale = L"en-us" } },
@@ -5993,7 +6220,7 @@ namespace fusion::ui {
 			components_.push_back(std::move(subtitle));
 
 			auto preview = std::make_unique<ImageFrame>(outlineColor, accentColor, surfaceAltColor);
-			preview->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 110.0f));
+			preview->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 110.0f);
 			preview->zIndex = 1;
 			preview_ = preview.get();
 			leftLayoutOrder_.push_back(preview.get());
@@ -6004,7 +6231,7 @@ namespace fusion::ui {
 				});
 			previewButton->horizontalAlign = HorizontalAlign::Left;
 			previewButton->verticalAlign = VerticalAlign::Center;
-			previewButton->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 46.0f));
+			previewButton->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 46.0f);
 			previewButton->zIndex = 3;
 			focusOrder_.push_back(previewButton.get());
 			leftLayoutOrder_.push_back(previewButton.get());
@@ -6018,7 +6245,7 @@ namespace fusion::ui {
 				}, true);
 			resetButton->horizontalAlign = HorizontalAlign::Center;
 			resetButton->verticalAlign = VerticalAlign::Center;
-			resetButton->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
+			resetButton->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight);
 			resetButton->zIndex = 3;
 			focusOrder_.push_back(resetButton.get());
 			leftLayoutOrder_.push_back(resetButton.get());
@@ -6030,7 +6257,7 @@ namespace fusion::ui {
 				}
 				UpdateStatus(checked ? L"Grid enabled from checkbox." : L"Grid disabled from checkbox.");
 				});
-			checkbox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
+			checkbox->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight);
 			checkbox->zIndex = 3;
 			focusOrder_.push_back(checkbox.get());
 			leftLayoutOrder_.push_back(checkbox.get());
@@ -6040,7 +6267,7 @@ namespace fusion::ui {
 				if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 				UpdateStatus(L"Aim style switched to ring mode.");
 				});
-			radio0->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
+			radio0->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight);
 			radio0->zIndex = 3;
 			focusOrder_.push_back(radio0.get());
 			leftLayoutOrder_.push_back(radio0.get());
@@ -6050,7 +6277,7 @@ namespace fusion::ui {
 				if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 				UpdateStatus(L"Aim style switched to dot mode.");
 				});
-			radio1->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
+			radio1->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight);
 			radio1->zIndex = 3;
 			focusOrder_.push_back(radio1.get());
 			leftLayoutOrder_.push_back(radio1.get());
@@ -6060,7 +6287,7 @@ namespace fusion::ui {
 				if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 				UpdateStatus(L"Aim style switched to triangle mode.");
 				});
-			radio2->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight));
+			radio2->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, detail::kControlHeight);
 			radio2->zIndex = 3;
 			focusOrder_.push_back(radio2.get());
 			leftLayoutOrder_.push_back(radio2.get());
@@ -6072,14 +6299,14 @@ namespace fusion::ui {
 				ss << L"Aim radius updated to " << static_cast<int>(5.0f + value * 75.0f) << L" px.";
 				UpdateStatus(ss.str());
 				});
-			slider->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f));
+			slider->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f);
 			slider->zIndex = 3;
 			focusOrder_.push_back(slider.get());
 			leftLayoutOrder_.push_back(slider.get());
 			components_.push_back(std::move(slider));
 
 			auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", graphics_.dwriteFactory, captionFormat_, surfaceAltColor, accentColor, textColor, &progressAnimation_);
-			progress->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f));
+			progress->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f);
 			progress->zIndex = 3;
 			progressBar_ = progress.get();
 			leftLayoutOrder_.push_back(progress.get());
@@ -6090,7 +6317,7 @@ namespace fusion::ui {
 				status.append(value);
 				UpdateStatus(status);
 				});
-			singleInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 60.0f));
+			singleInput->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 60.0f);
 			singleInput->zIndex = 3;
 			singleInput_ = singleInput.get();
 			focusOrder_.push_back(singleInput_);
@@ -6100,7 +6327,7 @@ namespace fusion::ui {
 			auto multiInput = std::make_unique<TextInput>(L"Multiline editor", L"Notes...", L"Header-only migration complete.\nNext: richer text selection and IME support.", graphics_.dwriteFactory, fieldFormat_, surfaceColor, outlineColor, textColor, mutedTextColor, accentColor, true, [this](std::wstring_view) {
 				UpdateStatus(L"Multiline editor changed.");
 				});
-			multiInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 118.0f));
+			multiInput->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 118.0f);
 			multiInput->zIndex = 3;
 			multiInput_ = multiInput.get();
 			focusOrder_.push_back(multiInput_);
@@ -6112,7 +6339,7 @@ namespace fusion::ui {
 				status.append(value);
 				UpdateStatus(status);
 				});
-			listBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 142.0f));
+			listBox->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 142.0f);
 			listBox->zIndex = 3;
 			listBox_ = listBox.get();
 			focusOrder_.push_back(listBox_);
@@ -6124,7 +6351,7 @@ namespace fusion::ui {
 				status.append(value);
 				UpdateStatus(status);
 				});
-			comboBox->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 38.0f));
+			comboBox->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 38.0f);
 			comboBox->zIndex = 10;
 			comboBox_ = comboBox.get();
 			focusOrder_.push_back(comboBox_);
@@ -6132,7 +6359,7 @@ namespace fusion::ui {
 			components_.push_back(std::move(comboBox));
 
 			auto chipStrip = std::make_unique<ChipStrip>(L"Horizontal overflow", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltColor, accentColor, outlineColor, textColor, std::vector<std::wstring>{ L"Telemetry", L"Render Thread", L"Composition", L"Clipboard", L"IME", L"Selection", L"VirtualSurface", L"Animation" });
-			chipStrip->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 76.0f));
+			chipStrip->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 76.0f);
 			chipStrip->zIndex = 3;
 			focusOrder_.push_back(chipStrip.get());
 			rightLayoutOrder_.push_back(chipStrip.get());
@@ -6144,7 +6371,7 @@ namespace fusion::ui {
 				UpdateStatus(ss.str());
 				});
 			knob->fullCircle = true;
-			knob->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 136.0f));
+			knob->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 136.0f);
 			knob->zIndex = 3;
 			knob_ = knob.get();
 			focusOrder_.push_back(knob_);
@@ -6152,7 +6379,7 @@ namespace fusion::ui {
 			components_.push_back(std::move(knob));
 
 			auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltColor, outlineColor, textColor, mutedTextColor);
-			statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 84.0f));
+			statusText->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 84.0f);
 			statusText->zIndex = 3;
 			statusText_ = statusText.get();
 			focusOrder_.push_back(statusText_);
