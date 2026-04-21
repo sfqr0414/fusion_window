@@ -820,12 +820,7 @@ namespace fusion::ui {
 				RegisterAnimationSlot(std::wstring(key), target);
 				animation = customAnimations_.find(std::wstring(key));
 			}
-			if (animator_) {
-				animator_->AnimateLinear(animation->second, target, duration);
-			}
-			else {
-				animation->second.ObserveValue(target);
-			}
+			AnimateLinear(animation->second, target, duration);
 		}
 
 		float AnimationSlotValue(std::wstring_view key, float fallback = 0.0f) const {
