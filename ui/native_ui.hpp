@@ -124,6 +124,14 @@ namespace fusion::ui {
 			return variable_.Get();
 		}
 
+		bool IsAnimating() const {
+			if (!variable_) {
+				return false;
+			}
+			double finalValue = 0.0;
+			return SUCCEEDED(variable_->GetFinalValue(&finalValue)) && std::fabs(static_cast<double>(Value()) - finalValue) > 1e-4;
+		}
+
 	private:
 		ComPtr<IUIAnimationVariable> variable_;
 		float cachedValue_ = 0.0f;
@@ -251,7 +259,11 @@ namespace fusion::ui {
 		}
 
 		void SetBounds(const D2D1_RECT_F& bounds) {
+			if (bounds.left == bounds_.left && bounds.top == bounds_.top && bounds.right == bounds_.right && bounds.bottom == bounds_.bottom) {
+				return;
+			}
 			bounds_ = bounds;
+			MarkDirty();
 		}
 
 		const D2D1_RECT_F& Bounds() const {
@@ -259,7 +271,11 @@ namespace fusion::ui {
 		}
 
 		void SetZIndex(int zIndex) {
+			if (zIndex_ == zIndex) {
+				return;
+			}
 			zIndex_ = zIndex;
+			MarkDirty();
 		}
 
 		int ZIndex() const {
@@ -271,6 +287,9 @@ namespace fusion::ui {
 		}
 
 		void SetVisible(bool visible) {
+			if (visible_ == visible) {
+				return;
+			}
 			visible_ = visible;
 			if (!visible_) {
 				hovered_ = false;
@@ -280,6 +299,7 @@ namespace fusion::ui {
 				Animate(pressAnimation_, 0.0f, 0.10);
 				Animate(focusAnimation_, 0.0f, 0.10);
 			}
+			MarkDirty();
 		}
 
 		bool Enabled() const {
@@ -287,7 +307,11 @@ namespace fusion::ui {
 		}
 
 		void SetEnabled(bool enabled) {
+			if (enabled_ == enabled) {
+				return;
+			}
 			enabled_ = enabled;
+			MarkDirty();
 		}
 
 		bool Focused() const {
@@ -321,24 +345,67 @@ namespace fusion::ui {
 
 		virtual void Render(ID2D1DeviceContext* context) = 0;
 
+		virtual bool SupportsCachedRendering() const {
+			return true;
+		}
+
+		void MarkDirty() {
+			dirty_ = true;
+		}
+
+		void ClearRenderCache() {
+			renderCache_.Reset();
+			renderCacheFingerprint_ = 0;
+			dirty_ = true;
+		}
+
+		bool NeedsCacheRefresh() const {
+			return dirty_ || IsAnimating() || !renderCache_ || renderCacheFingerprint_ != ComputeRenderFingerprint();
+		}
+
+		bool RenderCached(ID2D1DeviceContext* context) {
+			if (!context || !visible_) {
+				return false;
+			}
+			bool rebuilt = false;
+			if (!SupportsCachedRendering()) {
+				Render(context);
+				dirty_ = false;
+				renderCacheFingerprint_ = ComputeRenderFingerprint();
+				return true;
+			}
+			if (NeedsCacheRefresh()) {
+				RebuildRenderCache(context);
+				rebuilt = true;
+			}
+			if (renderCache_) {
+				context->DrawImage(renderCache_.Get());
+			}
+			return rebuilt;
+		}
+
 		virtual void OnHover(bool hovered) {
 			hovered_ = hovered;
 			Animate(hoverAnimation_, hovered_ ? 1.0f : 0.0f);
+			MarkDirty();
 		}
 
 		virtual void OnFocus(bool focused) {
 			focused_ = focused;
 			Animate(focusAnimation_, focused_ ? 1.0f : 0.0f);
+			MarkDirty();
 		}
 
 		virtual void OnPointerDown(D2D1_POINT_2F) {
 			pressed_ = true;
 			Animate(pressAnimation_, 1.0f);
+			MarkDirty();
 		}
 
 		virtual void OnPointerUp(D2D1_POINT_2F) {
 			pressed_ = false;
 			Animate(pressAnimation_, 0.0f);
+			MarkDirty();
 		}
 
 		virtual void OnPointerMove(D2D1_POINT_2F) {}
@@ -382,6 +449,7 @@ namespace fusion::ui {
 			if (animator_) {
 				animator_->Attach(it->second, it->second.Value());
 			}
+			MarkDirty();
 		}
 
 		void AnimateSlot(std::wstring_view key, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
@@ -416,6 +484,7 @@ namespace fusion::ui {
 		virtual void OnAttachAnimations() {}
 
 		void Animate(UIAnimation& animation, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
+			MarkDirty();
 			if (animator_) {
 				animator_->Animate(animation, target, duration, accel, decel);
 			}
@@ -425,6 +494,7 @@ namespace fusion::ui {
 		}
 
 		void AnimateLinear(UIAnimation& animation, float target, double duration = 0.16) {
+			MarkDirty();
 			if (animator_) {
 				animator_->AnimateLinear(animation, target, duration);
 			}
@@ -443,6 +513,22 @@ namespace fusion::ui {
 
 		float FocusProgress() const {
 			return focusAnimation_.Value();
+		}
+
+		bool HasRunningOwnAnimations() const {
+			if (hoverAnimation_.IsAnimating() || pressAnimation_.IsAnimating() || focusAnimation_.IsAnimating()) {
+				return true;
+			}
+			for (const auto& [_, animation] : customAnimations_) {
+				if (animation.IsAnimating()) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		virtual bool IsAnimating() const {
+			return HasRunningOwnAnimations();
 		}
 
 		virtual HRESULT CreateHitGeometry(ID2D1Factory1* factory, ID2D1Geometry** geometry) const {
@@ -464,6 +550,60 @@ namespace fusion::ui {
 		UIAnimation pressAnimation_{};
 		UIAnimation focusAnimation_{};
 		std::unordered_map<std::wstring, UIAnimation> customAnimations_;
+		bool dirty_ = true;
+		ComPtr<ID2D1CommandList> renderCache_;
+		std::size_t renderCacheFingerprint_ = 0;
+
+	private:
+		std::size_t ComputeRenderFingerprint() const {
+			auto hashCombine = [](std::size_t seed, std::size_t value) {
+				return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+			};
+			auto quantize = [](float value) {
+				return static_cast<std::size_t>(std::lround(value * 1000.0f));
+			};
+			std::size_t seed = 0;
+			seed = hashCombine(seed, quantize(bounds_.left));
+			seed = hashCombine(seed, quantize(bounds_.top));
+			seed = hashCombine(seed, quantize(bounds_.right));
+			seed = hashCombine(seed, quantize(bounds_.bottom));
+			seed = hashCombine(seed, static_cast<std::size_t>(visible_));
+			seed = hashCombine(seed, static_cast<std::size_t>(enabled_));
+			seed = hashCombine(seed, static_cast<std::size_t>(hovered_));
+			seed = hashCombine(seed, static_cast<std::size_t>(pressed_));
+			seed = hashCombine(seed, static_cast<std::size_t>(focused_));
+			seed = hashCombine(seed, quantize(HoverProgress()));
+			seed = hashCombine(seed, quantize(PressProgress()));
+			seed = hashCombine(seed, quantize(FocusProgress()));
+			for (const auto& [key, animation] : customAnimations_) {
+				seed = hashCombine(seed, std::hash<std::wstring>{}(key));
+				seed = hashCombine(seed, quantize(animation.Value()));
+			}
+			seed = hashCombine(seed, ExtraRenderFingerprint());
+			return seed;
+		}
+
+	protected:
+		virtual std::size_t ExtraRenderFingerprint() const {
+			return 0;
+		}
+
+	private:
+		void RebuildRenderCache(ID2D1DeviceContext* context) {
+			ComPtr<ID2D1Image> previousTarget;
+			context->GetTarget(&previousTarget);
+			renderCache_.Reset();
+			context->CreateCommandList(&renderCache_);
+			if (!renderCache_) {
+				return;
+			}
+			context->SetTarget(renderCache_.Get());
+			Render(context);
+			context->SetTarget(previousTarget.Get());
+			renderCache_->Close();
+			renderCacheFingerprint_ = ComputeRenderFingerprint();
+			dirty_ = false;
+		}
 	};
 
 	class LayoutBase {
@@ -1060,6 +1200,7 @@ namespace fusion::ui {
 
 			void SetText(std::wstring text) {
 				text_ = std::move(text);
+				MarkDirty();
 			}
 
 			void SetTextStyle(const TextStyle& style) {
@@ -1069,6 +1210,7 @@ namespace fusion::ui {
 
 			void SetStyledRanges(std::vector<StyledTextRange> ranges) {
 				styledRanges_ = std::move(ranges);
+				MarkDirty();
 			}
 
 			bool IsDynamic() const override {
@@ -1111,10 +1253,12 @@ namespace fusion::ui {
 
 			void SetTitle(std::wstring title) {
 				title_ = std::move(title);
+				MarkDirty();
 			}
 
 			void SetBody(std::wstring body) {
 				body_ = std::move(body);
+				MarkDirty();
 			}
 
 			void SetTitleStyle(const TextStyle& style) {
@@ -1230,6 +1374,7 @@ namespace fusion::ui {
 				UpdateScrollBarViewport();
 				SetScrollOffset(scrollOffset_);
 				UpdateScrollBarAnimation(ShouldRevealScrollBar());
+				MarkDirty();
 			}
 
 			float ScrollOffset() const {
@@ -1240,6 +1385,7 @@ namespace fusion::ui {
 				UpdateScrollBarViewport();
 				scrollOffset_ = (std::clamp)(offset, 0.0f, MaxScrollOffset());
 				scrollBar_.offset = scrollOffset_;
+				MarkDirty();
 			}
 
 			float MaxScrollOffset() const {
@@ -1550,6 +1696,7 @@ namespace fusion::ui {
 			void SetScrollOffset(float x, float y) {
 				scrollX_ = Clamp01(x);
 				scrollY_ = Clamp01(y);
+				MarkDirty();
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
@@ -1887,6 +2034,7 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || checkAnimation_.IsAnimating(); }
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -1932,6 +2080,10 @@ namespace fusion::ui {
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				return (static_cast<std::size_t>(checked_) << 1) ^ static_cast<std::size_t>(std::lround(checkAnimation_.Value() * 1000.0f));
+			}
+
 			std::wstring text_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -1963,6 +2115,7 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || selectionAnimation_.IsAnimating(); }
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -2010,6 +2163,10 @@ namespace fusion::ui {
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				return (static_cast<std::size_t>(*selectedValue_ == ownValue_) << 1) ^ static_cast<std::size_t>(std::lround(selectionAnimation_.Value() * 1000.0f));
+			}
+
 			std::wstring text_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2041,6 +2198,7 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || valueAnimation_.IsAnimating(); }
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -2096,6 +2254,10 @@ namespace fusion::ui {
 				if (onChanged_) onChanged_(value_);
 			}
 
+			std::size_t ExtraRenderFingerprint() const override {
+				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 1);
+			}
+
 			std::wstring label_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2123,6 +2285,11 @@ namespace fusion::ui {
 			}
 
 			bool IsDynamic() const override { return true; }
+
+			std::size_t ExtraRenderFingerprint() const override {
+				const float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
+				return static_cast<std::size_t>(std::lround(progress * 1000.0f));
+			}
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -2175,6 +2342,9 @@ namespace fusion::ui {
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
 			CursorKind Cursor() const override { return CursorKind::IBeam; }
+			bool IsAnimating() const override {
+				return UIComponent::IsAnimating() || caretOpacityAnimation_.IsAnimating() || horizontalScrollVisibilityAnimation_.IsAnimating() || verticalScrollVisibilityAnimation_.IsAnimating();
+			}
 			bool WantsFrameTick() const override {
 				return HorizontalScrollRevealActive() || VerticalScrollRevealActive();
 			}
@@ -2607,6 +2777,21 @@ namespace fusion::ui {
 			const std::wstring& Text() const { return text_; }
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				std::size_t seed = std::hash<std::wstring>{}(text_);
+				seed ^= (std::hash<std::wstring>{}(imeComposition_) << 1);
+				seed ^= (caret_ << 1);
+				seed ^= (selectionAnchor_ << 2);
+				seed ^= (static_cast<std::size_t>(std::lround(scrollX_ * 1000.0f)) << 3);
+				seed ^= (static_cast<std::size_t>(std::lround(scrollY_ * 1000.0f)) << 4);
+				seed ^= (static_cast<std::size_t>(std::lround(caretOpacityAnimation_.Value() * 1000.0f)) << 5);
+				seed ^= (static_cast<std::size_t>(std::lround(horizontalScrollVisibilityAnimation_.Value() * 1000.0f)) << 6);
+				seed ^= (static_cast<std::size_t>(std::lround(verticalScrollVisibilityAnimation_.Value() * 1000.0f)) << 7);
+				seed ^= (static_cast<std::size_t>(imeActive_) << 8);
+				seed ^= (static_cast<std::size_t>(multiline_) << 9);
+				return seed;
+			}
+
 			static constexpr float kScrollGutter = 18.0f;
 			static constexpr float kSingleLineScrollGutter = 12.0f;
 
@@ -3236,6 +3421,7 @@ namespace fusion::ui {
 				const size_t maxOffset = items_.size() > VisibleRows() ? items_.size() - VisibleRows() : 0;
 				topIndex_ = static_cast<size_t>(Clamp01(value) * static_cast<float>(maxOffset));
 				NotifyScrollChanged();
+				MarkDirty();
 			}
 
 			float ScrollNormalized() const {
@@ -3727,6 +3913,7 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || openAnimation_.IsAnimating(); }
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -3836,6 +4023,11 @@ namespace fusion::ui {
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				const std::size_t hovered = hoveredIndex_.has_value() ? (*hoveredIndex_ + 1) : 0;
+				return (selectedIndex_ << 1) ^ (hovered << 3) ^ (static_cast<std::size_t>(open_) << 5) ^ (static_cast<std::size_t>(std::lround(openAnimation_.Value() * 1000.0f)) << 6);
+			}
+
 			D2D1_RECT_F PopupBounds(float openAmount = 1.0f) const {
 				const float fullHeight = static_cast<float>(items_.size()) * PopupRowHeight() + 12.0f;
 				return D2D1::RectF(bounds_.left, bounds_.bottom + 6.0f, bounds_.right, bounds_.bottom + 6.0f + fullHeight * openAmount);
@@ -3894,6 +4086,7 @@ namespace fusion::ui {
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
 			CursorKind Cursor() const override { return CursorKind::Arrow; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || valueAnimation_.IsAnimating(); }
 
 			float Value() const {
 				return value_;
@@ -3959,6 +4152,10 @@ namespace fusion::ui {
 				if (notify && onChanged_) onChanged_(value_);
 			}
 
+			std::size_t ExtraRenderFingerprint() const override {
+				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(pageSize_ * 1000.0f)) << 1) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 2);
+			}
+
 			ScrollOrientation orientation_ = ScrollOrientation::Horizontal;
 			D2D1_COLOR_F surfaceColor_{};
 			D2D1_COLOR_F accentColor_{};
@@ -3985,6 +4182,7 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || valueAnimation_.IsAnimating(); }
 
 			void SetLabelStyle(const TextStyle& style) {
 				labelStyle_ = style;
@@ -4048,6 +4246,10 @@ namespace fusion::ui {
 				value_ = Clamp01(value);
 				Animate(valueAnimation_, value_, 0.12);
 				if (onChanged_) onChanged_(value_);
+			}
+
+			std::size_t ExtraRenderFingerprint() const override {
+				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 1) ^ (static_cast<std::size_t>(fullCircle_) << 2);
 			}
 
 			std::wstring label_;
@@ -4146,9 +4348,13 @@ namespace fusion::ui {
 				}
 				else {
 					currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
+					if (target) {
+						target->MarkDirty();
+					}
 				}
 				if (captured_) {
 					captured_->OnPointerMove(point);
+					captured_->MarkDirty();
 					if (captured_ == leftCard_ || captured_ == rightCard_) {
 						layoutDirty_ = true;
 					}
@@ -4168,6 +4374,7 @@ namespace fusion::ui {
 					UpdateCardHoverState(point, cardScrollTarget);
 					currentCursor_ = CursorKind::Arrow;
 					cardScrollTarget->OnPointerDown(point);
+					cardScrollTarget->MarkDirty();
 					layoutDirty_ = true;
 					dynamicDirty_ = true;
 					return;
@@ -4179,6 +4386,7 @@ namespace fusion::ui {
 				captured_ = target;
 				if (target) {
 					target->OnPointerDown(point);
+					target->MarkDirty();
 					dynamicDirty_ = true;
 				}
 				return;
@@ -4186,6 +4394,7 @@ namespace fusion::ui {
 			case WM_LBUTTONUP: {
 				if (captured_) {
 					captured_->OnPointerUp(point);
+					captured_->MarkDirty();
 					if (captured_ == leftCard_ || captured_ == rightCard_) {
 						layoutDirty_ = true;
 					}
@@ -4198,6 +4407,9 @@ namespace fusion::ui {
 					}
 					else {
 						currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : (PointInViewport(point) ? CursorKind::Arrow : CursorKind::None);
+						if (target) {
+							target->MarkDirty();
+						}
 					}
 					dynamicDirty_ = true;
 				}
@@ -4214,6 +4426,7 @@ namespace fusion::ui {
 				const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
 				if (auto* modal = ResolveModalComponent(point, false)) {
 					if (modal->OnMouseWheel(delta, point)) {
+						modal->MarkDirty();
 						dynamicDirty_ = true;
 						return;
 					}
@@ -4231,6 +4444,7 @@ namespace fusion::ui {
 
 				for (auto* target : ordered) {
 					if (target && target->OnMouseWheel(delta, point)) {
+						target->MarkDirty();
 						dynamicDirty_ = true;
 						return;
 					}
@@ -4238,6 +4452,7 @@ namespace fusion::ui {
 
 				if (auto* card = CardAtPoint(point)) {
 					if (card->OnMouseWheel(delta, point)) {
+						card->MarkDirty();
 						layoutDirty_ = true;
 						dynamicDirty_ = true;
 					}
@@ -4247,6 +4462,7 @@ namespace fusion::ui {
 			case WM_CHAR: {
 				if (focused_) {
 					focused_->OnChar(static_cast<wchar_t>(wParam));
+					focused_->MarkDirty();
 					dynamicDirty_ = true;
 				}
 				return;
@@ -4254,6 +4470,7 @@ namespace fusion::ui {
 			case WM_IME_STARTCOMPOSITION: {
 				if (focused_) {
 					focused_->OnImeStart(hwnd);
+					focused_->MarkDirty();
 					dynamicDirty_ = true;
 				}
 				return;
@@ -4261,6 +4478,7 @@ namespace fusion::ui {
 			case WM_IME_COMPOSITION: {
 				if (focused_) {
 					focused_->OnImeComposition(hwnd, lParam);
+					focused_->MarkDirty();
 					dynamicDirty_ = true;
 				}
 				return;
@@ -4268,6 +4486,7 @@ namespace fusion::ui {
 			case WM_IME_ENDCOMPOSITION: {
 				if (focused_) {
 					focused_->OnImeEnd(hwnd);
+					focused_->MarkDirty();
 					dynamicDirty_ = true;
 				}
 				return;
@@ -4307,6 +4526,7 @@ namespace fusion::ui {
 			}
 			if (focused_) {
 				focused_->OnKeyDown(key, modifiers);
+				focused_->MarkDirty();
 				dynamicDirty_ = true;
 				return true;
 			}
@@ -4315,6 +4535,9 @@ namespace fusion::ui {
 
 		void SetAnimationProgress(float normalizedProgress) {
 			progressAnimation_.SetObservedValue((std::clamp)(normalizedProgress, 0.0f, 1.0f));
+			if (progressBar_) {
+				progressBar_->MarkDirty();
+			}
 			dynamicDirty_ = true;
 		}
 
@@ -4327,6 +4550,8 @@ namespace fusion::ui {
 			if (layoutDirty_) {
 				Arrange();
 			}
+			lastFrameCacheRebuildCount_ = 0;
+			lastFrameRenderedComponentCount_ = 0;
 			if (rightCard_ && rightCard_->Visible()) {
 				RenderCard(targetContext, rightCard_, rightLayoutOrder_);
 			}
@@ -4334,8 +4559,10 @@ namespace fusion::ui {
 				RenderCard(targetContext, leftCard_, leftLayoutOrder_);
 			}
 			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup()) {
-				comboBox_->Render(targetContext);
+				lastFrameCacheRebuildCount_ += comboBox_->RenderCached(targetContext) ? 1 : 0;
+				++lastFrameRenderedComponentCount_;
 			}
+			RenderCacheDiagnostics(targetContext);
 			dynamicDirty_ = false;
 		}
 
@@ -4405,6 +4632,7 @@ namespace fusion::ui {
 				}
 				if (target == card || UIComponent::PointInRect(card->Bounds(), point)) {
 					card->CursorAt(point);
+					card->MarkDirty();
 				}
 				else {
 					card->OnHover(false);
@@ -4418,7 +4646,8 @@ namespace fusion::ui {
 			if (!context || !card || !card->Visible()) {
 				return;
 			}
-			card->Render(context);
+			lastFrameCacheRebuildCount_ += card->RenderCached(context) ? 1 : 0;
+			++lastFrameRenderedComponentCount_;
 			const auto clip = card->ContentClipBounds();
 			context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 			for (auto* item : items) {
@@ -4428,9 +4657,22 @@ namespace fusion::ui {
 				if (item == comboBox_ && comboBox_ && comboBox_->HasOpenPopup()) {
 					continue;
 				}
-				item->Render(context);
+				lastFrameCacheRebuildCount_ += item->RenderCached(context) ? 1 : 0;
+				++lastFrameRenderedComponentCount_;
 			}
 			context->PopAxisAlignedClip();
+		}
+
+		void RenderCacheDiagnostics(ID2D1DeviceContext* context) {
+			if (!context || !captionFormat_) {
+				return;
+			}
+			const D2D1_RECT_F panel = D2D1::RectF(viewport_.right - 228.0f, viewport_.top + 4.0f, viewport_.right - 8.0f, viewport_.top + 20.0f);
+			context->FillRoundedRectangle(D2D1::RoundedRect(panel, 8.0f, 8.0f), detail::PrepareSharedBrush(context, detail::SharedBrushSlot::Primary, detail::MakeColor(1.0f, 1.0f, 1.0f, 0.82f)));
+			context->DrawRoundedRectangle(D2D1::RoundedRect(panel, 8.0f, 8.0f), detail::PrepareSharedBrush(context, detail::SharedBrushSlot::Secondary, detail::MakeColor(0.89f, 0.89f, 0.91f, 1.0f)), 1.0f);
+			std::wstringstream ss;
+			ss << L"Dirty redraws " << lastFrameCacheRebuildCount_ << L" / " << lastFrameRenderedComponentCount_;
+			detail::DrawStyledText(context, graphics_.dwriteFactory.Get(), captionFormat_.Get(), detail::PrepareSharedBrush(context, detail::SharedBrushSlot::Tertiary, detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f)), ss.str(), D2D1::RectF(panel.left + 10.0f, panel.top + 1.0f, panel.right - 10.0f, panel.bottom - 1.0f));
 		}
 
 		void ArrangeCard(CardSurface* card, std::span<UIComponent*> items) {
@@ -4600,6 +4842,7 @@ namespace fusion::ui {
 			auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", graphics_.dwriteFactory, captionFormat_, surfaceAltColor, accentColor, textColor, &progressAnimation_);
 			progress->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f));
 			progress->SetZIndex(3);
+			progressBar_ = progress.get();
 			leftLayoutOrder_.push_back(progress.get());
 			components_.push_back(std::move(progress));
 
@@ -4927,11 +5170,14 @@ namespace fusion::ui {
 		CardSurface* rightCard_ = nullptr;
 		ImageFrame* preview_ = nullptr;
 		ExpandableNote* statusText_ = nullptr;
+		ProgressBar* progressBar_ = nullptr;
 		TextInput* singleInput_ = nullptr;
 		TextInput* multiInput_ = nullptr;
 		ListBox* listBox_ = nullptr;
 		ComboBox* comboBox_ = nullptr;
 		Knob* knob_ = nullptr;
+		int lastFrameCacheRebuildCount_ = 0;
+		int lastFrameRenderedComponentCount_ = 0;
 	};
 
 }
