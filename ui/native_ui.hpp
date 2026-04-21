@@ -4521,12 +4521,488 @@ namespace fusion::ui {
 
 	class DemoUiHost {
 	public:
-		struct KDNode {
-			D2D1_RECT_F bounds{ D2D1::RectF() };
-			int axis = 0;
-			const UIComponent* item = nullptr;
-			std::unique_ptr<KDNode> left;
-			std::unique_ptr<KDNode> right;
+		class QuadtreeHitIndex {
+		public:
+			void Clear() {
+				for (auto& node : nodes_) {
+					node.items.clear();
+				}
+				nodes_.clear();
+				entries_.clear();
+				rootBounds_ = D2D1::RectF();
+				config_ = Config{};
+				mortonDepth_ = 1;
+			}
+
+			void Rebuild(const std::vector<UIComponent*>& components, const D2D1_RECT_F& viewport) {
+				Clear();
+				std::vector<UIComponent*> active;
+				active.reserve(components.size());
+				for (auto* component : components) {
+					if (component && IsHittable(component)) {
+						active.push_back(component);
+					}
+				}
+				if (active.empty()) {
+					return;
+				}
+
+				rootBounds_ = ComputeRootBounds(active, viewport);
+				config_ = ComputeConfig(active, rootBounds_);
+				mortonDepth_ = (std::clamp)(config_.maxDepth, 1, 15);
+				nodes_.reserve((std::max)(static_cast<size_t>(1), active.size() * 2));
+				nodes_.push_back(MakeNode(rootBounds_, -1, 0, 0));
+				for (auto* component : active) {
+					Insert(component, MakeEntry(component));
+				}
+			}
+
+			void Upsert(UIComponent* component) {
+				if (!component) {
+					return;
+				}
+				const Entry latest = MakeEntry(component);
+				auto existing = entries_.find(component);
+				if (!latest.active) {
+					if (existing != entries_.end() && existing->second.active) {
+						Remove(component);
+					}
+					entries_[component] = latest;
+					return;
+				}
+				if (nodes_.empty()) {
+					return;
+				}
+				if (existing == entries_.end() || !existing->second.active) {
+					Insert(component, latest);
+					return;
+				}
+				if (SameEntry(existing->second, latest)) {
+					return;
+				}
+				Remove(component);
+				Insert(component, latest);
+			}
+
+			UIComponent* QueryTopHit(D2D1_POINT_2F point, ID2D1Factory1* factory) const {
+				if (nodes_.empty() || !UIComponent::PointInRect(rootBounds_, point)) {
+					return nullptr;
+				}
+				const uint64_t morton = MortonKey(point);
+				int bestZ = kNoZ;
+				UIComponent* best = nullptr;
+				int nodeIndex = 0;
+				while (nodeIndex >= 0) {
+					const auto& node = nodes_[nodeIndex];
+					if (node.subtreeCount <= 0 || node.subtreeMaxZ <= bestZ || !RectContains(node.subtreeBounds, point)) {
+						break;
+					}
+					for (auto* component : node.items) {
+						auto entry = entries_.find(component);
+						if (entry == entries_.end() || !entry->second.active) {
+							continue;
+						}
+						if (entry->second.zIndex <= bestZ) {
+							break;
+						}
+						if (!UIComponent::PointInRect(entry->second.bounds, point)) {
+							continue;
+						}
+						if (component->HitTest(factory, point)) {
+							best = component;
+							bestZ = entry->second.zIndex;
+							break;
+						}
+					}
+					if (node.depth >= config_.maxDepth) {
+						break;
+					}
+					const int childSlot = ChildSlotForMorton(morton, node.depth);
+					if (childSlot < 0 || node.children[childSlot] < 0) {
+						break;
+					}
+					const auto& child = nodes_[node.children[childSlot]];
+					if (child.subtreeCount <= 0 || child.subtreeMaxZ <= bestZ || !UIComponent::PointInRect(child.bounds, point) || !RectContains(child.subtreeBounds, point)) {
+						break;
+					}
+					nodeIndex = node.children[childSlot];
+				}
+				return best;
+			}
+
+			void GatherCandidates(D2D1_POINT_2F point, std::vector<UIComponent*>& out) const {
+				out.clear();
+				if (nodes_.empty() || !UIComponent::PointInRect(rootBounds_, point)) {
+					return;
+				}
+				const uint64_t morton = MortonKey(point);
+				int nodeIndex = 0;
+				while (nodeIndex >= 0) {
+					const auto& node = nodes_[nodeIndex];
+					if (node.subtreeCount <= 0 || !RectContains(node.subtreeBounds, point)) {
+						break;
+					}
+					for (auto* component : node.items) {
+						auto entry = entries_.find(component);
+						if (entry != entries_.end() && entry->second.active && UIComponent::PointInRect(entry->second.bounds, point)) {
+							out.push_back(component);
+						}
+					}
+					if (node.depth >= config_.maxDepth) {
+						break;
+					}
+					const int childSlot = ChildSlotForMorton(morton, node.depth);
+					if (childSlot < 0 || node.children[childSlot] < 0) {
+						break;
+					}
+					const auto& child = nodes_[node.children[childSlot]];
+					if (child.subtreeCount <= 0 || !UIComponent::PointInRect(child.bounds, point) || !RectContains(child.subtreeBounds, point)) {
+						break;
+					}
+					nodeIndex = node.children[childSlot];
+				}
+			}
+
+		private:
+			static constexpr int kNoZ = (std::numeric_limits<int>::min)();
+
+			struct Config {
+				int maxItems = 8;
+				int maxDepth = 6;
+				float minCellExtent = 24.0f;
+			};
+
+			struct Entry {
+				D2D1_RECT_F bounds{ D2D1::RectF() };
+				int zIndex = 0;
+				int nodeIndex = -1;
+				bool active = false;
+			};
+
+			struct Node {
+				D2D1_RECT_F bounds{ D2D1::RectF() };
+				D2D1_RECT_F subtreeBounds{ D2D1::RectF() };
+				std::array<int, 4> children{ -1, -1, -1, -1 };
+				std::vector<UIComponent*> items;
+				int parent = -1;
+				int depth = 0;
+				int subtreeMaxZ = kNoZ;
+				int subtreeCount = 0;
+				uint64_t mortonPrefix = 0;
+			};
+
+			static bool IsHittable(const UIComponent* component) {
+				return component && component->Visible() && component->Enabled() && component->ZIndex() > 0 && RectValid(component->Bounds());
+			}
+
+			static bool RectValid(const D2D1_RECT_F& rect) {
+				return rect.right > rect.left && rect.bottom > rect.top;
+			}
+
+			static bool RectContains(const D2D1_RECT_F& rect, D2D1_POINT_2F point) {
+				return RectValid(rect) && UIComponent::PointInRect(rect, point);
+			}
+
+			static bool SameEntry(const Entry& lhs, const Entry& rhs) {
+				return lhs.active == rhs.active
+					&& lhs.zIndex == rhs.zIndex
+					&& lhs.bounds.left == rhs.bounds.left
+					&& lhs.bounds.top == rhs.bounds.top
+					&& lhs.bounds.right == rhs.bounds.right
+					&& lhs.bounds.bottom == rhs.bounds.bottom;
+			}
+
+			static D2D1_RECT_F EmptyRect() {
+				return D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
+			}
+
+			static D2D1_RECT_F MergeRect(const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) {
+				if (!RectValid(lhs)) {
+					return rhs;
+				}
+				if (!RectValid(rhs)) {
+					return lhs;
+				}
+				return detail::UnionRect(lhs, rhs);
+			}
+
+			static Entry MakeEntry(const UIComponent* component) {
+				Entry entry;
+				entry.bounds = component->Bounds();
+				entry.zIndex = component->ZIndex();
+				entry.active = IsHittable(component);
+				return entry;
+			}
+
+			Node MakeNode(const D2D1_RECT_F& bounds, int parent, int depth, uint64_t mortonPrefix) const {
+				Node node;
+				node.bounds = bounds;
+				node.parent = parent;
+				node.depth = depth;
+				node.mortonPrefix = mortonPrefix;
+				return node;
+			}
+
+			D2D1_RECT_F ComputeRootBounds(const std::vector<UIComponent*>& components, const D2D1_RECT_F& viewport) const {
+				D2D1_RECT_F merged = RectValid(viewport) ? viewport : EmptyRect();
+				for (auto* component : components) {
+					merged = MergeRect(merged, component->Bounds());
+				}
+				const float width = (std::max)(1.0f, merged.right - merged.left);
+				const float height = (std::max)(1.0f, merged.bottom - merged.top);
+				const float extent = (std::max)(width, height);
+				return D2D1::RectF(merged.left, merged.top, merged.left + extent, merged.top + extent);
+			}
+
+			Config ComputeConfig(const std::vector<UIComponent*>& components, const D2D1_RECT_F& rootBounds) const {
+				Config config;
+				const float width = (std::max)(1.0f, rootBounds.right - rootBounds.left);
+				const float height = (std::max)(1.0f, rootBounds.bottom - rootBounds.top);
+				const float area = width * height;
+				float minExtent = (std::max)(18.0f, (std::min)(width, height));
+				for (auto* component : components) {
+					const auto bounds = component->Bounds();
+					const float componentExtent = (std::max)(6.0f, (std::min)(bounds.right - bounds.left, bounds.bottom - bounds.top));
+					minExtent = (std::min)(minExtent, componentExtent);
+				}
+				config.minCellExtent = (std::clamp)(minExtent, 18.0f, (std::max)(width, height));
+				config.maxItems = (std::clamp)(static_cast<int>(std::sqrt(static_cast<double>((std::max)(size_t{ 1 }, components.size())))) + 4, 6, 16);
+				const double leafAreaTarget = area / static_cast<double>((std::max)(size_t{ 1 }, components.size()));
+				const float targetExtent = static_cast<float>(std::sqrt((std::max)(1.0, leafAreaTarget)));
+				int depthBySize = 0;
+				for (float cellExtent = (std::max)(width, height); cellExtent > (std::max)(config.minCellExtent, targetExtent); cellExtent *= 0.5f) {
+					++depthBySize;
+					if (depthBySize >= 10) {
+						break;
+					}
+				}
+				int depthByCount = 0;
+				size_t capacity = static_cast<size_t>(config.maxItems);
+				while (capacity < components.size() && depthByCount < 10) {
+					capacity *= 4;
+					++depthByCount;
+				}
+				config.maxDepth = (std::clamp)((std::max)(2, (std::min)(depthByCount + 1, depthBySize + 1)), 2, 10);
+				return config;
+			}
+
+			static uint64_t Part1By1(uint32_t value) {
+				uint64_t x = value;
+				x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
+				x = (x | (x << 8)) & 0x00FF00FF00FF00FFULL;
+				x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0FULL;
+				x = (x | (x << 2)) & 0x3333333333333333ULL;
+				x = (x | (x << 1)) & 0x5555555555555555ULL;
+				return x;
+			}
+
+			uint64_t MortonKey(D2D1_POINT_2F point) const {
+				const float width = (std::max)(1.0f, rootBounds_.right - rootBounds_.left);
+				const float height = (std::max)(1.0f, rootBounds_.bottom - rootBounds_.top);
+				const uint32_t scale = static_cast<uint32_t>((1u << mortonDepth_) - 1u);
+				const float normalizedX = (std::clamp)((point.x - rootBounds_.left) / width, 0.0f, 1.0f);
+				const float normalizedY = (std::clamp)((point.y - rootBounds_.top) / height, 0.0f, 1.0f);
+				const uint32_t x = static_cast<uint32_t>(std::lround(normalizedX * static_cast<float>(scale)));
+				const uint32_t y = static_cast<uint32_t>(std::lround(normalizedY * static_cast<float>(scale)));
+				return (Part1By1(y) << 1) | Part1By1(x);
+			}
+
+			int ChildSlotForMorton(uint64_t morton, int depth) const {
+				if (depth >= mortonDepth_) {
+					return -1;
+				}
+				const int shift = (mortonDepth_ - depth - 1) * 2;
+				return static_cast<int>((morton >> shift) & 0x3ULL);
+			}
+
+			static int ChildSlotForBounds(const D2D1_RECT_F& nodeBounds, const D2D1_RECT_F& itemBounds) {
+				const float midX = (nodeBounds.left + nodeBounds.right) * 0.5f;
+				const float midY = (nodeBounds.top + nodeBounds.bottom) * 0.5f;
+				const bool fitsLeft = itemBounds.right <= midX;
+				const bool fitsRight = itemBounds.left >= midX;
+				const bool fitsTop = itemBounds.bottom <= midY;
+				const bool fitsBottom = itemBounds.top >= midY;
+				if (fitsLeft) {
+					if (fitsTop) {
+						return 0;
+					}
+					if (fitsBottom) {
+						return 2;
+					}
+				}
+				if (fitsRight) {
+					if (fitsTop) {
+						return 1;
+					}
+					if (fitsBottom) {
+						return 3;
+					}
+				}
+				return -1;
+			}
+
+			D2D1_RECT_F ChildBounds(const D2D1_RECT_F& bounds, int slot) const {
+				const float midX = (bounds.left + bounds.right) * 0.5f;
+				const float midY = (bounds.top + bounds.bottom) * 0.5f;
+				switch (slot) {
+				case 0:
+					return D2D1::RectF(bounds.left, bounds.top, midX, midY);
+				case 1:
+					return D2D1::RectF(midX, bounds.top, bounds.right, midY);
+				case 2:
+					return D2D1::RectF(bounds.left, midY, midX, bounds.bottom);
+				default:
+					return D2D1::RectF(midX, midY, bounds.right, bounds.bottom);
+				}
+			}
+
+			void EnsureChildren(int nodeIndex) {
+				auto& node = nodes_[nodeIndex];
+				if (node.children[0] >= 0) {
+					return;
+				}
+				for (int slot = 0; slot < 4; ++slot) {
+					node.children[slot] = static_cast<int>(nodes_.size());
+					nodes_.push_back(MakeNode(ChildBounds(node.bounds, slot), nodeIndex, node.depth + 1, (node.mortonPrefix << 2) | static_cast<uint64_t>(slot)));
+				}
+			}
+
+			void InsertItemSorted(std::vector<UIComponent*>& items, UIComponent* component, int zIndex) {
+				auto position = items.begin();
+				for (; position != items.end(); ++position) {
+					auto entry = entries_.find(*position);
+					if (entry == entries_.end() || entry->second.zIndex < zIndex) {
+						break;
+					}
+				}
+				items.insert(position, component);
+			}
+
+			void AccumulateNodeOnly(int nodeIndex, const D2D1_RECT_F& bounds, int zIndex) {
+				auto& node = nodes_[nodeIndex];
+				node.subtreeCount += 1;
+				node.subtreeMaxZ = (std::max)(node.subtreeMaxZ, zIndex);
+				node.subtreeBounds = MergeRect(node.subtreeBounds, bounds);
+			}
+
+			void Insert(UIComponent* component, const Entry& entry) {
+				entries_[component] = entry;
+				int nodeIndex = 0;
+				while (true) {
+					auto& node = nodes_[nodeIndex];
+					if (node.depth < config_.maxDepth) {
+						const int childSlot = ChildSlotForBounds(node.bounds, entry.bounds);
+						if (childSlot >= 0) {
+							if (node.children[childSlot] < 0 && static_cast<int>(node.items.size()) >= config_.maxItems) {
+								EnsureChildren(nodeIndex);
+								Redistribute(nodeIndex);
+							}
+							if (node.children[childSlot] >= 0) {
+								nodeIndex = node.children[childSlot];
+								continue;
+							}
+						}
+					}
+					InsertItemSorted(node.items, component, entry.zIndex);
+					entries_[component].nodeIndex = nodeIndex;
+					int updateIndex = nodeIndex;
+					while (updateIndex >= 0) {
+						AccumulateNodeOnly(updateIndex, entry.bounds, entry.zIndex);
+						updateIndex = nodes_[updateIndex].parent;
+					}
+					return;
+				}
+			}
+
+			void Redistribute(int nodeIndex) {
+				auto& node = nodes_[nodeIndex];
+				if (node.children[0] < 0 || node.items.empty()) {
+					return;
+				}
+				std::vector<UIComponent*> retained;
+				retained.reserve(node.items.size());
+				for (auto* component : node.items) {
+					auto entry = entries_.find(component);
+					if (entry == entries_.end() || !entry->second.active) {
+						continue;
+					}
+					const int childSlot = ChildSlotForBounds(node.bounds, entry->second.bounds);
+					if (childSlot < 0) {
+						retained.push_back(component);
+						continue;
+					}
+					const int childIndex = node.children[childSlot];
+					InsertItemSorted(nodes_[childIndex].items, component, entry->second.zIndex);
+					entries_[component].nodeIndex = childIndex;
+					AccumulateNodeOnly(childIndex, entry->second.bounds, entry->second.zIndex);
+				}
+				node.items.swap(retained);
+				RecomputePath(nodeIndex);
+			}
+
+			void Remove(UIComponent* component) {
+				auto entry = entries_.find(component);
+				if (entry == entries_.end() || !entry->second.active || entry->second.nodeIndex < 0) {
+					return;
+				}
+				const int nodeIndex = entry->second.nodeIndex;
+				auto& items = nodes_[nodeIndex].items;
+				items.erase(std::remove(items.begin(), items.end(), component), items.end());
+				int updateIndex = nodeIndex;
+				while (updateIndex >= 0) {
+					nodes_[updateIndex].subtreeCount = (std::max)(0, nodes_[updateIndex].subtreeCount - 1);
+					updateIndex = nodes_[updateIndex].parent;
+				}
+				entry->second.nodeIndex = -1;
+				entry->second.active = false;
+				RecomputePath(nodeIndex);
+			}
+
+			void RecomputePath(int nodeIndex) {
+				int current = nodeIndex;
+				while (current >= 0) {
+					RecomputeNode(current);
+					current = nodes_[current].parent;
+				}
+			}
+
+			void RecomputeNode(int nodeIndex) {
+				auto& node = nodes_[nodeIndex];
+				if (node.subtreeCount <= 0) {
+					node.subtreeBounds = EmptyRect();
+					node.subtreeMaxZ = kNoZ;
+					return;
+				}
+				D2D1_RECT_F merged = EmptyRect();
+				int maxZ = kNoZ;
+				for (auto* component : node.items) {
+					auto entry = entries_.find(component);
+					if (entry == entries_.end() || !entry->second.active) {
+						continue;
+					}
+					merged = MergeRect(merged, entry->second.bounds);
+					maxZ = (std::max)(maxZ, entry->second.zIndex);
+				}
+				for (int childIndex : node.children) {
+					if (childIndex < 0) {
+						continue;
+					}
+					const auto& child = nodes_[childIndex];
+					if (child.subtreeCount <= 0) {
+						continue;
+					}
+					merged = MergeRect(merged, child.subtreeBounds);
+					maxZ = (std::max)(maxZ, child.subtreeMaxZ);
+				}
+				node.subtreeBounds = merged;
+				node.subtreeMaxZ = maxZ;
+			}
+
+			std::vector<Node> nodes_;
+			std::unordered_map<UIComponent*, Entry> entries_;
+			D2D1_RECT_F rootBounds_{ D2D1::RectF() };
+			Config config_{};
+			int mortonDepth_ = 1;
 		};
 
 		DemoUiHost(GraphicsContext graphics, HostCallbacks callbacks)
@@ -4674,11 +5150,13 @@ namespace fusion::ui {
 					}
 				}
 
-				auto candidates = CollectCandidates(point);
+				SyncHitIndex();
+				std::vector<UIComponent*> candidates;
+				hitIndex_.GatherCandidates(point, candidates);
 				std::vector<UIComponent*> ordered;
 				ordered.reserve(candidates.size());
-				for (const auto* candidate : candidates) {
-					ordered.push_back(const_cast<UIComponent*>(candidate));
+				for (auto* candidate : candidates) {
+					ordered.push_back(candidate);
 				}
 				std::ranges::sort(ordered, [](const UIComponent* lhs, const UIComponent* rhs) {
 					return lhs->ZIndex() > rhs->ZIndex();
@@ -4837,7 +5315,7 @@ namespace fusion::ui {
 			return nullptr;
 		}
 
-		UIComponent* ResolvePointerTarget(D2D1_POINT_2F point, bool captureOutsideModal) const {
+		UIComponent* ResolvePointerTarget(D2D1_POINT_2F point, bool captureOutsideModal) {
 			if (auto* modal = ResolveModalComponent(point, captureOutsideModal)) {
 				return modal;
 			}
@@ -5246,13 +5724,24 @@ namespace fusion::ui {
 		}
 
 		void RebuildHitIndex() {
-			std::vector<const UIComponent*> hittable;
+			std::vector<UIComponent*> hittable;
 			for (const auto& component : components_) {
-				if (component->Visible() && component->Enabled() && component->ZIndex() > 0) {
+				if (component) {
 					hittable.push_back(component.get());
 				}
 			}
-			hitIndex_ = BuildKDTree(hittable, 0);
+			hitIndex_.Rebuild(hittable, viewport_);
+		}
+
+		void SyncHitIndex() {
+			if (layoutDirty_) {
+				return;
+			}
+			for (const auto& component : components_) {
+				if (component) {
+					hitIndex_.Upsert(component.get());
+				}
+			}
 		}
 
 		void ClearHover() {
@@ -5288,31 +5777,12 @@ namespace fusion::ui {
 			}
 		}
 
-		UIComponent* Pick(D2D1_POINT_2F point) const {
+		UIComponent* Pick(D2D1_POINT_2F point) {
 			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup() && comboBox_->HitTest(graphics_.d2dFactory.Get(), point)) {
 				return comboBox_;
 			}
-			auto candidates = CollectCandidates(point);
-			std::vector<UIComponent*> hits;
-			for (const auto* candidate : candidates) {
-				auto* mutableCandidate = const_cast<UIComponent*>(candidate);
-				if (mutableCandidate->HitTest(graphics_.d2dFactory.Get(), point)) {
-					hits.push_back(mutableCandidate);
-				}
-			}
-			if (hits.empty()) {
-				return nullptr;
-			}
-			std::ranges::sort(hits, [](const UIComponent* lhs, const UIComponent* rhs) {
-				return lhs->ZIndex() > rhs->ZIndex();
-				});
-			return hits.front();
-		}
-
-		std::vector<const UIComponent*> CollectCandidates(D2D1_POINT_2F point) const {
-			std::vector<const UIComponent*> candidates;
-			QueryKDTree(hitIndex_.get(), point, candidates);
-			return candidates;
+			SyncHitIndex();
+			return hitIndex_.QueryTopHit(point, graphics_.d2dFactory.Get());
 		}
 
 		bool PointInViewport(D2D1_POINT_2F point) const {
@@ -5332,51 +5802,6 @@ namespace fusion::ui {
 			if (statusText_) {
 				statusText_->SetBody(std::move(text));
 			}
-		}
-
-		static std::unique_ptr<KDNode> BuildKDTree(std::vector<const UIComponent*>& items, int depth) {
-			if (items.empty()) {
-				return nullptr;
-			}
-			const int axis = depth % 2;
-			const auto midpoint = items.begin() + static_cast<std::ptrdiff_t>(items.size() / 2);
-			std::nth_element(items.begin(), midpoint, items.end(), [axis](const UIComponent* lhs, const UIComponent* rhs) {
-				const auto& leftBounds = lhs->Bounds();
-				const auto& rightBounds = rhs->Bounds();
-				const float leftCenter = axis == 0 ? (leftBounds.left + leftBounds.right) * 0.5f : (leftBounds.top + leftBounds.bottom) * 0.5f;
-				const float rightCenter = axis == 0 ? (rightBounds.left + rightBounds.right) * 0.5f : (rightBounds.top + rightBounds.bottom) * 0.5f;
-				if (leftCenter == rightCenter) {
-					return lhs->ZIndex() < rhs->ZIndex();
-				}
-				return leftCenter < rightCenter;
-				});
-
-			auto node = std::make_unique<KDNode>();
-			node->axis = axis;
-			node->item = *midpoint;
-			node->bounds = node->item->Bounds();
-			std::vector<const UIComponent*> leftItems(items.begin(), midpoint);
-			std::vector<const UIComponent*> rightItems(midpoint + 1, items.end());
-			node->left = BuildKDTree(leftItems, depth + 1);
-			node->right = BuildKDTree(rightItems, depth + 1);
-			if (node->left) {
-				node->bounds = detail::UnionRect(node->bounds, node->left->bounds);
-			}
-			if (node->right) {
-				node->bounds = detail::UnionRect(node->bounds, node->right->bounds);
-			}
-			return node;
-		}
-
-		static void QueryKDTree(const KDNode* node, D2D1_POINT_2F point, std::vector<const UIComponent*>& out) {
-			if (!node || !UIComponent::PointInRect(node->bounds, point)) {
-				return;
-			}
-			if (UIComponent::PointInRect(node->item->Bounds(), point)) {
-				out.push_back(node->item);
-			}
-			QueryKDTree(node->left.get(), point, out);
-			QueryKDTree(node->right.get(), point, out);
 		}
 
 		GraphicsContext graphics_;
@@ -5399,7 +5824,7 @@ namespace fusion::ui {
 		std::vector<UIComponent*> rightLayoutOrder_;
 		std::vector<UIComponent*> focusOrder_;
 		std::unique_ptr<LayoutBase> layout_;
-		std::unique_ptr<KDNode> hitIndex_;
+		QuadtreeHitIndex hitIndex_{};
 		UIComponent* hovered_ = nullptr;
 		UIComponent* focused_ = nullptr;
 		UIComponent* captured_ = nullptr;
