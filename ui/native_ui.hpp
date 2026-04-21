@@ -603,7 +603,7 @@ namespace fusion::ui {
 			if (!ShouldAnimate(animation, target)) {
 				return;
 			}
-			MarkDirty();
+			MarkCacheDirty();
 			if (animator_) {
 				animator_->Animate(animation, target, duration, accel, decel);
 			}
@@ -616,7 +616,7 @@ namespace fusion::ui {
 			if (!ShouldAnimate(animation, target)) {
 				return;
 			}
-			MarkDirty();
+			MarkCacheDirty();
 			if (animator_) {
 				animator_->AnimateLinear(animation, target, duration);
 			}
@@ -658,10 +658,6 @@ namespace fusion::ui {
 				return E_INVALIDARG;
 			}
 			return factory->CreateRectangleGeometry(bounds_, reinterpret_cast<ID2D1RectangleGeometry**>(geometry));
-		}
-
-		virtual std::size_t ExtraRenderFingerprint() const {
-			return 0;
 		}
 
 		D2D1_RECT_F bounds_{ D2D1::RectF() };
@@ -1551,6 +1547,7 @@ namespace fusion::ui {
 				if (scrollBar_.hovered) {
 					TouchScrollReveal();
 				}
+				const_cast<ScrollArea*>(this)->UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				return HitScrollBar(point) ? CursorKind::Arrow : CursorKind::Arrow;
 			}
 
@@ -1634,16 +1631,6 @@ namespace fusion::ui {
 					return E_INVALIDARG;
 				}
 				return factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius), reinterpret_cast<ID2D1RoundedRectangleGeometry**>(geometry));
-			}
-
-			std::size_t ExtraRenderFingerprint() const override {
-				std::size_t seed = static_cast<std::size_t>(std::lround(contentHeight_ * 1000.0f));
-				seed ^= (static_cast<std::size_t>(std::lround(hintedContentHeight_ * 1000.0f)) << 1);
-				seed ^= (static_cast<std::size_t>(std::lround(scrollOffset_ * 1000.0f)) << 2);
-				seed ^= (static_cast<std::size_t>(std::lround(scrollBar_.offset * 1000.0f)) << 3);
-				seed ^= (static_cast<std::size_t>(scrollBar_.hovered) << 4);
-				seed ^= (static_cast<std::size_t>(scrollBar_.dragging) << 5);
-				return seed;
 			}
 
 		private:
@@ -1928,15 +1915,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				std::size_t seed = static_cast<std::size_t>(std::lround(scrollX_ * 1000.0f));
-				seed ^= (static_cast<std::size_t>(std::lround(scrollY_ * 1000.0f)) << 1);
-				seed ^= (static_cast<std::size_t>(horizontalScrollHovered_) << 2);
-				seed ^= (static_cast<std::size_t>(verticalScrollHovered_) << 3);
-				seed ^= (static_cast<std::size_t>(dragMode_) << 4);
-				return seed;
-			}
-
 			struct Metrics {
 				D2D1_RECT_F viewport{ D2D1::RectF() };
 				float viewportWidth = 0.0f;
@@ -2219,10 +2197,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				return (static_cast<std::size_t>(checked_) << 1) ^ static_cast<std::size_t>(std::lround(checkAnimation_.Value() * 1000.0f));
-			}
-
 			std::wstring text_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2302,10 +2276,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				return (static_cast<std::size_t>(*selectedValue_ == ownValue_) << 1) ^ static_cast<std::size_t>(std::lround(selectionAnimation_.Value() * 1000.0f));
-			}
-
 			std::wstring text_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2402,10 +2372,6 @@ namespace fusion::ui {
 				if (onChanged_) onChanged_(value_);
 			}
 
-			std::size_t ExtraRenderFingerprint() const override {
-				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 1);
-			}
-
 			std::wstring label_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2437,11 +2403,6 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool SupportsCachedRendering() const override { return false; }
-
-			std::size_t ExtraRenderFingerprint() const override {
-				const float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
-				return static_cast<std::size_t>(std::lround(progress * 1000.0f));
-			}
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -2966,24 +2927,6 @@ namespace fusion::ui {
 			const std::wstring& Text() const { return text_; }
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				std::size_t seed = std::hash<std::wstring>{}(text_);
-				seed ^= (std::hash<std::wstring>{}(imeComposition_) << 1);
-				seed ^= (caret_ << 1);
-				seed ^= (selectionAnchor_ << 2);
-				seed ^= (static_cast<std::size_t>(std::lround(scrollX_ * 1000.0f)) << 3);
-				seed ^= (static_cast<std::size_t>(std::lround(scrollY_ * 1000.0f)) << 4);
-				seed ^= (static_cast<std::size_t>(std::lround(caretOpacityAnimation_.Value() * 1000.0f)) << 5);
-				seed ^= (static_cast<std::size_t>(std::lround(horizontalScrollVisibilityAnimation_.Value() * 1000.0f)) << 6);
-				seed ^= (static_cast<std::size_t>(std::lround(verticalScrollVisibilityAnimation_.Value() * 1000.0f)) << 7);
-				seed ^= (static_cast<std::size_t>(imeActive_) << 8);
-				seed ^= (static_cast<std::size_t>(multiline_) << 9);
-				seed ^= (static_cast<std::size_t>(horizontalScrollHovered_) << 10);
-				seed ^= (static_cast<std::size_t>(verticalScrollHovered_) << 11);
-				seed ^= (static_cast<std::size_t>(scrollDragMode_) << 12);
-				return seed;
-			}
-
 			static constexpr float kScrollGutter = 18.0f;
 			static constexpr float kSingleLineScrollGutter = 12.0f;
 
@@ -3825,15 +3768,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				const std::size_t hoveredRow = hoveredRow_.has_value() ? (*hoveredRow_ + 1) : 0;
-				return selectedIndex_
-					^ (topIndex_ << 8)
-					^ (hoveredRow << 16)
-					^ (static_cast<std::size_t>(scrollBarHovered_) << 24)
-					^ (static_cast<std::size_t>(draggingScroll_) << 25);
-			}
-
 			float ScrollBarOpacity() const {
 				return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
 			}
@@ -3884,8 +3818,8 @@ namespace fusion::ui {
 				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
-					return CursorKind::Arrow;
 				}
+				const_cast<ListBox*>(this)->UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				return CursorKind::Arrow;
 			}
 
@@ -4096,13 +4030,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				return selectedIndex_
-					^ (static_cast<std::size_t>(std::lround(scrollOffset_ * 1000.0f)) << 8)
-					^ (static_cast<std::size_t>(scrollBarHovered_) << 20)
-					^ (static_cast<std::size_t>(draggingScroll_) << 21);
-			}
-
 			float ScrollBarOpacity() const {
 				return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
 			}
@@ -4161,6 +4088,9 @@ namespace fusion::ui {
 				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
+				}
+				const_cast<ChipStrip*>(this)->UpdateScrollBarAnimation(ShouldRevealScrollBar());
+				if (scrollBarHovered_) {
 					return CursorKind::Arrow;
 				}
 				return CursorKind::Hand;
@@ -4349,7 +4279,7 @@ namespace fusion::ui {
 				UIComponent::OnPointerUp(point);
 				if (wasDraggingScroll) {
 					popupDraggingScroll_ = false;
-					popupScrollBarHovered_ = HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point);
+					AssignAndDirty(popupScrollBarHovered_, HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point));
 					if (popupScrollBarHovered_) {
 						TouchPopupScrollReveal();
 					}
@@ -4415,21 +4345,6 @@ namespace fusion::ui {
 			}
 
 		private:
-			std::size_t ExtraRenderFingerprint() const override {
-				const std::size_t hovered = hoveredIndex_.has_value() ? (*hoveredIndex_ + 1) : 0;
-				const std::size_t quantizedScroll = static_cast<std::size_t>(std::lround(popupScrollOffset_ * 1000.0f));
-				const std::size_t quantizedOpen = static_cast<std::size_t>(std::lround(openAnimation_.Value() * 1000.0f));
-				const std::size_t quantizedScrollBar = static_cast<std::size_t>(std::lround(PopupScrollBarOpacity() * 1000.0f));
-				return (selectedIndex_ << 1)
-					^ (hovered << 3)
-					^ (static_cast<std::size_t>(open_) << 5)
-					^ (quantizedOpen << 6)
-					^ (quantizedScroll << 7)
-					^ (quantizedScrollBar << 8)
-					^ (static_cast<std::size_t>(popupScrollBarHovered_) << 9)
-					^ (static_cast<std::size_t>(popupDraggingScroll_) << 10);
-			}
-
 			D2D1_RECT_F PopupBounds(float openAmount = 1.0f) const {
 				if (!cachedPopupBoundsValid_
 					|| !detail::NearlyEqual(cachedPopupHostBounds_.left, bounds_.left, 0.01f)
@@ -4622,8 +4537,11 @@ namespace fusion::ui {
 				if (HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point)) {
 					AssignAndDirty(popupScrollBarHovered_, true);
 					TouchPopupScrollReveal();
+					const_cast<ComboBox*>(this)->UpdatePopupScrollBarAnimation(ShouldRevealPopupScrollBar());
 					return CursorKind::Arrow;
 				}
+				AssignAndDirty(popupScrollBarHovered_, false);
+				const_cast<ComboBox*>(this)->UpdatePopupScrollBarAnimation(ShouldRevealPopupScrollBar());
 				return CursorKind::Arrow;
 			}
 
@@ -4737,10 +4655,6 @@ namespace fusion::ui {
 				if (notify && onChanged_) onChanged_(value_);
 			}
 
-			std::size_t ExtraRenderFingerprint() const override {
-				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(pageSize_ * 1000.0f)) << 1) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 2);
-			}
-
 			ScrollOrientation orientation_ = ScrollOrientation::Horizontal;
 			D2D1_COLOR_F surfaceColor_{};
 			D2D1_COLOR_F accentColor_{};
@@ -4833,10 +4747,6 @@ namespace fusion::ui {
 				if (onChanged_) onChanged_(value_);
 			}
 
-			std::size_t ExtraRenderFingerprint() const override {
-				return static_cast<std::size_t>(std::lround(value_ * 1000.0f)) ^ (static_cast<std::size_t>(std::lround(valueAnimation_.Value() * 1000.0f)) << 1) ^ (static_cast<std::size_t>(fullCircle_) << 2);
-			}
-
 			std::wstring label_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -4925,6 +4835,15 @@ namespace fusion::ui {
 				}
 				Remove(component);
 				Insert(component, latest);
+			}
+
+			bool ContainsBounds(const D2D1_RECT_F& bounds) const {
+				return !nodes_.empty()
+					&& RectValid(bounds)
+					&& bounds.left >= rootBounds_.left
+					&& bounds.top >= rootBounds_.top
+					&& bounds.right <= rootBounds_.right
+					&& bounds.bottom <= rootBounds_.bottom;
 			}
 
 			UIComponent* QueryTopHit(D2D1_POINT_2F point, ID2D1Factory1* factory) const {
@@ -5094,7 +5013,11 @@ namespace fusion::ui {
 				const float width = (std::max)(1.0f, merged.right - merged.left);
 				const float height = (std::max)(1.0f, merged.bottom - merged.top);
 				const float extent = (std::max)(width, height);
-				return D2D1::RectF(merged.left, merged.top, merged.left + extent, merged.top + extent);
+				const float padding = (std::max)(96.0f, extent * 0.35f);
+				const float paddedExtent = extent + padding * 2.0f;
+				const float centerX = (merged.left + merged.right) * 0.5f;
+				const float centerY = (merged.top + merged.bottom) * 0.5f;
+				return D2D1::RectF(centerX - paddedExtent * 0.5f, centerY - paddedExtent * 0.5f, centerX + paddedExtent * 0.5f, centerY + paddedExtent * 0.5f);
 			}
 
 			Config ComputeConfig(const std::vector<UIComponent*>& components, const D2D1_RECT_F& rootBounds) const {
@@ -5373,10 +5296,13 @@ namespace fusion::ui {
 
 		void SetViewport(const D2D1_RECT_F& viewport, float dpiScale) {
 			if (viewport.left != viewport_.left || viewport.top != viewport_.top || viewport.right != viewport_.right || viewport.bottom != viewport_.bottom || dpiScale != dpiScale_) {
+				const D2D1_RECT_F previousViewport = viewport_;
 				viewport_ = viewport;
 				dpiScale_ = dpiScale;
 				MarkLayoutDirty(kLayoutDirtySize);
-				hitIndexDirty_ = true;
+				if (!hitIndex_.ContainsBounds(previousViewport) || !hitIndex_.ContainsBounds(viewport_)) {
+					hitIndexDirty_ = true;
+				}
 				staticLayerDirty_ = true;
 				dynamicDirty_ = true;
 			}
