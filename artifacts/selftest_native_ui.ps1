@@ -26,6 +26,8 @@ public static class Native {
     public const int VK_HOME = 0x24;
     public const int VK_END = 0x23;
     public const int VK_RETURN = 0x0D;
+    
+    public const int GW_HWNDNEXT = 2;
 
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
@@ -39,6 +41,12 @@ public static class Native {
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    
+    [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
 }
 
 public static class AsyncSaver {
@@ -74,14 +82,79 @@ public static class AsyncSaver {
 $MouseEventLeftDown = 0x0002
 $MouseEventLeftUp = 0x0004
 
-$OutputDir = 'D:\Repo\fusion_window\artifacts'
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$BuildDir = Join-Path $RepoRoot 'build'
+$ExecutablePath = Join-Path $BuildDir 'Debug\fusion_window.exe'
 
-if (-not (Test-Path $OutputDir)) {
-    New-Item -ItemType Directory -Path $OutputDir | Out-Null
+# 初始化输出目录
+$PicDir = Join-Path $PSScriptRoot 'pic'
+$LogDir = Join-Path $PSScriptRoot 'log'
+
+if (-not (Test-Path $PicDir)) { New-Item -ItemType Directory -Path $PicDir | Out-Null }
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out-Null }
+
+$null = & cmake --build $BuildDir --config Debug
+if ($LASTEXITCODE -ne 0) {
+    throw "Build failed with exit code $LASTEXITCODE."
 }
 
-$window = Get-Process fusion_window -ErrorAction Stop | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-$hwnd = [IntPtr]$window.MainWindowHandle
+function Get-GuiWindowHandle {
+    param([int]$ProcessId)
+    
+    $ConsoleClass = 'ConsoleWindowClass'
+    $TerminalClass = 'CASCADIA_HOSTING_WINDOW_CLASS'
+    
+    $hWnd = [Native]::GetTopWindow([IntPtr]::Zero)
+    while ($hWnd -ne [IntPtr]::Zero) {
+        [uint32]$pidOut = 0
+        [Native]::GetWindowThreadProcessId($hWnd, [ref]$pidOut) | Out-Null
+        if ($pidOut -eq $ProcessId -and [Native]::IsWindowVisible($hWnd)) {
+            $sb = New-Object System.Text.StringBuilder 256
+            [Native]::GetClassName($hWnd, $sb, $sb.Capacity) | Out-Null
+            $className = $sb.ToString()
+            
+            # 命中非控制台类的可见窗口即认为是目标 GUI 窗口
+            if ($className -ne $ConsoleClass -and $className -ne $TerminalClass) {
+                return $hWnd
+            }
+        }
+        $hWnd = [Native]::GetWindow($hWnd, [Native]::GW_HWNDNEXT)
+    }
+    return [IntPtr]::Zero
+}
+
+function Get-UiWindowProcess {
+    return Get-Process fusion_window -ErrorAction SilentlyContinue | Where-Object { 
+        (Get-GuiWindowHandle -ProcessId $_.Id) -ne [IntPtr]::Zero 
+    } | Select-Object -First 1
+}
+
+$window = Get-UiWindowProcess
+$launchedByScript = $false
+if (-not $window) {
+    if (-not (Test-Path $ExecutablePath)) {
+        throw "Executable not found at $ExecutablePath"
+    }
+
+    $startedProcess = Start-Process -FilePath $ExecutablePath -WorkingDirectory (Split-Path $ExecutablePath -Parent) -PassThru
+    $launchedByScript = $true
+
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        Start-Sleep -Milliseconds 100
+        $window = Get-Process -Id $startedProcess.Id -ErrorAction SilentlyContinue | Where-Object { 
+            (Get-GuiWindowHandle -ProcessId $_.Id) -ne [IntPtr]::Zero 
+        } | Select-Object -First 1
+        if ($window) {
+            break
+        }
+    }
+}
+
+if (-not $window) {
+    throw 'Unable to locate a running fusion_window main window.'
+}
+
+$hwnd = Get-GuiWindowHandle -ProcessId $window.Id
 
 if ([Native]::IsIconic($hwnd)) {
     [Native]::ShowWindow($hwnd, [Native]::SW_RESTORE) | Out-Null
@@ -138,7 +211,7 @@ function Save-Capture([string]$name, [switch]$useCopyFromScreen) {
     }
 
     $graphics.Dispose()
-    $path = Join-Path $OutputDir $name
+    $path = Join-Path $PicDir $name
     [AsyncSaver]::SaveAndDispose($bitmap, $path)
 }
 
@@ -786,23 +859,23 @@ $expandCollapseOk = $true
 Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
 
-$dirtyRenderScreenshotsCaptured = (Test-Path (Join-Path $OutputDir 'native_ui_00a_dirty_idle.png')) -and (Test-Path (Join-Path $OutputDir 'native_ui_00b_dirty_hover.png'))
-$comboPopupVisualDelta = Measure-ImageRectDifference (Join-Path $OutputDir 'native_ui_02_combo_open.png') (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png') $comboPopupDiffLeft $comboPopupDiffTop $comboPopupDiffRight $comboPopupDiffBottom
+$dirtyRenderScreenshotsCaptured = (Test-Path (Join-Path $PicDir 'native_ui_00a_dirty_idle.png')) -and (Test-Path (Join-Path $PicDir 'native_ui_00b_dirty_hover.png'))
+$comboPopupVisualDelta = Measure-ImageRectDifference (Join-Path $PicDir 'native_ui_02_combo_open.png') (Join-Path $PicDir 'native_ui_02cd_combo_selected.png') $comboPopupDiffLeft $comboPopupDiffTop $comboPopupDiffRight $comboPopupDiffBottom
 $comboPopupOk = $comboPopupCaptured -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02c_combo_animating.png')) -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02_combo_open.png')) -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02ca_combo_hover.png')) -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02cb_combo_hover_scrollbar.png')) -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02cc_combo_scrolled.png')) -and
-    (Test-Path (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02c_combo_animating.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02_combo_open.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02ca_combo_hover.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02cb_combo_hover_scrollbar.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02cc_combo_scrolled.png')) -and
+    (Test-Path (Join-Path $PicDir 'native_ui_02cd_combo_selected.png')) -and
     ($comboPopupVisualDelta -ge 14.0)
 
-$singleCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_01_single_caret.png') ($controlLeft + (Scale-Logical 16)) ($singleBoundsTop + (Scale-Logical 26)) ($singleBoundsTop + $singleBoundsHeight - (Scale-Logical 12))
-$multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
+$singleCaretVisible = Test-CaretVisible (Join-Path $PicDir 'native_ui_01_single_caret.png') ($controlLeft + (Scale-Logical 16)) ($singleBoundsTop + (Scale-Logical 26)) ($singleBoundsTop + $singleBoundsHeight - (Scale-Logical 12))
+$multiCaretVisible = Test-CaretVisible (Join-Path $PicDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
 
 $stillAlive = (Get-Process -Id $window.Id -ErrorAction SilentlyContinue) -ne $null
 $closedCleanly = $false
-if ($stillAlive) {
+if ($stillAlive -and $launchedByScript) {
     $null = $window.CloseMainWindow()
     Start-Sleep -Milliseconds 300
     try {
@@ -811,6 +884,9 @@ if ($stillAlive) {
     catch {
         $closedCleanly = $false
     }
+}
+elseif (-not $launchedByScript) {
+    $closedCleanly = $true
 }
 
 $result = [pscustomobject]@{
@@ -839,36 +915,36 @@ $result = [pscustomobject]@{
 }
 
 $screenshotPaths = @(
-    (Join-Path $OutputDir 'native_ui_01_initial.png'),
-    (Join-Path $OutputDir 'native_ui_00a_dirty_idle.png'),
-    (Join-Path $OutputDir 'native_ui_00b_dirty_hover.png'),
-    (Join-Path $OutputDir 'native_ui_00_menu_open.png'),
-    (Join-Path $OutputDir 'native_ui_00_menu_hover_switch.png'),
-    (Join-Path $OutputDir 'native_ui_00_menu_closed.png'),
-    (Join-Path $OutputDir 'native_ui_01_single_caret.png'),
-    (Join-Path $OutputDir 'native_ui_01a_single_overflow.png'),
-    (Join-Path $OutputDir 'native_ui_01aa_single_hover_scrollbar.png'),
-    (Join-Path $OutputDir 'native_ui_01b_single_scrolled.png'),
-    (Join-Path $OutputDir 'native_ui_01c_single_collapsed.png'),
-    (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
-    (Join-Path $OutputDir 'native_ui_02aa_multi_hover_scrollbar.png'),
-    (Join-Path $OutputDir 'native_ui_02a_multi_overflow.png'),
-    (Join-Path $OutputDir 'native_ui_02ab_multi_up_one_line.png'),
-    (Join-Path $OutputDir 'native_ui_02ac_multi_down_one_line.png'),
-    (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
-    (Join-Path $OutputDir 'native_ui_02c_combo_animating.png'),
-    (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
-    (Join-Path $OutputDir 'native_ui_02ca_combo_hover.png'),
-    (Join-Path $OutputDir 'native_ui_02cb_combo_hover_scrollbar.png'),
-    (Join-Path $OutputDir 'native_ui_02cc_combo_scrolled.png'),
-    (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png')
+    (Join-Path $PicDir 'native_ui_01_initial.png'),
+    (Join-Path $PicDir 'native_ui_00a_dirty_idle.png'),
+    (Join-Path $PicDir 'native_ui_00b_dirty_hover.png'),
+    (Join-Path $PicDir 'native_ui_00_menu_open.png'),
+    (Join-Path $PicDir 'native_ui_00_menu_hover_switch.png'),
+    (Join-Path $PicDir 'native_ui_00_menu_closed.png'),
+    (Join-Path $PicDir 'native_ui_01_single_caret.png'),
+    (Join-Path $PicDir 'native_ui_01a_single_overflow.png'),
+    (Join-Path $PicDir 'native_ui_01aa_single_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_01b_single_scrolled.png'),
+    (Join-Path $PicDir 'native_ui_01c_single_collapsed.png'),
+    (Join-Path $PicDir 'native_ui_02_multi_caret.png'),
+    (Join-Path $PicDir 'native_ui_02aa_multi_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_02a_multi_overflow.png'),
+    (Join-Path $PicDir 'native_ui_02ab_multi_up_one_line.png'),
+    (Join-Path $PicDir 'native_ui_02ac_multi_down_one_line.png'),
+    (Join-Path $PicDir 'native_ui_02b_multi_collapsed.png'),
+    (Join-Path $PicDir 'native_ui_02c_combo_animating.png'),
+    (Join-Path $PicDir 'native_ui_02_combo_open.png'),
+    (Join-Path $PicDir 'native_ui_02ca_combo_hover.png'),
+    (Join-Path $PicDir 'native_ui_02cb_combo_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_02cc_combo_scrolled.png'),
+    (Join-Path $PicDir 'native_ui_02cd_combo_selected.png')
 )
 if ($twoColumn) {
-    $screenshotPaths += (Join-Path $OutputDir 'native_ui_02ba_left_card_hover_scrollbar.png')
+    $screenshotPaths += (Join-Path $PicDir 'native_ui_02ba_left_card_hover_scrollbar.png')
 }
 $screenshotPaths += @(
-    (Join-Path $OutputDir 'native_ui_02bb_right_card_hover_scrollbar.png'),
-    (Join-Path $OutputDir 'native_ui_03_after_interaction.png')
+    (Join-Path $PicDir 'native_ui_02bb_right_card_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_03_after_interaction.png')
 )
 $result.Screenshots = $screenshotPaths -join ';'
 
@@ -897,7 +973,7 @@ if (-not $result.ProcessClosedAfterSelftest) { $failures += 'process-exit' }
 $result | ConvertTo-Json -Compress
 
 $resultJson = $result | ConvertTo-Json -Compress
-[System.IO.File]::WriteAllText((Join-Path $OutputDir 'selftest_native_ui.last.txt'), $resultJson, [System.Text.Encoding]::Unicode)
+[System.IO.File]::WriteAllText((Join-Path $LogDir 'selftest_native_ui.last.txt'), $resultJson, [System.Text.Encoding]::Unicode)
 Write-Output $resultJson
 
 if ($failures.Count -gt 0) {
