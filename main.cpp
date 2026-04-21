@@ -1485,7 +1485,7 @@ LRESULT CALLBACK MenuMsgFilterHook(int code, WPARAM wParam, LPARAM lParam) {
 				}
 			}
 		}
-		else if (msg->message == WM_LBUTTONDOWN || msg->message == WM_LBUTTONUP) {
+		/*else if (msg->message == WM_LBUTTONDOWN || msg->message == WM_LBUTTONUP) {
 			POINT pt = msg->pt;
 			ScreenToClient(g_hMainWindow, &pt);
 			if (IsInMenuBarBand(pt)) {
@@ -1496,6 +1496,27 @@ LRESULT CALLBACK MenuMsgFilterHook(int code, WPARAM wParam, LPARAM lParam) {
 					PostMessageW(g_hMainWindow, WM_CANCELMODE, 0, 0);
 					return 1;
 				}
+			}
+		}*/
+
+		else if (msg->message == WM_LBUTTONDOWN) {
+			POINT pt = msg->pt;
+			ScreenToClient(g_hMainWindow, &pt);
+			if (IsInMenuBarBand(pt)) {
+				const int clickedIndex = GetMenuIndexFromLogicalX((float)pt.x / g_dpiScale);
+				if (clickedIndex != -1) {
+					const int activeIndex = g_PressedMenuIndexForRender.load(std::memory_order_acquire);
+					g_NextMenuIndex.store(clickedIndex == activeIndex ? kCloseMenuRequest : clickedIndex);
+					PostMessageW(g_hMainWindow, WM_CANCELMODE, 0, 0);
+					return 1;
+				}
+			}
+		}
+		else if (msg->message == WM_LBUTTONUP) {
+			POINT pt = msg->pt;
+			ScreenToClient(g_hMainWindow, &pt);
+			if (IsInMenuBarBand(pt)) {
+				return 1; // 拦截松开事件：防止按住拖动到其他菜单项后松手时发生误关
 			}
 		}
 	}
@@ -1558,6 +1579,19 @@ void ShowCustomWin32Menu(HWND hwnd, int selectedIndex) {
 	g_IsMenuPopupActive.store(false, std::memory_order_relaxed);
 	UpdateTitleMenuVisibilityFromCursor(hwnd);
 	g_RenderEvent.Notify();
+
+	if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) {
+		POINT pt;
+		GetCursorPos(&pt);
+		ScreenToClient(hwnd, &pt);
+		if (IsInCustomCaptionBand(pt)) {
+			SetCapture(hwnd);
+			g_CaptionPressPoint = pt;
+			g_IsCaptionPressActive = true;
+			g_IsCaptionDragStarted = false;
+			g_PressedMenuIndex = -1; // 设置为-1，确保本次鼠标松开时不会再次打开菜单
+		}
+	}
 }
 
 // =========================================================
