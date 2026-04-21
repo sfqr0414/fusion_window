@@ -198,6 +198,67 @@ function Test-CaretVisible([string]$imagePath, [int]$expectedX, [int]$topY, [int
     }
 }
 
+function Measure-ImageRectDifference([string]$imagePathA, [string]$imagePathB, [int]$left, [int]$top, [int]$right, [int]$bottom, [int]$sampleStep = 4) {
+    if (-not (Test-Path $imagePathA) -or -not (Test-Path $imagePathB)) {
+        return 0.0
+    }
+
+    $bitmapA = [System.Drawing.Bitmap]::FromFile($imagePathA)
+    $bitmapB = [System.Drawing.Bitmap]::FromFile($imagePathB)
+    try {
+        $scanLeft = [Math]::Max(0, $left)
+        $scanTop = [Math]::Max(0, $top)
+        $scanRight = [Math]::Min([Math]::Min($bitmapA.Width, $bitmapB.Width) - 1, $right)
+        $scanBottom = [Math]::Min([Math]::Min($bitmapA.Height, $bitmapB.Height) - 1, $bottom)
+        if ($scanRight -le $scanLeft -or $scanBottom -le $scanTop) {
+            return 0.0
+        }
+
+        $totalDifference = 0.0
+        $sampleCount = 0
+        for ($y = $scanTop; $y -le $scanBottom; $y += $sampleStep) {
+            for ($x = $scanLeft; $x -le $scanRight; $x += $sampleStep) {
+                $pixelA = $bitmapA.GetPixel($x, $y)
+                $pixelB = $bitmapB.GetPixel($x, $y)
+                $totalDifference += ([Math]::Abs($pixelA.R - $pixelB.R) + [Math]::Abs($pixelA.G - $pixelB.G) + [Math]::Abs($pixelA.B - $pixelB.B)) / 3.0
+                $sampleCount++
+            }
+        }
+
+        if ($sampleCount -eq 0) {
+            return 0.0
+        }
+
+        return $totalDifference / $sampleCount
+    }
+    finally {
+        $bitmapA.Dispose()
+        $bitmapB.Dispose()
+    }
+}
+
+function Get-VerticalScrollbarOffsetAfterDrag([double]$viewportTop, [double]$viewportBottom, [double]$contentExtent, [double]$startY, [double]$endY) {
+    $viewportExtent = [Math]::Max(1.0, $viewportBottom - $viewportTop)
+    $maxOffset = [Math]::Max(0.0, $contentExtent - $viewportExtent)
+    if ($maxOffset -le 0.5) {
+        return 0.0
+    }
+
+    $trackTop = $viewportTop + 10.0
+    $trackBottom = $viewportBottom - 10.0
+    $trackExtent = [Math]::Max(1.0, $trackBottom - $trackTop)
+    $thumbExtent = [Math]::Max(24.0, $trackExtent * ($viewportExtent / [Math]::Max($contentExtent, $viewportExtent)))
+    $usableExtent = [Math]::Max(1.0, ($trackBottom - $trackTop) - $thumbExtent)
+    $thumbStart = [Math]::Min($trackBottom - $thumbExtent, [Math]::Max($trackTop, $startY - ($thumbExtent * 0.5)))
+    $offsetAfterClick = (($thumbStart - $trackTop) / $usableExtent) * $maxOffset
+    $dragRatio = ($endY - $startY) / $usableExtent
+    return [Math]::Max(0.0, [Math]::Min($maxOffset, $offsetAfterClick + ($dragRatio * $maxOffset)))
+}
+
+function Get-ScrolledClientY([int]$baseY, [double]$scrollOffset) {
+    return [int][Math]::Round($baseY - $scrollOffset)
+}
+
 function Get-ScreenPoint([int]$clientX, [int]$clientY) {
     $point = New-Object POINT
     $point.X = $clientX
@@ -382,19 +443,19 @@ $progressTop = $sliderTop + $sliderHeight + $stackGap
 $progressHeight = (Scale-Logical 40)
 
 $singleBoundsTop = $rightCardTop + $stackPadding
-$singleBoundsHeight = (Scale-Logical 56)
+$singleBoundsHeight = (Scale-Logical 60)
 $multiBoundsTop = $singleBoundsTop + $singleBoundsHeight + $stackGap
-$multiBoundsHeight = (Scale-Logical 96)
+$multiBoundsHeight = (Scale-Logical 118)
 $listBoundsTop = $multiBoundsTop + $multiBoundsHeight + $stackGap
-$listBoundsHeight = (Scale-Logical 108)
+$listBoundsHeight = (Scale-Logical 142)
 $comboBoundsTop = $listBoundsTop + $listBoundsHeight + $stackGap
-$comboBoundsHeight = (Scale-Logical 36)
+$comboBoundsHeight = (Scale-Logical 38)
 $chipStripTop = $comboBoundsTop + $comboBoundsHeight + $stackGap
-$chipStripHeight = (Scale-Logical 56)
+$chipStripHeight = (Scale-Logical 76)
 $knobTop = $chipStripTop + $chipStripHeight + $stackGap
-$knobHeight = (Scale-Logical 104)
+$knobHeight = (Scale-Logical 136)
 $noteTop = $knobTop + $knobHeight + $stackGap
-$noteHeight = (Scale-Logical 48)
+$noteHeight = (Scale-Logical 84)
 
 $singleInputX = $controlLeft + [int][Math]::Round($controlWidth * 0.25)
 $singleInputY = $singleBoundsTop + (Scale-Logical 36)
@@ -414,9 +475,15 @@ $listBoxY = $listBoundsTop + (Scale-Logical 20)
 $listScrollX = $controlLeft + $controlWidth - (Scale-Logical 10)
 $listScrollStartY = $listBoundsTop + (Scale-Logical 30)
 $listScrollEndY = $listBoundsTop + $listBoundsHeight - (Scale-Logical 30)
-$comboX = $controlLeft + (Scale-Logical 24)
+$comboX = $controlLeft + [int][Math]::Round($controlWidth * 0.5)
 $comboY = $comboBoundsTop + [int][Math]::Round($comboBoundsHeight * 0.5)
-$comboPopupItemY = ($comboBoundsTop + $comboBoundsHeight + (Scale-Logical 6) + (Scale-Logical 6) + (Scale-Logical 11) + (Scale-Logical 22))
+$comboPopupTop = $comboBoundsTop + $comboBoundsHeight + (Scale-Logical 6)
+$comboPopupRowHeight = (Scale-Logical 28)
+$comboPopupHoverY = $comboPopupTop + (Scale-Logical 6) + [int][Math]::Round($comboPopupRowHeight * 1.5)
+$comboPopupSelectY = $comboPopupTop + (Scale-Logical 6) + [int][Math]::Round($comboPopupRowHeight * 3.5)
+$comboPopupScrollX = $controlLeft + $controlWidth - (Scale-Logical 10)
+$comboPopupScrollStartY = $comboPopupTop + (Scale-Logical 18)
+$comboPopupScrollEndY = $comboPopupTop + (Scale-Logical 134)
 $chipStripStartX = $controlLeft + (Scale-Logical 28)
 $chipStripEndX = $controlLeft + $controlWidth - (Scale-Logical 40)
 $chipStripY = $chipStripTop + $chipStripHeight - (Scale-Logical 10)
@@ -431,6 +498,24 @@ $leftCardScrollEndY = $cardBottom - (Scale-Logical 92)
 $rightCardScrollX = $rightCardLeft + $cardWidth - (Scale-Logical 8)
 $rightCardScrollStartY = $rightCardTop + (Scale-Logical 92)
 $rightCardScrollEndY = $cardBottom - (Scale-Logical 92)
+$rightCardContentHeight = ($noteTop + $noteHeight + $stackPadding) - $rightCardTop
+$rightCardViewportTop = $rightCardTop + 2
+$rightCardViewportBottom = $cardBottom - 2
+$rightCardComboScrollOffset = Get-VerticalScrollbarOffsetAfterDrag $rightCardViewportTop $rightCardViewportBottom $rightCardContentHeight $rightCardScrollStartY $rightCardScrollEndY
+$comboVisibleY = Get-ScrolledClientY $comboY $rightCardComboScrollOffset
+$comboPopupVisibleTop = Get-ScrolledClientY $comboPopupTop $rightCardComboScrollOffset
+$comboPopupHoverVisibleY = Get-ScrolledClientY $comboPopupHoverY $rightCardComboScrollOffset
+$comboPopupSelectVisibleY = Get-ScrolledClientY $comboPopupSelectY $rightCardComboScrollOffset
+$comboPopupScrollStartVisibleY = Get-ScrolledClientY $comboPopupScrollStartY $rightCardComboScrollOffset
+$comboPopupScrollEndVisibleY = Get-ScrolledClientY $comboPopupScrollEndY $rightCardComboScrollOffset
+$chipStripVisibleY = Get-ScrolledClientY $chipStripY $rightCardComboScrollOffset
+$knobStartVisibleY = Get-ScrolledClientY $knobStartY $rightCardComboScrollOffset
+$knobEndVisibleY = Get-ScrolledClientY $knobEndY $rightCardComboScrollOffset
+$noteVisibleY = Get-ScrolledClientY $noteY $rightCardComboScrollOffset
+$comboPopupDiffLeft = $clientBounds.Left + $controlLeft + (Scale-Logical 12)
+$comboPopupDiffTop = $clientBounds.Top + $comboPopupVisibleTop + (Scale-Logical 12)
+$comboPopupDiffRight = $clientBounds.Left + $controlLeft + $controlWidth - (Scale-Logical 24)
+$comboPopupDiffBottom = $clientBounds.Top + $comboPopupVisibleTop + (Scale-Logical 108)
 $previewViewportLeft = $leftControlLeft + (Scale-Logical 12)
 $previewViewportTop = $previewTop + (Scale-Logical 12)
 $previewViewportRight = $leftControlLeft + $leftControlWidth - (Scale-Logical 30)
@@ -485,6 +570,7 @@ $inputScrollbarsOk = $false
 $cardScrollbarsHoverOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
+$comboPopupCaptured = $false
 
 $dirtyProbeX = if ($twoColumn) { $previewButtonX } else { $singleInputX }
 $dirtyProbeY = if ($twoColumn) { $previewButtonY } else { $singleInputY }
@@ -644,21 +730,40 @@ Send-Text 'Short note.'
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_02b_multi_collapsed.png'
 
-Click-Client $listBoxX $listBoxY
-Start-Sleep -Milliseconds 120
-
-Click-Client $comboX $comboY
-Start-Sleep -Milliseconds 160
-Save-Capture 'native_ui_02_combo_open.png'
-Send-KeyPress 27
-Start-Sleep -Milliseconds 180
-
-Drag-Client $chipStripStartX $chipStripY $chipStripEndX $chipStripY
 Drag-Client $listScrollX $listScrollStartY $listScrollX $listScrollEndY
-Drag-Client $knobX $knobStartY $knobX $knobEndY
-Click-Client $noteX $noteY
+Start-Sleep -Milliseconds 140
+Drag-Client $rightCardScrollX $rightCardScrollStartY $rightCardScrollX $rightCardScrollEndY
+Start-Sleep -Milliseconds 220
+
+Click-Client $comboX $comboVisibleY
 Start-Sleep -Milliseconds 120
-Click-Client $noteX $noteY
+Start-Sleep -Milliseconds 160
+Save-Capture 'native_ui_02c_combo_animating.png' -useCopyFromScreen
+Start-Sleep -Milliseconds 420
+Save-Capture 'native_ui_02_combo_open.png' -useCopyFromScreen
+Move-MouseScreen (Get-ScreenPoint $comboX $comboPopupHoverVisibleY).X (Get-ScreenPoint $comboX $comboPopupHoverVisibleY).Y 140
+Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_02ca_combo_hover.png' -useCopyFromScreen
+Move-MouseScreen (Get-ScreenPoint $comboPopupScrollX $comboPopupScrollStartVisibleY).X (Get-ScreenPoint $comboPopupScrollX $comboPopupScrollStartVisibleY).Y 140
+Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_02cb_combo_hover_scrollbar.png' -useCopyFromScreen
+Drag-Client $comboPopupScrollX $comboPopupScrollStartVisibleY $comboPopupScrollX $comboPopupScrollEndVisibleY
+Start-Sleep -Milliseconds 160
+Save-Capture 'native_ui_02cc_combo_scrolled.png' -useCopyFromScreen
+for ($i = 0; $i -lt 5; $i++) {
+    Send-KeyPress 40
+    Start-Sleep -Milliseconds 60
+}
+Send-KeyPress 13
+Start-Sleep -Milliseconds 180
+Save-Capture 'native_ui_02cd_combo_selected.png' -useCopyFromScreen
+$comboPopupCaptured = $true
+
+Drag-Client $chipStripStartX $chipStripVisibleY $chipStripEndX $chipStripVisibleY
+Drag-Client $knobX $knobStartVisibleY $knobX $knobEndVisibleY
+Click-Client $noteX $noteVisibleY
+Start-Sleep -Milliseconds 120
+Click-Client $noteX $noteVisibleY
 Start-Sleep -Milliseconds 120
 
 if ($twoColumn) {
@@ -682,6 +787,15 @@ Save-Capture 'native_ui_03_after_interaction.png'
 [AsyncSaver]::WaitAll()
 
 $dirtyRenderScreenshotsCaptured = (Test-Path (Join-Path $OutputDir 'native_ui_00a_dirty_idle.png')) -and (Test-Path (Join-Path $OutputDir 'native_ui_00b_dirty_hover.png'))
+$comboPopupVisualDelta = Measure-ImageRectDifference (Join-Path $OutputDir 'native_ui_02_combo_open.png') (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png') $comboPopupDiffLeft $comboPopupDiffTop $comboPopupDiffRight $comboPopupDiffBottom
+$comboPopupOk = $comboPopupCaptured -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02c_combo_animating.png')) -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02_combo_open.png')) -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02ca_combo_hover.png')) -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02cb_combo_hover_scrollbar.png')) -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02cc_combo_scrolled.png')) -and
+    (Test-Path (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png')) -and
+    ($comboPopupVisualDelta -ge 14.0)
 
 $singleCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_01_single_caret.png') ($controlLeft + (Scale-Logical 16)) ($singleBoundsTop + (Scale-Logical 26)) ($singleBoundsTop + $singleBoundsHeight - (Scale-Logical 12))
 $multiCaretVisible = Test-CaretVisible (Join-Path $OutputDir 'native_ui_02_multi_caret.png') ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 28)) ($multiBoundsTop + (Scale-Logical 54))
@@ -715,6 +829,8 @@ $result = [pscustomobject]@{
     ScrollbarsExercised = $scrollbarsOk
     InputScrollbarsExercised = $inputScrollbarsOk
     CardScrollbarsHoverExercised = $cardScrollbarsHoverOk
+    ComboBoxPopupExercised = $comboPopupOk
+    ComboBoxPopupVisualDelta = [Math]::Round($comboPopupVisualDelta, 2)
     KnobExercised = $knobOk
     ExpandCollapseExercised = $expandCollapseOk
     ProcessAliveAfterUiOps = $stillAlive
@@ -740,7 +856,12 @@ $screenshotPaths = @(
     (Join-Path $OutputDir 'native_ui_02ab_multi_up_one_line.png'),
     (Join-Path $OutputDir 'native_ui_02ac_multi_down_one_line.png'),
     (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
-    (Join-Path $OutputDir 'native_ui_02_combo_open.png')
+    (Join-Path $OutputDir 'native_ui_02c_combo_animating.png'),
+    (Join-Path $OutputDir 'native_ui_02_combo_open.png'),
+    (Join-Path $OutputDir 'native_ui_02ca_combo_hover.png'),
+    (Join-Path $OutputDir 'native_ui_02cb_combo_hover_scrollbar.png'),
+    (Join-Path $OutputDir 'native_ui_02cc_combo_scrolled.png'),
+    (Join-Path $OutputDir 'native_ui_02cd_combo_selected.png')
 )
 if ($twoColumn) {
     $screenshotPaths += (Join-Path $OutputDir 'native_ui_02ba_left_card_hover_scrollbar.png')
@@ -767,6 +888,7 @@ if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
 if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
 if (-not $result.CardScrollbarsHoverExercised) { $failures += 'card-scrollbar-hover' }
+if (-not $result.ComboBoxPopupExercised) { $failures += 'combo-popup' }
 if (-not $result.KnobExercised) { $failures += 'knob' }
 if (-not $result.ExpandCollapseExercised) { $failures += 'expand-collapse' }
 if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }
