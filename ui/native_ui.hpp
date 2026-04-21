@@ -500,6 +500,11 @@ namespace fusion::ui {
 	protected:
 		virtual void OnAttachAnimations() {}
 
+		void MarkCacheDirty() {
+			cacheDirty_ = true;
+			dirty_ = true;
+		}
+
 		virtual bool IsOnlyAnimating() const {
 			return IsAnimating() && !contentChanged_;
 		}
@@ -1427,7 +1432,7 @@ namespace fusion::ui {
 				}
 				UpdateScrollBarViewport();
 				SetScrollOffset(scrollOffset_);
-				MarkDirty();
+				MarkCacheDirty();
 			}
 
 			float ScrollOffset() const {
@@ -1438,7 +1443,7 @@ namespace fusion::ui {
 				UpdateScrollBarViewport();
 				scrollOffset_ = (std::clamp)(offset, 0.0f, MaxScrollOffset());
 				scrollBar_.offset = scrollOffset_;
-				MarkDirty();
+				MarkCacheDirty();
 			}
 
 			float MaxScrollOffset() const {
@@ -1574,6 +1579,16 @@ namespace fusion::ui {
 					return E_INVALIDARG;
 				}
 				return factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius), reinterpret_cast<ID2D1RoundedRectangleGeometry**>(geometry));
+			}
+
+			std::size_t ExtraRenderFingerprint() const override {
+				std::size_t seed = static_cast<std::size_t>(std::lround(contentHeight_ * 1000.0f));
+				seed ^= (static_cast<std::size_t>(std::lround(hintedContentHeight_ * 1000.0f)) << 1);
+				seed ^= (static_cast<std::size_t>(std::lround(scrollOffset_ * 1000.0f)) << 2);
+				seed ^= (static_cast<std::size_t>(std::lround(scrollBar_.offset * 1000.0f)) << 3);
+				seed ^= (static_cast<std::size_t>(scrollBar_.hovered) << 4);
+				seed ^= (static_cast<std::size_t>(scrollBar_.dragging) << 5);
+				return seed;
 			}
 
 		private:
@@ -1756,7 +1771,7 @@ namespace fusion::ui {
 			void SetScrollOffset(float x, float y) {
 				scrollX_ = Clamp01(x);
 				scrollY_ = Clamp01(y);
-				MarkDirty();
+				MarkCacheDirty();
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
@@ -1814,14 +1829,14 @@ namespace fusion::ui {
 					const auto track = metrics.horizontalScroll.TrackBounds();
 					const auto thumb = metrics.horizontalScroll.ThumbBounds();
 					const float trackWidth = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
-					scrollX_ = Clamp01(originScrollX_ + (point.x - dragOrigin_.x) / trackWidth);
+					SetScrollOffset(Clamp01(originScrollX_ + (point.x - dragOrigin_.x) / trackWidth), scrollY_);
 					return;
 				}
 				TouchVerticalScrollReveal();
 				const auto track = metrics.verticalScroll.TrackBounds();
 				const auto thumb = metrics.verticalScroll.ThumbBounds();
 				const float trackHeight = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
-				scrollY_ = Clamp01(originScrollY_ + (point.y - dragOrigin_.y) / trackHeight);
+				SetScrollOffset(scrollX_, Clamp01(originScrollY_ + (point.y - dragOrigin_.y) / trackHeight));
 			}
 
 			void OnPointerUp(D2D1_POINT_2F point) override {
@@ -1842,7 +1857,7 @@ namespace fusion::ui {
 					return false;
 				}
 				const float previous = scrollY_;
-				scrollY_ = Clamp01(scrollY_ + (delta > 0 ? -0.05f : 0.05f));
+				SetScrollOffset(scrollX_, Clamp01(scrollY_ + (delta > 0 ? -0.05f : 0.05f)));
 				const bool changed = !NearlyEqual(previous, scrollY_, 0.0001f);
 				if (changed) {
 					TouchVerticalScrollReveal();
@@ -1851,13 +1866,22 @@ namespace fusion::ui {
 			}
 
 			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
-				if (key == VK_LEFT) scrollX_ = Clamp01(scrollX_ - 0.04f);
-				if (key == VK_RIGHT) scrollX_ = Clamp01(scrollX_ + 0.04f);
-				if (key == VK_UP) scrollY_ = Clamp01(scrollY_ - 0.04f);
-				if (key == VK_DOWN) scrollY_ = Clamp01(scrollY_ + 0.04f);
+				if (key == VK_LEFT) SetScrollOffset(Clamp01(scrollX_ - 0.04f), scrollY_);
+				if (key == VK_RIGHT) SetScrollOffset(Clamp01(scrollX_ + 0.04f), scrollY_);
+				if (key == VK_UP) SetScrollOffset(scrollX_, Clamp01(scrollY_ - 0.04f));
+				if (key == VK_DOWN) SetScrollOffset(scrollX_, Clamp01(scrollY_ + 0.04f));
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				std::size_t seed = static_cast<std::size_t>(std::lround(scrollX_ * 1000.0f));
+				seed ^= (static_cast<std::size_t>(std::lround(scrollY_ * 1000.0f)) << 1);
+				seed ^= (static_cast<std::size_t>(horizontalScrollHovered_) << 2);
+				seed ^= (static_cast<std::size_t>(verticalScrollHovered_) << 3);
+				seed ^= (static_cast<std::size_t>(dragMode_) << 4);
+				return seed;
+			}
+
 			struct Metrics {
 				D2D1_RECT_F viewport{ D2D1::RectF() };
 				float viewportWidth = 0.0f;
@@ -2319,6 +2343,7 @@ namespace fusion::ui {
 			}
 			void SetValue(float value) {
 				value_ = Clamp01(value);
+				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (onChanged_) onChanged_(value_);
 			}
@@ -2496,7 +2521,11 @@ namespace fusion::ui {
 				if (!multiline_) {
 					const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
 					const float drawMaxScrollX = (std::max)(0.0f, MeasureSingleLineContentWidth(visual.renderText) - visibleWidth + 4.0f);
-					scrollX_ = (std::clamp)(scrollX_, 0.0f, drawMaxScrollX);
+					const float clampedScrollX = (std::clamp)(scrollX_, 0.0f, drawMaxScrollX);
+					if (!NearlyEqual(clampedScrollX, scrollX_, 0.001f)) {
+						scrollX_ = clampedScrollX;
+						MarkCacheDirty();
+					}
 				}
 				if (visual.renderHorizontalScroll) {
 					visual.horizontalScroll.offset = scrollX_;
@@ -2573,7 +2602,11 @@ namespace fusion::ui {
 					dragOrigin_ = point;
 					originScrollX_ = scrollX_;
 					if (!visual.horizontalScroll.HitThumb(point)) {
-						scrollX_ = (std::clamp)(ScrollbarOffsetForPointer(visual.horizontalScroll, point.x), 0.0f, visual.maxScrollX);
+						const float nextScrollX = (std::clamp)(ScrollbarOffsetForPointer(visual.horizontalScroll, point.x), 0.0f, visual.maxScrollX);
+						if (!NearlyEqual(nextScrollX, scrollX_, 0.001f)) {
+							scrollX_ = nextScrollX;
+							MarkCacheDirty();
+						}
 						originScrollX_ = scrollX_;
 					}
 					ResetCaretBlink();
@@ -2588,7 +2621,11 @@ namespace fusion::ui {
 					dragOrigin_ = point;
 					originScrollY_ = scrollY_;
 					if (!visual.verticalScroll.HitThumb(point)) {
-						scrollY_ = (std::clamp)(ScrollbarOffsetForPointer(visual.verticalScroll, point.y), 0.0f, visual.maxScrollY);
+						const float nextScrollY = (std::clamp)(ScrollbarOffsetForPointer(visual.verticalScroll, point.y), 0.0f, visual.maxScrollY);
+						if (!NearlyEqual(nextScrollY, scrollY_, 0.001f)) {
+							scrollY_ = nextScrollY;
+							MarkCacheDirty();
+						}
 						originScrollY_ = scrollY_;
 					}
 					ResetCaretBlink();
@@ -2612,7 +2649,11 @@ namespace fusion::ui {
 						const auto track = visual.horizontalScroll.TrackBounds();
 						const auto thumb = visual.horizontalScroll.ThumbBounds();
 						const float travel = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
-						scrollX_ = (std::clamp)(originScrollX_ + ((point.x - dragOrigin_.x) / travel) * visual.maxScrollX, 0.0f, visual.maxScrollX);
+						const float nextScrollX = (std::clamp)(originScrollX_ + ((point.x - dragOrigin_.x) / travel) * visual.maxScrollX, 0.0f, visual.maxScrollX);
+						if (!NearlyEqual(nextScrollX, scrollX_, 0.001f)) {
+							scrollX_ = nextScrollX;
+							MarkCacheDirty();
+						}
 						ensureCaretVisible_ = false;
 						return;
 					}
@@ -2621,7 +2662,11 @@ namespace fusion::ui {
 						const auto track = visual.verticalScroll.TrackBounds();
 						const auto thumb = visual.verticalScroll.ThumbBounds();
 						const float travel = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
-						scrollY_ = (std::clamp)(originScrollY_ + ((point.y - dragOrigin_.y) / travel) * visual.maxScrollY, 0.0f, visual.maxScrollY);
+						const float nextScrollY = (std::clamp)(originScrollY_ + ((point.y - dragOrigin_.y) / travel) * visual.maxScrollY, 0.0f, visual.maxScrollY);
+						if (!NearlyEqual(nextScrollY, scrollY_, 0.001f)) {
+							scrollY_ = nextScrollY;
+							MarkCacheDirty();
+						}
 						ensureCaretVisible_ = false;
 						return;
 					}
@@ -2668,6 +2713,7 @@ namespace fusion::ui {
 					ensureCaretVisible_ = false;
 					const bool changed = !NearlyEqual(previous, scrollY_, 0.05f);
 					if (changed) {
+						MarkCacheDirty();
 						TouchVerticalScrollReveal();
 					}
 					return changed;
@@ -2680,6 +2726,7 @@ namespace fusion::ui {
 				ensureCaretVisible_ = false;
 				const bool changed = !NearlyEqual(previous, scrollX_, 0.05f);
 				if (changed) {
+					MarkCacheDirty();
 					TouchHorizontalScrollReveal();
 				}
 				return changed;
@@ -2876,6 +2923,9 @@ namespace fusion::ui {
 				seed ^= (static_cast<std::size_t>(std::lround(verticalScrollVisibilityAnimation_.Value() * 1000.0f)) << 7);
 				seed ^= (static_cast<std::size_t>(imeActive_) << 8);
 				seed ^= (static_cast<std::size_t>(multiline_) << 9);
+				seed ^= (static_cast<std::size_t>(horizontalScrollHovered_) << 10);
+				seed ^= (static_cast<std::size_t>(verticalScrollHovered_) << 11);
+				seed ^= (static_cast<std::size_t>(scrollDragMode_) << 12);
 				return seed;
 			}
 
@@ -3274,6 +3324,8 @@ namespace fusion::ui {
 				if (!layout) {
 					return;
 				}
+				const float previousScrollX = scrollX_;
+				const float previousScrollY = scrollY_;
 				DWRITE_TEXT_METRICS textMetrics{};
 				layout->GetMetrics(&textMetrics);
 				const float visibleWidth = (std::max)(1.0f, content.right - content.left);
@@ -3306,6 +3358,9 @@ namespace fusion::ui {
 				}
 				scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
 				scrollY_ = (std::clamp)(scrollY_, 0.0f, maxScrollY);
+				if (!NearlyEqual(previousScrollX, scrollX_, 0.001f) || !NearlyEqual(previousScrollY, scrollY_, 0.001f)) {
+					MarkCacheDirty();
+				}
 				ensureCaretVisible_ = false;
 			}
 
@@ -3583,7 +3638,7 @@ namespace fusion::ui {
 				const size_t maxOffset = items_.size() > VisibleRows() ? items_.size() - VisibleRows() : 0;
 				topIndex_ = static_cast<size_t>(Clamp01(value) * static_cast<float>(maxOffset));
 				NotifyScrollChanged();
-				MarkDirty();
+				MarkCacheDirty();
 			}
 
 			float ScrollNormalized() const {
@@ -3663,8 +3718,12 @@ namespace fusion::ui {
 					const size_t maxOffset = items_.size() > VisibleRows() ? items_.size() - VisibleRows() : 0;
 					if (maxOffset > 0) {
 						const float deltaRatio = (point.y - dragOriginY_) / trackHeight;
-						topIndex_ = (std::min)(maxOffset, static_cast<size_t>((std::max)(0.0f, std::round(originTopIndex_ + deltaRatio * maxOffset))));
-						NotifyScrollChanged();
+						const size_t nextTopIndex = (std::min)(maxOffset, static_cast<size_t>((std::max)(0.0f, std::round(originTopIndex_ + deltaRatio * maxOffset))));
+						if (nextTopIndex != topIndex_) {
+							topIndex_ = nextTopIndex;
+							NotifyScrollChanged();
+							MarkCacheDirty();
+						}
 					}
 					return;
 				}
@@ -3689,9 +3748,10 @@ namespace fusion::ui {
 				else if (delta < 0 && topIndex_ + VisibleRows() < items_.size()) {
 					++topIndex_;
 				}
-				NotifyScrollChanged();
 				const bool changed = previous != topIndex_;
 				if (changed) {
+					NotifyScrollChanged();
+					MarkCacheDirty();
 					TouchScrollReveal();
 				}
 				return changed;
@@ -3710,6 +3770,15 @@ namespace fusion::ui {
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				const std::size_t hoveredRow = hoveredRow_.has_value() ? (*hoveredRow_ + 1) : 0;
+				return selectedIndex_
+					^ (topIndex_ << 8)
+					^ (hoveredRow << 16)
+					^ (static_cast<std::size_t>(scrollBarHovered_) << 24)
+					^ (static_cast<std::size_t>(draggingScroll_) << 25);
+			}
+
 			float ScrollBarOpacity() const {
 				return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
 			}
@@ -3787,6 +3856,8 @@ namespace fusion::ui {
 			}
 
 			void SelectIndex(size_t index) {
+				const size_t previousSelectedIndex = selectedIndex_;
+				const size_t previousTopIndex = topIndex_;
 				selectedIndex_ = index;
 				if (selectedIndex_ < topIndex_) {
 					topIndex_ = selectedIndex_;
@@ -3796,6 +3867,9 @@ namespace fusion::ui {
 				}
 				if (onChanged_) {
 					onChanged_(items_[selectedIndex_]);
+				}
+				if (previousSelectedIndex != selectedIndex_ || previousTopIndex != topIndex_) {
+					MarkCacheDirty();
 				}
 			}
 
@@ -3905,7 +3979,10 @@ namespace fusion::ui {
 				}
 				const auto hit = HitChip(point);
 				if (hit) {
-					selectedIndex_ = *hit;
+					if (selectedIndex_ != *hit) {
+						selectedIndex_ = *hit;
+						MarkCacheDirty();
+					}
 				}
 			}
 
@@ -3916,7 +3993,11 @@ namespace fusion::ui {
 					const auto track = state.TrackBounds();
 					const auto thumb = state.ThumbBounds();
 					const float travel = (std::max)(1.0f, (track.right - track.left) - (thumb.right - thumb.left));
-					scrollOffset_ = (std::clamp)(originScrollOffset_ + (point.x - dragOriginX_) * (MaxScrollOffset() / travel), 0.0f, MaxScrollOffset());
+					const float nextOffset = (std::clamp)(originScrollOffset_ + (point.x - dragOriginX_) * (MaxScrollOffset() / travel), 0.0f, MaxScrollOffset());
+					if (!NearlyEqual(nextOffset, scrollOffset_, 0.05f)) {
+						scrollOffset_ = nextOffset;
+						MarkCacheDirty();
+					}
 				}
 			}
 
@@ -3944,17 +4025,29 @@ namespace fusion::ui {
 				scrollOffset_ = (std::clamp)(scrollOffset_ + (delta > 0 ? -26.0f : 26.0f), 0.0f, MaxScrollOffset());
 				const bool changed = !NearlyEqual(previous, scrollOffset_, 0.05f);
 				if (changed) {
+					MarkCacheDirty();
 					TouchScrollReveal();
 				}
 				return changed;
 			}
 
 			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
+				const float previous = scrollOffset_;
 				if (key == VK_LEFT) scrollOffset_ = (std::max)(0.0f, scrollOffset_ - 24.0f);
 				if (key == VK_RIGHT) scrollOffset_ = (std::min)(MaxScrollOffset(), scrollOffset_ + 24.0f);
+				if (!NearlyEqual(previous, scrollOffset_, 0.05f)) {
+					MarkCacheDirty();
+				}
 			}
 
 		private:
+			std::size_t ExtraRenderFingerprint() const override {
+				return selectedIndex_
+					^ (static_cast<std::size_t>(std::lround(scrollOffset_ * 1000.0f)) << 8)
+					^ (static_cast<std::size_t>(scrollBarHovered_) << 20)
+					^ (static_cast<std::size_t>(draggingScroll_) << 21);
+			}
+
 			float ScrollBarOpacity() const {
 				return AnimationSlotValue(L"scrollbarVisibility", 0.0f);
 			}
@@ -4147,7 +4240,11 @@ namespace fusion::ui {
 					const auto track = state.TrackBounds();
 					const auto thumb = state.ThumbBounds();
 					const float travel = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
-					popupScrollOffset_ = (std::clamp)(popupScrollOrigin_ + ((point.y - popupDragOriginY_) / travel) * PopupMaxScrollOffset(), 0.0f, PopupMaxScrollOffset());
+					const float nextScrollOffset = (std::clamp)(popupScrollOrigin_ + ((point.y - popupDragOriginY_) / travel) * PopupMaxScrollOffset(), 0.0f, PopupMaxScrollOffset());
+					if (!NearlyEqual(nextScrollOffset, popupScrollOffset_, 0.05f)) {
+						popupScrollOffset_ = nextScrollOffset;
+						MarkCacheDirty();
+					}
 					return;
 				}
 				popupScrollBarHovered_ = NeedsPopupScrollBar() && MakePopupScrollState(popup).HitTrack(point);
@@ -4180,7 +4277,11 @@ namespace fusion::ui {
 				popupDragOriginY_ = point.y;
 				popupScrollOrigin_ = popupScrollOffset_;
 				if (!state.HitThumb(point)) {
-					popupScrollOffset_ = (std::clamp)(ScrollbarOffsetForPointer(state, point.y), 0.0f, PopupMaxScrollOffset());
+					const float nextScrollOffset = (std::clamp)(ScrollbarOffsetForPointer(state, point.y), 0.0f, PopupMaxScrollOffset());
+					if (!NearlyEqual(nextScrollOffset, popupScrollOffset_, 0.05f)) {
+						popupScrollOffset_ = nextScrollOffset;
+						MarkCacheDirty();
+					}
 					popupScrollOrigin_ = popupScrollOffset_;
 				}
 			}
@@ -4230,6 +4331,7 @@ namespace fusion::ui {
 				popupScrollOffset_ = (std::clamp)(popupScrollOffset_ + (delta > 0 ? -PopupRowHeight() : PopupRowHeight()), 0.0f, PopupMaxScrollOffset());
 				const bool changed = !NearlyEqual(previous, popupScrollOffset_, 0.05f);
 				if (changed) {
+					MarkCacheDirty();
 					TouchPopupScrollReveal();
 				}
 				hoveredIndex_ = PopupRowFromPoint(point);
@@ -4365,9 +4467,13 @@ namespace fusion::ui {
 
 			void EnsureSelectedVisible() {
 				if (items_.empty()) {
-					popupScrollOffset_ = 0.0f;
+					if (!NearlyEqual(popupScrollOffset_, 0.0f, 0.05f)) {
+						popupScrollOffset_ = 0.0f;
+						MarkCacheDirty();
+					}
 					return;
 				}
+				const float previous = popupScrollOffset_;
 				const float rowTop = static_cast<float>(selectedIndex_) * PopupRowHeight();
 				const float rowBottom = rowTop + PopupRowHeight();
 				if (rowTop < popupScrollOffset_) {
@@ -4377,6 +4483,9 @@ namespace fusion::ui {
 					popupScrollOffset_ = rowBottom - (PopupExpandedHeight() - 12.0f);
 				}
 				popupScrollOffset_ = (std::clamp)(popupScrollOffset_, 0.0f, PopupMaxScrollOffset());
+				if (!NearlyEqual(previous, popupScrollOffset_, 0.05f)) {
+					MarkCacheDirty();
+				}
 			}
 
 			void SelectIndex(size_t index) {
@@ -4567,6 +4676,7 @@ namespace fusion::ui {
 
 			void SetValue(float value, bool notify = true) {
 				value_ = Clamp01(value);
+				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (notify && onChanged_) onChanged_(value_);
 			}
@@ -4663,6 +4773,7 @@ namespace fusion::ui {
 		private:
 			void SetValue(float value) {
 				value_ = Clamp01(value);
+				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (onChanged_) onChanged_(value_);
 			}
