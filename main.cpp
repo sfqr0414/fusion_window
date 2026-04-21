@@ -1175,7 +1175,7 @@ private:
 			d2dContext->EndDraw();
 
 			if (uiHost) {
-				uiHost->SetViewport(contentRect, g_dpiScale);
+				uiHost->UpdateViewport(contentRect, g_dpiScale);
 			}
 
 			if (uiHost && uiSurface && (receivedResizeCmd || uiHost->NeedsContinuousRedraw())) {
@@ -1272,7 +1272,7 @@ private:
 			else if constexpr (std::is_same_v<T, CmdUpdateAnim>) {
 				currentMenuAlpha = arg.menuAlpha; currentHoverAlphas = arg.hoverAlpha;
 				if (uiHost) {
-					uiHost->SetAnimationProgress(arg.progress);
+					uiHost->UpdateAnimationProgress(arg.progress);
 				}
 			}
 			else if constexpr (std::is_same_v<T, CmdKeyDown>) {
