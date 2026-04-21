@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -240,6 +241,72 @@ namespace fusion::ui {
 		ComPtr<IUIAnimationTransitionLibrary> library_;
 	};
 
+	template <typename T, typename Equal = std::equal_to<>>
+	class Property {
+	public:
+		Property() = default;
+		Property(T initialValue, std::function<void()> onDirty)
+			: value_(std::move(initialValue)), onDirty_(std::move(onDirty)) {
+		}
+
+		const T& Get() const {
+			return value_;
+		}
+
+		operator const T&() const {
+			return value_;
+		}
+
+		const T* operator->() const {
+			return &value_;
+		}
+
+		Property& operator=(const T& value) {
+			Set(value);
+			return *this;
+		}
+
+		Property& operator=(T&& value) {
+			Set(std::move(value));
+			return *this;
+		}
+
+		template <typename Mutator>
+		decltype(auto) Mutate(Mutator&& mutator) {
+			T previous = value_;
+			if constexpr (std::is_void_v<std::invoke_result_t<Mutator, T&>>) {
+				mutator(value_);
+				if (!equal_(previous, value_) && onDirty_) {
+					onDirty_();
+				}
+				return;
+			}
+			else {
+				auto result = mutator(value_);
+				if (!equal_(previous, value_) && onDirty_) {
+					onDirty_();
+				}
+				return result;
+			}
+		}
+
+	private:
+		template <typename Value>
+		void Set(Value&& value) {
+			if (equal_(value_, value)) {
+				return;
+			}
+			value_ = std::forward<Value>(value);
+			if (onDirty_) {
+				onDirty_();
+			}
+		}
+
+		T value_{};
+		std::function<void()> onDirty_{};
+		Equal equal_{};
+	};
+
 	class UIComponent {
 	public:
 		virtual ~UIComponent() = default;
@@ -263,7 +330,7 @@ namespace fusion::ui {
 				return;
 			}
 			bounds_ = bounds;
-			MarkContentChanged();
+			MarkGeometryChanged();
 		}
 
 		const D2D1_RECT_F& Bounds() const {
@@ -275,7 +342,7 @@ namespace fusion::ui {
 				return;
 			}
 			zIndex_ = zIndex;
-			MarkContentChanged();
+			MarkGeometryChanged();
 		}
 
 		int ZIndex() const {
@@ -349,6 +416,10 @@ namespace fusion::ui {
 			return true;
 		}
 
+		bool NeedsRedraw() const {
+			return dirty_ || cacheDirty_;
+		}
+
 		void MarkDirty() {
 			dirty_ = true;
 		}
@@ -361,13 +432,12 @@ namespace fusion::ui {
 
 		void ClearRenderCache() {
 			renderCache_.Reset();
-			renderCacheFingerprint_ = 0;
 			cacheDirty_ = true;
 			dirty_ = true;
 		}
 
 		bool NeedsCacheRefresh() const {
-			return cacheDirty_ || !renderCache_ || (renderCacheFingerprint_ != ComputeRenderFingerprint() && !IsOnlyAnimating());
+			return cacheDirty_ || !renderCache_;
 		}
 
 		bool RenderCached(ID2D1DeviceContext* context) {
@@ -376,11 +446,12 @@ namespace fusion::ui {
 			}
 			bool rebuilt = false;
 			if (!SupportsCachedRendering()) {
+				const bool rebuilt = cacheDirty_ || !renderCache_;
 				Render(context);
 				dirty_ = false;
 				cacheDirty_ = false;
-				renderCacheFingerprint_ = ComputeRenderFingerprint();
-				return true;
+				ResetContentChanged();
+				return rebuilt;
 			}
 			const bool animationOnly = IsOnlyAnimating();
 			if (NeedsCacheRefresh()) {
@@ -404,25 +475,25 @@ namespace fusion::ui {
 		virtual void OnHover(bool hovered) {
 			hovered_ = hovered;
 			Animate(hoverAnimation_, hovered_ ? 1.0f : 0.0f);
-			MarkDirty();
+			MarkCacheDirty();
 		}
 
 		virtual void OnFocus(bool focused) {
 			focused_ = focused;
 			Animate(focusAnimation_, focused_ ? 1.0f : 0.0f);
-			MarkDirty();
+			MarkCacheDirty();
 		}
 
 		virtual void OnPointerDown(D2D1_POINT_2F) {
 			pressed_ = true;
 			Animate(pressAnimation_, 1.0f);
-			MarkDirty();
+			MarkCacheDirty();
 		}
 
 		virtual void OnPointerUp(D2D1_POINT_2F) {
 			pressed_ = false;
 			Animate(pressAnimation_, 0.0f);
-			MarkDirty();
+			MarkCacheDirty();
 		}
 
 		virtual void OnPointerMove(D2D1_POINT_2F) {}
@@ -466,7 +537,7 @@ namespace fusion::ui {
 			if (animator_) {
 				animator_->Attach(it->second, it->second.Value());
 			}
-			MarkDirty();
+			MarkCacheDirty();
 		}
 
 		void AnimateSlot(std::wstring_view key, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
@@ -500,9 +571,24 @@ namespace fusion::ui {
 	protected:
 		virtual void OnAttachAnimations() {}
 
+		void MarkGeometryChanged() {
+			cacheDirty_ = true;
+			dirty_ = true;
+		}
+
 		void MarkCacheDirty() {
 			cacheDirty_ = true;
 			dirty_ = true;
+		}
+
+		template <typename T>
+		bool AssignAndDirty(T& slot, const T& value) const {
+			if (slot == value) {
+				return false;
+			}
+			slot = value;
+			const_cast<UIComponent*>(this)->MarkCacheDirty();
+			return true;
 		}
 
 		virtual bool IsOnlyAnimating() const {
@@ -574,6 +660,10 @@ namespace fusion::ui {
 			return factory->CreateRectangleGeometry(bounds_, reinterpret_cast<ID2D1RectangleGeometry**>(geometry));
 		}
 
+		virtual std::size_t ExtraRenderFingerprint() const {
+			return 0;
+		}
+
 		D2D1_RECT_F bounds_{ D2D1::RectF() };
 		int zIndex_ = 0;
 		bool visible_ = true;
@@ -590,7 +680,6 @@ namespace fusion::ui {
 		bool cacheDirty_ = true;
 		bool contentChanged_ = true;
 		ComPtr<ID2D1CommandList> renderCache_;
-		std::size_t renderCacheFingerprint_ = 0;
 
 	private:
 		static bool ShouldAnimate(const UIAnimation& animation, float target) {
@@ -599,39 +688,6 @@ namespace fusion::ui {
 				return std::fabs(finalValue - static_cast<double>(target)) > 1e-4;
 			}
 			return std::fabs(static_cast<double>(animation.Value()) - static_cast<double>(target)) > 1e-4;
-		}
-
-		std::size_t ComputeRenderFingerprint() const {
-			auto hashCombine = [](std::size_t seed, std::size_t value) {
-				return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
-				};
-			auto quantize = [](float value) {
-				return static_cast<std::size_t>(std::lround(value * 1000.0f));
-				};
-			std::size_t seed = 0;
-			seed = hashCombine(seed, quantize(bounds_.left));
-			seed = hashCombine(seed, quantize(bounds_.top));
-			seed = hashCombine(seed, quantize(bounds_.right));
-			seed = hashCombine(seed, quantize(bounds_.bottom));
-			seed = hashCombine(seed, static_cast<std::size_t>(visible_));
-			seed = hashCombine(seed, static_cast<std::size_t>(enabled_));
-			seed = hashCombine(seed, static_cast<std::size_t>(hovered_));
-			seed = hashCombine(seed, static_cast<std::size_t>(pressed_));
-			seed = hashCombine(seed, static_cast<std::size_t>(focused_));
-			seed = hashCombine(seed, quantize(HoverProgress()));
-			seed = hashCombine(seed, quantize(PressProgress()));
-			seed = hashCombine(seed, quantize(FocusProgress()));
-			for (const auto& [key, animation] : customAnimations_) {
-				seed = hashCombine(seed, std::hash<std::wstring>{}(key));
-				seed = hashCombine(seed, quantize(animation.Value()));
-			}
-			seed = hashCombine(seed, ExtraRenderFingerprint());
-			return seed;
-		}
-
-	protected:
-		virtual std::size_t ExtraRenderFingerprint() const {
-			return 0;
 		}
 
 	private:
@@ -647,7 +703,6 @@ namespace fusion::ui {
 			Render(context);
 			context->SetTarget(previousTarget.Get());
 			renderCache_->Close();
-			renderCacheFingerprint_ = ComputeRenderFingerprint();
 			cacheDirty_ = false;
 			ResetContentChanged();
 			dirty_ = false;
@@ -1492,7 +1547,7 @@ namespace fusion::ui {
 			}
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
-				scrollBar_.hovered = scrollBar_.Visible() && HitScrollBar(point);
+				AssignAndDirty(scrollBar_.hovered, scrollBar_.Visible() && HitScrollBar(point));
 				if (scrollBar_.hovered) {
 					TouchScrollReveal();
 				}
@@ -1502,7 +1557,7 @@ namespace fusion::ui {
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !scrollBar_.dragging) {
-					scrollBar_.hovered = false;
+					AssignAndDirty(scrollBar_.hovered, false);
 					UpdateScrollBarAnimation(false);
 				}
 			}
@@ -1513,7 +1568,7 @@ namespace fusion::ui {
 				}
 				UIComponent::OnPointerDown(point);
 				scrollBar_.dragging = true;
-				scrollBar_.hovered = true;
+				AssignAndDirty(scrollBar_.hovered, true);
 				TouchScrollReveal();
 				UpdateScrollBarAnimation(true);
 				dragStartY_ = point.y;
@@ -1526,7 +1581,7 @@ namespace fusion::ui {
 			}
 
 			void OnPointerMove(D2D1_POINT_2F point) override {
-				scrollBar_.hovered = scrollBar_.HitTrack(point);
+				AssignAndDirty(scrollBar_.hovered, scrollBar_.HitTrack(point));
 				if (scrollBar_.hovered) {
 					TouchScrollReveal();
 				}
@@ -1551,7 +1606,7 @@ namespace fusion::ui {
 					OnPointerMove(point);
 				}
 				scrollBar_.dragging = false;
-				scrollBar_.hovered = scrollBar_.HitTrack(point);
+				AssignAndDirty(scrollBar_.hovered, scrollBar_.HitTrack(point));
 				if (scrollBar_.hovered) {
 					TouchScrollReveal();
 				}
@@ -1847,8 +1902,8 @@ namespace fusion::ui {
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && dragMode_ == DragMode::None) {
-					horizontalScrollHovered_ = false;
-					verticalScrollHovered_ = false;
+					AssignAndDirty(horizontalScrollHovered_, false);
+					AssignAndDirty(verticalScrollHovered_, false);
 				}
 			}
 
@@ -1945,8 +2000,8 @@ namespace fusion::ui {
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				const auto metrics = ComputeMetrics();
-				horizontalScrollHovered_ = metrics.showHorizontal && metrics.horizontalScroll.HitTrack(point);
-				verticalScrollHovered_ = metrics.showVertical && metrics.verticalScroll.HitTrack(point);
+				AssignAndDirty(horizontalScrollHovered_, metrics.showHorizontal && metrics.horizontalScroll.HitTrack(point));
+				AssignAndDirty(verticalScrollHovered_, metrics.showVertical && metrics.verticalScroll.HitTrack(point));
 				if (horizontalScrollHovered_) {
 					TouchHorizontalScrollReveal();
 				}
@@ -2277,7 +2332,7 @@ namespace fusion::ui {
 				const D2D1_COLOR_F& outlineColor,
 				float initialValue,
 				std::function<void(float)> onChanged)
-				: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), outlineColor_(outlineColor), value_(Clamp01(initialValue)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {
+				: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), outlineColor_(outlineColor), value_(Clamp01(initialValue), [this]() { MarkCacheDirty(); }), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {
 			}
 
 			bool IsDynamic() const override { return true; }
@@ -2343,7 +2398,6 @@ namespace fusion::ui {
 			}
 			void SetValue(float value) {
 				value_ = Clamp01(value);
-				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (onChanged_) onChanged_(value_);
 			}
@@ -2361,7 +2415,7 @@ namespace fusion::ui {
 			D2D1_COLOR_F outlineColor_{};
 			TextStyle textStyle_{};
 			bool textStyleOverride_ = false;
-			float value_ = 0.0f;
+			Property<float> value_{};
 			UIAnimation valueAnimation_{};
 			mutable bool trackBoundsValid_ = false;
 			mutable D2D1_RECT_F cachedTrackBoundsHost_{ D2D1::RectF() };
@@ -2382,6 +2436,7 @@ namespace fusion::ui {
 			}
 
 			bool IsDynamic() const override { return true; }
+			bool SupportsCachedRendering() const override { return false; }
 
 			std::size_t ExtraRenderFingerprint() const override {
 				const float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
@@ -2453,8 +2508,8 @@ namespace fusion::ui {
 			}
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				auto visual = ComputeVisualState();
-				horizontalScrollHovered_ = visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point);
-				verticalScrollHovered_ = visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point);
+				AssignAndDirty(horizontalScrollHovered_, visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point));
+				AssignAndDirty(verticalScrollHovered_, visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point));
 				if (horizontalScrollHovered_) {
 					TouchHorizontalScrollReveal();
 				}
@@ -2596,7 +2651,7 @@ namespace fusion::ui {
 				if (visual.showHorizontalScroll && visual.horizontalScroll.HitTrack(point)) {
 					UIComponent::OnPointerDown(point);
 					scrollDragMode_ = ScrollDragMode::Horizontal;
-					horizontalScrollHovered_ = true;
+					AssignAndDirty(horizontalScrollHovered_, true);
 					TouchHorizontalScrollReveal();
 					ensureCaretVisible_ = false;
 					dragOrigin_ = point;
@@ -2615,7 +2670,7 @@ namespace fusion::ui {
 				if (visual.showVerticalScroll && visual.verticalScroll.HitTrack(point)) {
 					UIComponent::OnPointerDown(point);
 					scrollDragMode_ = ScrollDragMode::Vertical;
-					verticalScrollHovered_ = true;
+					AssignAndDirty(verticalScrollHovered_, true);
 					TouchVerticalScrollReveal();
 					ensureCaretVisible_ = false;
 					dragOrigin_ = point;
@@ -2681,8 +2736,8 @@ namespace fusion::ui {
 
 			void OnPointerUp(D2D1_POINT_2F point) override {
 				if (scrollDragMode_ != ScrollDragMode::None) {
-					horizontalScrollHovered_ = false;
-					verticalScrollHovered_ = false;
+					AssignAndDirty(horizontalScrollHovered_, false);
+					AssignAndDirty(verticalScrollHovered_, false);
 					scrollDragMode_ = ScrollDragMode::None;
 					UIComponent::OnPointerUp(point);
 					return;
@@ -2694,8 +2749,8 @@ namespace fusion::ui {
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && scrollDragMode_ == ScrollDragMode::None) {
-					horizontalScrollHovered_ = false;
-					verticalScrollHovered_ = false;
+					AssignAndDirty(horizontalScrollHovered_, false);
+					AssignAndDirty(verticalScrollHovered_, false);
 				}
 			}
 
@@ -3689,7 +3744,7 @@ namespace fusion::ui {
 				UIComponent::OnPointerDown(point);
 				if (NeedsScrollBar() && MakeScrollState().HitThumb(point)) {
 					draggingScroll_ = true;
-					scrollBarHovered_ = true;
+					AssignAndDirty(scrollBarHovered_, true);
 					TouchScrollReveal();
 					dragOriginY_ = point.y;
 					originTopIndex_ = topIndex_;
@@ -3700,7 +3755,7 @@ namespace fusion::ui {
 
 			void OnPointerUp(D2D1_POINT_2F point) override {
 				draggingScroll_ = false;
-				scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
 				}
@@ -3727,13 +3782,13 @@ namespace fusion::ui {
 					}
 					return;
 				}
-				hoveredRow_ = RowFromPoint(point);
+				AssignAndDirty(hoveredRow_, RowFromPoint(point));
 			}
 
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !draggingScroll_) {
-					scrollBarHovered_ = false;
+					AssignAndDirty(scrollBarHovered_, false);
 				}
 			}
 
@@ -3826,7 +3881,7 @@ namespace fusion::ui {
 			CursorKind Cursor() const override { return CursorKind::Arrow; }
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
-				scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
 					return CursorKind::Arrow;
@@ -3971,7 +4026,7 @@ namespace fusion::ui {
 				UIComponent::OnPointerDown(point);
 				if (NeedsScrollBar() && MakeScrollState().HitThumb(point)) {
 					draggingScroll_ = true;
-					scrollBarHovered_ = true;
+					AssignAndDirty(scrollBarHovered_, true);
 					TouchScrollReveal();
 					dragOriginX_ = point.x;
 					originScrollOffset_ = scrollOffset_;
@@ -4003,7 +4058,7 @@ namespace fusion::ui {
 
 			void OnPointerUp(D2D1_POINT_2F point) override {
 				draggingScroll_ = false;
-				scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
 				}
@@ -4013,7 +4068,7 @@ namespace fusion::ui {
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !draggingScroll_) {
-					scrollBarHovered_ = false;
+					AssignAndDirty(scrollBarHovered_, false);
 				}
 			}
 
@@ -4103,7 +4158,7 @@ namespace fusion::ui {
 			}
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
-				scrollBarHovered_ = NeedsScrollBar() && MakeScrollState().HitTrack(point);
+				AssignAndDirty(scrollBarHovered_, NeedsScrollBar() && MakeScrollState().HitTrack(point));
 				if (scrollBarHovered_) {
 					TouchScrollReveal();
 					return CursorKind::Arrow;
@@ -4247,11 +4302,11 @@ namespace fusion::ui {
 					}
 					return;
 				}
-				popupScrollBarHovered_ = NeedsPopupScrollBar() && MakePopupScrollState(popup).HitTrack(point);
+				AssignAndDirty(popupScrollBarHovered_, NeedsPopupScrollBar() && MakePopupScrollState(popup).HitTrack(point));
 				if (popupScrollBarHovered_) {
 					TouchPopupScrollReveal();
 				}
-				hoveredIndex_ = PopupRowFromPoint(point);
+				AssignAndDirty(hoveredIndex_, PopupRowFromPoint(point));
 			}
 
 			void OnAttachAnimations() override {
@@ -4272,7 +4327,7 @@ namespace fusion::ui {
 					return;
 				}
 				popupDraggingScroll_ = true;
-				popupScrollBarHovered_ = true;
+				AssignAndDirty(popupScrollBarHovered_, true);
 				TouchPopupScrollReveal();
 				popupDragOriginY_ = point.y;
 				popupScrollOrigin_ = popupScrollOffset_;
@@ -4316,9 +4371,9 @@ namespace fusion::ui {
 			void OnHover(bool hovered) override {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !popupDraggingScroll_) {
-					popupScrollBarHovered_ = false;
+					AssignAndDirty(popupScrollBarHovered_, false);
 					if (!HasOpenPopup()) {
-						hoveredIndex_.reset();
+						AssignAndDirty(hoveredIndex_, std::optional<size_t>{});
 					}
 				}
 			}
@@ -4334,7 +4389,7 @@ namespace fusion::ui {
 					MarkCacheDirty();
 					TouchPopupScrollReveal();
 				}
-				hoveredIndex_ = PopupRowFromPoint(point);
+				AssignAndDirty(hoveredIndex_, PopupRowFromPoint(point));
 				return changed;
 			}
 
@@ -4494,7 +4549,7 @@ namespace fusion::ui {
 				}
 				selectedIndex_ = (std::min)(index, items_.size() - 1);
 				EnsureSelectedVisible();
-				hoveredIndex_ = selectedIndex_;
+				AssignAndDirty(hoveredIndex_, std::optional<size_t>(selectedIndex_));
 				if (onChanged_) {
 					onChanged_(items_[selectedIndex_]);
 				}
@@ -4512,9 +4567,10 @@ namespace fusion::ui {
 			void OpenPopup() {
 				open_ = true;
 				popupDraggingScroll_ = false;
-				popupScrollBarHovered_ = false;
-				hoveredIndex_ = items_.empty() ? std::nullopt : std::optional<size_t>(selectedIndex_);
+				AssignAndDirty(popupScrollBarHovered_, false);
+				AssignAndDirty(hoveredIndex_, items_.empty() ? std::optional<size_t>{} : std::optional<size_t>(selectedIndex_));
 				EnsureSelectedVisible();
+				MarkCacheDirty();
 				Animate(openAnimation_, 1.0f, 0.14);
 				if (NeedsPopupScrollBar()) {
 					TouchPopupScrollReveal();
@@ -4524,8 +4580,9 @@ namespace fusion::ui {
 			void ClosePopup() {
 				open_ = false;
 				popupDraggingScroll_ = false;
-				popupScrollBarHovered_ = false;
-				hoveredIndex_.reset();
+				AssignAndDirty(popupScrollBarHovered_, false);
+				AssignAndDirty(hoveredIndex_, std::optional<size_t>{});
+				MarkCacheDirty();
 				UpdatePopupScrollBarAnimation(false);
 				Animate(openAnimation_, 0.0f, 0.14);
 			}
@@ -4563,7 +4620,7 @@ namespace fusion::ui {
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				if (HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point)) {
-					popupScrollBarHovered_ = true;
+					AssignAndDirty(popupScrollBarHovered_, true);
 					TouchPopupScrollReveal();
 					return CursorKind::Arrow;
 				}
@@ -4608,7 +4665,7 @@ namespace fusion::ui {
 				float value,
 				float pageSize,
 				std::function<void(float)> onChanged)
-				: orientation_(orientation), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), value_(Clamp01(value)), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {
+				: orientation_(orientation), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), value_(Clamp01(value), [this]() { MarkCacheDirty(); }), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {
 			}
 
 			bool IsDynamic() const override { return true; }
@@ -4676,7 +4733,6 @@ namespace fusion::ui {
 
 			void SetValue(float value, bool notify = true) {
 				value_ = Clamp01(value);
-				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (notify && onChanged_) onChanged_(value_);
 			}
@@ -4689,7 +4745,7 @@ namespace fusion::ui {
 			D2D1_COLOR_F surfaceColor_{};
 			D2D1_COLOR_F accentColor_{};
 			D2D1_COLOR_F outlineColor_{};
-			float value_ = 0.0f;
+			Property<float> value_{};
 			float pageSize_ = 0.2f;
 			UIAnimation valueAnimation_{};
 			std::function<void(float)> onChanged_;
@@ -4706,7 +4762,7 @@ namespace fusion::ui {
 				const D2D1_COLOR_F& textColor,
 				float value,
 				std::function<void(float)> onChanged)
-				: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), value_(Clamp01(value)), onChanged_(std::move(onChanged)), labelStyle_(CaptureTextStyle(format_.Get(), textColor_)), valueStyle_(CaptureTextStyle(format_.Get(), textColor_)) {
+				: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), value_(Clamp01(value), [this]() { MarkCacheDirty(); }), onChanged_(std::move(onChanged)), labelStyle_(CaptureTextStyle(format_.Get(), textColor_)), valueStyle_(CaptureTextStyle(format_.Get(), textColor_)) {
 			}
 
 			bool IsDynamic() const override { return true; }
@@ -4773,7 +4829,6 @@ namespace fusion::ui {
 		private:
 			void SetValue(float value) {
 				value_ = Clamp01(value);
-				MarkCacheDirty();
 				Animate(valueAnimation_, value_, 0.12);
 				if (onChanged_) onChanged_(value_);
 			}
@@ -4794,7 +4849,7 @@ namespace fusion::ui {
 			bool labelStyleOverride_ = false;
 			bool valueStyleOverride_ = false;
 			bool fullCircle_ = false;
-			float value_ = 0.0f;
+			Property<float> value_{};
 			UIAnimation valueAnimation_{};
 			D2D1_POINT_2F anchor_{ 0.0f, 0.0f };
 			float anchorValue_ = 0.0f;
@@ -5304,8 +5359,12 @@ namespace fusion::ui {
 			return currentCursor_;
 		}
 
+		bool NeedsRedraw() const {
+			return HasLayoutDirty() || staticLayerDirty_ || dynamicDirty_ || HasDirtyComponents();
+		}
+
 		bool NeedsContinuousRedraw() const {
-			return focused_ != nullptr || captured_ != nullptr || dynamicDirty_ || animationSystem_.HasRunningAnimations() || HasPendingFrameTicks();
+			return NeedsRedraw() || animationSystem_.HasRunningAnimations() || HasPendingFrameTicks();
 		}
 
 		D2D1_RECT_F VisibleUiBounds() const {
@@ -5316,7 +5375,7 @@ namespace fusion::ui {
 			if (viewport.left != viewport_.left || viewport.top != viewport_.top || viewport.right != viewport_.right || viewport.bottom != viewport_.bottom || dpiScale != dpiScale_) {
 				viewport_ = viewport;
 				dpiScale_ = dpiScale;
-				layoutDirty_ = true;
+				MarkLayoutDirty(kLayoutDirtySize);
 				hitIndexDirty_ = true;
 				staticLayerDirty_ = true;
 				dynamicDirty_ = true;
@@ -5555,7 +5614,7 @@ namespace fusion::ui {
 				return;
 			}
 			animationSystem_.Update();
-			if (layoutDirty_) {
+			if (HasLayoutDirty()) {
 				Arrange();
 			}
 			lastFrameCacheRebuildCount_ = 0;
@@ -5706,6 +5765,16 @@ namespace fusion::ui {
 			}
 			lastLayoutBounds_[component] = bounds;
 			component->SetBounds(bounds);
+			QueueHitIndexUpdate(component);
+			return true;
+		}
+
+		bool SetComponentVisible(UIComponent* component, bool visible) {
+			if (!component || component->Visible() == visible) {
+				return false;
+			}
+			component->SetVisible(visible);
+			QueueHitIndexUpdate(component);
 			return true;
 		}
 
@@ -5724,12 +5793,38 @@ namespace fusion::ui {
 			return card ? card->ScrollOffset() : -1.0f;
 		}
 
-		void UpsertHitIndex(std::span<UIComponent*> items) {
+		void QueueHitIndexUpdate(UIComponent* component) {
+			if (component) {
+				pendingHitIndexUpdates_.push_back(component);
+			}
+		}
+
+		void QueueHitIndexUpdates(std::span<UIComponent*> items) {
 			for (auto* item : items) {
 				if (item) {
-					hitIndex_.Upsert(item);
+					pendingHitIndexUpdates_.push_back(item);
 				}
 			}
+		}
+
+		void FlushHitIndexUpdates() {
+			for (size_t index = 0; index < pendingHitIndexUpdates_.size(); ++index) {
+				auto* component = pendingHitIndexUpdates_[index];
+				if (!component) {
+					continue;
+				}
+				bool seenEarlier = false;
+				for (size_t previous = 0; previous < index; ++previous) {
+					if (pendingHitIndexUpdates_[previous] == component) {
+						seenEarlier = true;
+						break;
+					}
+				}
+				if (!seenEarlier) {
+					hitIndex_.Upsert(component);
+				}
+			}
+			pendingHitIndexUpdates_.clear();
 			hitIndexDirty_ = false;
 		}
 
@@ -5738,8 +5833,9 @@ namespace fusion::ui {
 				return;
 			}
 			ArrangeCard(card, LayoutItemsForCard(card));
-			hitIndex_.Upsert(card);
-			UpsertHitIndex(LayoutItemsForCard(card));
+			QueueHitIndexUpdate(card);
+			QueueHitIndexUpdates(LayoutItemsForCard(card));
+			FlushHitIndexUpdates();
 		}
 
 		void RefreshCardLayoutIfScrollChanged(UIComponent* component, float previousScrollOffset) {
@@ -5758,13 +5854,70 @@ namespace fusion::ui {
 			}
 			float contentHeight = layout_->Arrange(items, card->LayoutBounds(false), dpiScale_, card->ScrollOffset());
 			card->SetContentMetrics(contentHeight);
-			const bool needsScrollBar = card->ShouldReserveVerticalScrollBar();
-			const float arrangedOffset = card->ScrollOffset();
-			contentHeight = layout_->Arrange(items, card->LayoutBounds(needsScrollBar), dpiScale_, arrangedOffset);
-			card->SetContentMetrics(contentHeight);
-			if (card->ScrollOffset() != arrangedOffset) {
-				layout_->Arrange(items, card->LayoutBounds(card->ShouldReserveVerticalScrollBar()), dpiScale_, card->ScrollOffset());
+			if (card->ShouldReserveVerticalScrollBar()) {
+				const float arrangedOffset = card->ScrollOffset();
+				contentHeight = layout_->Arrange(items, card->LayoutBounds(true), dpiScale_, arrangedOffset);
+				card->SetContentMetrics(contentHeight);
+				if (card->ScrollOffset() != arrangedOffset) {
+					layout_->Arrange(items, card->LayoutBounds(card->ShouldReserveVerticalScrollBar()), dpiScale_, card->ScrollOffset());
+				}
 			}
+			lastCardContentHeight_[card] = contentHeight;
+			QueueHitIndexUpdates(items);
+		}
+
+		bool CanApplyFastSizeOnlyLayout(CardSurface* card, const D2D1_RECT_F& bounds, bool visible) const {
+			if (!card || card->Visible() != visible) {
+				return false;
+			}
+			if (!visible) {
+				return true;
+			}
+			auto it = lastCardContentHeight_.find(card);
+			if (it == lastCardContentHeight_.end()) {
+				return false;
+			}
+			const auto& current = card->Bounds();
+			return detail::NearlyEqual(current.left, bounds.left, 0.01f)
+				&& detail::NearlyEqual(current.top, bounds.top, 0.01f)
+				&& detail::NearlyEqual(current.right, bounds.right, 0.01f);
+		}
+
+		bool TryApplyFastSizeLayout(bool twoColumn, const D2D1_RECT_F& leftCardBounds, const D2D1_RECT_F& rightCardBounds) {
+			if (!HasLayoutDirty(kLayoutDirtySize)) {
+				return false;
+			}
+			const bool leftVisible = twoColumn;
+			const bool rightVisible = true;
+			if (!CanApplyFastSizeOnlyLayout(leftCard_, leftCardBounds, leftVisible)
+				|| !CanApplyFastSizeOnlyLayout(rightCard_, rightCardBounds, rightVisible)) {
+				return false;
+			}
+
+			if (leftVisible) {
+				ApplyArrangedBounds(leftCard_, leftCardBounds);
+				leftCard_->SetContentMetrics(lastCardContentHeight_[leftCard_]);
+			}
+			ApplyArrangedBounds(rightCard_, rightCardBounds);
+			rightCard_->SetContentMetrics(lastCardContentHeight_[rightCard_]);
+
+			visibleUiBounds_ = D2D1::RectF();
+			if (leftVisible) {
+				visibleUiBounds_ = leftCard_->Bounds();
+			}
+			if (rightVisible) {
+				visibleUiBounds_ = visibleUiBounds_.right > visibleUiBounds_.left ? detail::UnionRect(visibleUiBounds_, rightCard_->Bounds()) : rightCard_->Bounds();
+			}
+
+			if (hitIndexDirty_) {
+				RebuildHitIndex();
+			}
+			else {
+				FlushHitIndexUpdates();
+			}
+			layoutDirtyFlags_ = kLayoutDirtyNone;
+			staticLayerDirty_ = true;
+			return true;
 		}
 
 		void InitializeResources() {
@@ -6011,34 +6164,37 @@ namespace fusion::ui {
 			const bool twoColumn = availableWidth >= 420.0f;
 			const float top = viewport_.top + 24.0f;
 			const float bottom = viewport_.bottom - 24.0f;
+			const float cardWidth = (std::min)(detail::kCardWidth, twoColumn ? (availableWidth - gap) * 0.5f : (std::max)(300.0f, availableWidth));
+			const D2D1_RECT_F leftCardBounds = D2D1::RectF(viewport_.left + 24.0f, top, viewport_.left + 24.0f + cardWidth, bottom);
+			const D2D1_RECT_F rightCardBounds = twoColumn
+				? D2D1::RectF(leftCardBounds.right + gap, top, leftCardBounds.right + gap + cardWidth, bottom)
+				: D2D1::RectF(viewport_.right - cardWidth - 24.0f, top, viewport_.right - 24.0f, bottom);
+			if (TryApplyFastSizeLayout(twoColumn, leftCardBounds, rightCardBounds)) {
+				return;
+			}
 			if (twoColumn) {
-				leftCard_->SetVisible(true);
-				rightCard_->SetVisible(true);
+				SetComponentVisible(leftCard_, true);
+				SetComponentVisible(rightCard_, true);
 				for (auto* item : leftLayoutOrder_) {
-					item->SetVisible(true);
+					SetComponentVisible(item, true);
 				}
 				for (auto* item : rightLayoutOrder_) {
-					item->SetVisible(true);
+					SetComponentVisible(item, true);
 				}
-				const float cardWidth = (std::min)(detail::kCardWidth, (availableWidth - gap) * 0.5f);
-				const D2D1_RECT_F leftCardBounds = D2D1::RectF(viewport_.left + 24.0f, top, viewport_.left + 24.0f + cardWidth, bottom);
-				const D2D1_RECT_F rightCardBounds = D2D1::RectF(leftCardBounds.right + gap, top, leftCardBounds.right + gap + cardWidth, bottom);
 				ApplyArrangedBounds(leftCard_, leftCardBounds);
 				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(leftCard_, leftLayoutOrder_);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
 			}
 			else {
-				leftCard_->SetVisible(false);
-				rightCard_->SetVisible(true);
+				SetComponentVisible(leftCard_, false);
+				SetComponentVisible(rightCard_, true);
 				for (auto* item : leftLayoutOrder_) {
-					item->SetVisible(false);
+					SetComponentVisible(item, false);
 				}
 				for (auto* item : rightLayoutOrder_) {
-					item->SetVisible(true);
+					SetComponentVisible(item, true);
 				}
-				const float cardWidth = (std::min)(detail::kCardWidth, (std::max)(300.0f, availableWidth));
-				const D2D1_RECT_F rightCardBounds = D2D1::RectF(viewport_.right - cardWidth - 24.0f, top, viewport_.right - 24.0f, bottom);
 				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
 			}
@@ -6051,8 +6207,13 @@ namespace fusion::ui {
 				visibleUiBounds_ = visibleUiBounds_.right > visibleUiBounds_.left ? detail::UnionRect(visibleUiBounds_, rightCard_->Bounds()) : rightCard_->Bounds();
 			}
 
-			RebuildHitIndex();
-			layoutDirty_ = false;
+			if (hitIndexDirty_) {
+				RebuildHitIndex();
+			}
+			else {
+				FlushHitIndexUpdates();
+			}
+			layoutDirtyFlags_ = kLayoutDirtyNone;
 			staticLayerDirty_ = true;
 		}
 
@@ -6088,6 +6249,7 @@ namespace fusion::ui {
 				}
 			}
 			hitIndex_.Rebuild(hittable, viewport_);
+			pendingHitIndexUpdates_.clear();
 			hitIndexDirty_ = false;
 		}
 
@@ -6144,6 +6306,23 @@ namespace fusion::ui {
 			return false;
 		}
 
+		bool HasDirtyComponents() const {
+			for (const auto& component : components_) {
+				if (component && component->Visible() && component->NeedsRedraw()) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void MarkLayoutDirty(unsigned flags) {
+			layoutDirtyFlags_ |= flags;
+		}
+
+		bool HasLayoutDirty(unsigned flags = kLayoutDirtyAll) const {
+			return (layoutDirtyFlags_ & flags) != 0;
+		}
+
 		void SetStatus(std::wstring text) {
 			if (statusText_) {
 				statusText_->SetBody(std::move(text));
@@ -6154,7 +6333,11 @@ namespace fusion::ui {
 		HostCallbacks callbacks_;
 		D2D1_RECT_F viewport_{ D2D1::RectF() };
 		float dpiScale_ = 1.0f;
-		bool layoutDirty_ = true;
+		static constexpr unsigned kLayoutDirtyNone = 0u;
+		static constexpr unsigned kLayoutDirtyStructure = 1u << 0;
+		static constexpr unsigned kLayoutDirtySize = 1u << 1;
+		static constexpr unsigned kLayoutDirtyAll = kLayoutDirtyStructure | kLayoutDirtySize;
+		unsigned layoutDirtyFlags_ = kLayoutDirtyAll;
 		bool staticLayerDirty_ = true;
 		bool dynamicDirty_ = true;
 
@@ -6171,6 +6354,8 @@ namespace fusion::ui {
 		std::vector<UIComponent*> focusOrder_;
 		std::unique_ptr<LayoutBase> layout_;
 		std::unordered_map<UIComponent*, D2D1_RECT_F> lastLayoutBounds_;
+		std::unordered_map<CardSurface*, float> lastCardContentHeight_;
+		std::vector<UIComponent*> pendingHitIndexUpdates_;
 		QuadtreeHitIndex hitIndex_{};
 		bool hitIndexDirty_ = true;
 		UIComponent* hovered_ = nullptr;
