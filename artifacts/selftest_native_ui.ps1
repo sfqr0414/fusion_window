@@ -403,6 +403,9 @@ $singleScrollEndX = $controlLeft + $controlWidth - (Scale-Logical 42)
 $singleScrollY = $singleBoundsTop + $singleBoundsHeight - (Scale-Logical 6)
 $multiInputX = $controlLeft + (Scale-Logical 24)
 $multiInputY = $multiBoundsTop + (Scale-Logical 44)
+$multiLinePitch = (Scale-Logical 16)
+$multiLineStartX = $controlLeft + (Scale-Logical 16)
+$multiLine1Y = $multiBoundsTop + (Scale-Logical 44)
 $multiScrollX = $controlLeft + $controlWidth - (Scale-Logical 6)
 $multiScrollStartY = $multiBoundsTop + (Scale-Logical 38)
 $multiScrollEndY = $multiBoundsTop + $multiBoundsHeight - (Scale-Logical 18)
@@ -551,25 +554,78 @@ Click-Client ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logic
 Start-Sleep -Milliseconds 100
 Save-Capture 'native_ui_02_multi_caret.png'
 Start-Sleep -Milliseconds 80
+$multiLines = @(
+    'Header-only migration complete.',
+    'Next: richer text selection and IME support.',
+    'Clipboard and selection test passed.',
+    'Fourth line keeps the editor overflowing.',
+    'Fifth line verifies the vertical scrollbar drag path.',
+    'Sixth line keeps the thumb short enough to verify the cue.',
+    'Seventh line confirms the hover hotspot on the vertical track.',
+    'Eighth line keeps the overflow state obvious in screenshots.'
+)
 Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
-Send-Text 'Header-only migration complete.'
-Send-Enter
-Send-Text 'Next: richer text selection and IME support.'
-Send-Enter
-Send-Text 'Clipboard and selection test passed.'
-Send-Enter
-Send-Text 'Fourth line keeps the editor overflowing.'
-Send-Enter
-Send-Text 'Fifth line verifies the vertical scrollbar drag path.'
-Send-Enter
-Send-Text 'Sixth line keeps the thumb short enough to verify the cue.'
-Send-Enter
-Send-Text 'Seventh line confirms the hover hotspot on the vertical track.'
-Send-Enter
-Send-Text 'Eighth line keeps the overflow state obvious in screenshots.'
+for ($i = 0; $i -lt $multiLines.Count; $i++) {
+    Send-Text $multiLines[$i]
+    if ($i -lt ($multiLines.Count - 1)) {
+        Send-Enter
+    }
+}
 Start-Sleep -Milliseconds 180
 Save-Capture 'native_ui_02a_multi_overflow.png'
+
+$null = Write-ClipboardText '__pending__'
+Send-KeyPress ([Native]::VK_HOME)
+Start-Sleep -Milliseconds 100
+Send-KeyPress 40
+Start-Sleep -Milliseconds 80
+Send-KeyPress 38
+Start-Sleep -Milliseconds 80
+Send-Text '^'
+Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_02ab_multi_up_one_line.png'
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+Start-Sleep -Milliseconds 120
+$multiArrowUpText = Read-ClipboardText
+$multiArrowUpOk = $multiArrowUpText -match '^\^Header-only migration complete\.'
+
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+for ($i = 0; $i -lt $multiLines.Count; $i++) {
+    Send-Text $multiLines[$i]
+    if ($i -lt ($multiLines.Count - 1)) {
+        Send-Enter
+    }
+}
+Start-Sleep -Milliseconds 180
+
+$null = Write-ClipboardText '__pending__'
+Send-KeyPress ([Native]::VK_HOME)
+Start-Sleep -Milliseconds 100
+Send-KeyPress 40
+Start-Sleep -Milliseconds 80
+Send-Text 'v'
+Start-Sleep -Milliseconds 120
+Save-Capture 'native_ui_02ac_multi_down_one_line.png'
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+Start-Sleep -Milliseconds 120
+$multiArrowDownText = Read-ClipboardText
+$multiArrowDownOk = $multiArrowDownText -match "Header-only migration complete\.\r?\nvNext: richer text selection and IME support\."
+
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+for ($i = 0; $i -lt $multiLines.Count; $i++) {
+    Send-Text $multiLines[$i]
+    if ($i -lt ($multiLines.Count - 1)) {
+        Send-Enter
+    }
+}
+Start-Sleep -Milliseconds 180
 Move-MouseScreen (Get-ScreenPoint $multiScrollX $multiScrollStartY).X (Get-ScreenPoint $multiScrollX $multiScrollStartY).Y 140
 Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_02aa_multi_hover_scrollbar.png'
@@ -643,6 +699,8 @@ $result = [pscustomobject]@{
     SingleInputReplaceAndCopy = $replaceOk
     SingleInputCaretVisible = $singleCaretVisible
     MultiInputCaretVisible = $multiCaretVisible
+    MultiInputArrowUpOneLine = $multiArrowUpOk
+    MultiInputArrowDownOneLine = $multiArrowDownOk
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
     InputScrollbarsExercised = $inputScrollbarsOk
@@ -667,6 +725,8 @@ $screenshotPaths = @(
     (Join-Path $OutputDir 'native_ui_02_multi_caret.png'),
     (Join-Path $OutputDir 'native_ui_02aa_multi_hover_scrollbar.png'),
     (Join-Path $OutputDir 'native_ui_02a_multi_overflow.png'),
+    (Join-Path $OutputDir 'native_ui_02ab_multi_up_one_line.png'),
+    (Join-Path $OutputDir 'native_ui_02ac_multi_down_one_line.png'),
     (Join-Path $OutputDir 'native_ui_02b_multi_collapsed.png'),
     (Join-Path $OutputDir 'native_ui_02_combo_open.png')
 )
@@ -688,6 +748,8 @@ if (-not $result.SingleInputCopyInitial) { $failures += 'single-input-copy-initi
 if (-not $result.SingleInputReplaceAndCopy) { $failures += 'single-input-replace-copy' }
 if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
 if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
+if (-not $result.MultiInputArrowUpOneLine) { $failures += 'multi-input-arrow-up' }
+if (-not $result.MultiInputArrowDownOneLine) { $failures += 'multi-input-arrow-down' }
 if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
 if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
@@ -698,6 +760,10 @@ if (-not $result.ProcessAliveAfterUiOps) { $failures += 'process-alive' }
 if (-not $result.ProcessClosedAfterSelftest) { $failures += 'process-exit' }
 
 $result | ConvertTo-Json -Compress
+
+$resultJson = $result | ConvertTo-Json -Compress
+[System.IO.File]::WriteAllText((Join-Path $OutputDir 'selftest_native_ui.last.txt'), $resultJson, [System.Text.Encoding]::Unicode)
+Write-Output $resultJson
 
 if ($failures.Count -gt 0) {
     throw ('native UI selftest failed: ' + ($failures -join ', '))

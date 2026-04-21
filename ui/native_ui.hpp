@@ -692,6 +692,48 @@ inline float ScrollbarOffsetForPointer(const ScrollbarState& state, float axisPo
 	return ((thumbStart - trackStart) / usableExtent) * maxOffset;
 }
 
+enum class SharedBrushSlot {
+	Primary = 0,
+	Secondary = 1,
+	Tertiary = 2,
+};
+
+inline std::array<ComPtr<ID2D1SolidColorBrush>, 3>& SharedBrushPool() {
+	static std::array<ComPtr<ID2D1SolidColorBrush>, 3> brushes;
+	return brushes;
+}
+
+inline void EnsureSharedBrushPool(ID2D1DeviceContext* context) {
+	if (!context) {
+		return;
+	}
+	auto& brushes = SharedBrushPool();
+	for (auto& brush : brushes) {
+		if (!brush) {
+			context->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 1.0f), &brush);
+		}
+	}
+}
+
+inline D2D1_COLOR_F ApplyBrushOpacity(D2D1_COLOR_F color, float opacity) {
+	color.a *= (std::clamp)(opacity, 0.0f, 1.0f);
+	return color;
+}
+
+inline ID2D1SolidColorBrush* PrepareSharedBrush(ID2D1DeviceContext* context, SharedBrushSlot slot, const D2D1_COLOR_F& color, float opacity = 1.0f) {
+	if (!context) {
+		return nullptr;
+	}
+	EnsureSharedBrushPool(context);
+	auto& brush = SharedBrushPool()[static_cast<size_t>(slot)];
+	if (!brush) {
+		return nullptr;
+	}
+	brush->SetOpacity(1.0f);
+	brush->SetColor(ApplyBrushOpacity(color, opacity));
+	return brush.Get();
+}
+
 inline void DrawRadixScrollbar(ID2D1DeviceContext* context, const ScrollbarState& state, ID2D1SolidColorBrush* thumbSource, ID2D1SolidColorBrush* trackSource, float visibility = 1.0f) {
 	if (!context || !state.Visible() || !thumbSource || !trackSource || visibility <= 0.001f) {
 		return;
@@ -716,10 +758,13 @@ inline void DrawRadixScrollbar(ID2D1DeviceContext* context, const ScrollbarState
 		const float radius = (std::max)(1.0f, (std::min)(width, height) * 0.5f);
 		return D2D1::RoundedRect(rect, radius, radius);
 	};
-	auto trackBrush = CreateBrush(context, D2D1::ColorF(trackColor.r, trackColor.g, trackColor.b, trackOpacity));
-	auto thumbBrush = CreateBrush(context, D2D1::ColorF(thumbColor.r, thumbColor.g, thumbColor.b, thumbOpacity));
-	context->FillRoundedRectangle(roundedRect(track), trackBrush.Get());
-	context->FillRoundedRectangle(roundedRect(thumb), thumbBrush.Get());
+	auto* trackBrush = PrepareSharedBrush(context, SharedBrushSlot::Primary, trackColor, trackOpacity);
+	auto* thumbBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, thumbColor, thumbOpacity);
+	if (!trackBrush || !thumbBrush) {
+		return;
+	}
+	context->FillRoundedRectangle(roundedRect(track), trackBrush);
+	context->FillRoundedRectangle(roundedRect(thumb), thumbBrush);
 }
 
 inline D2D1_RECT_F InflateRect(const D2D1_RECT_F& rect, float inset) {
@@ -779,6 +824,12 @@ inline TextStyle CaptureTextStyle(IDWriteTextFormat* format, ID2D1SolidColorBrus
 	if (brush) {
 		style.color = brush->GetColor();
 	}
+	return style;
+}
+
+inline TextStyle CaptureTextStyle(IDWriteTextFormat* format, const D2D1_COLOR_F& color) {
+	TextStyle style = CaptureTextStyle(format, static_cast<ID2D1SolidColorBrush*>(nullptr));
+	style.color = color;
 	return style;
 }
 
@@ -922,10 +973,9 @@ inline void DrawStyledText(
 		if (layout) {
 			layout->SetWordWrapping(wrapping);
 			ID2D1SolidColorBrush* drawBrush = fallbackBrush;
-			ComPtr<ID2D1SolidColorBrush> brush;
-			if (style && !ColorEqual(style->color, fallbackBrush->GetColor())) {
-				brush = CreateBrush(context, style->color);
-				drawBrush = brush ? brush.Get() : fallbackBrush;
+			if (style) {
+				auto* overrideBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, style->color);
+				drawBrush = overrideBrush ? overrideBrush : fallbackBrush;
 			}
 			context->DrawTextLayout(D2D1::Point2F(rect.left, rect.top), layout.Get(), drawBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 			return;
@@ -1004,8 +1054,8 @@ inline bool SetClipboardText(std::wstring_view text) {
 
 class TextBlock final : public UIComponent {
 public:
-	TextBlock(std::wstring text, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> format, ComPtr<ID2D1SolidColorBrush> brush, bool dynamicText = false)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), brush_(std::move(brush)), dynamicText_(dynamicText), textStyle_(CaptureTextStyle(format_.Get(), brush_.Get())) {}
+	TextBlock(std::wstring text, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> format, const D2D1_COLOR_F& color, bool dynamicText = false)
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), color_(color), dynamicText_(dynamicText), textStyle_(CaptureTextStyle(format_.Get(), color_)) {}
 
 	void SetText(std::wstring text) {
 		text_ = std::move(text);
@@ -1025,14 +1075,14 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		if (!visible_ || !format_ || !brush_) {
+		if (!visible_ || !format_) {
 			return;
 		}
 		const TextStyle* baseStyle = styleOverride_ ? &textStyle_ : nullptr;
 		auto* layout = layoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), text_, bounds_.right - bounds_.left, bounds_.bottom - bounds_.top, baseStyle, styledRanges_);
-		auto styledBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
+		auto* brush = PrepareSharedBrush(context, SharedBrushSlot::Primary, styleOverride_ ? textStyle_.color : color_);
 		if (layout) {
-			context->DrawTextLayout(D2D1::Point2F(bounds_.left, bounds_.top), layout, styledBrush ? styledBrush.Get() : brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			context->DrawTextLayout(D2D1::Point2F(bounds_.left, bounds_.top), layout, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 		}
 	}
 
@@ -1040,7 +1090,7 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> brush_;
+	D2D1_COLOR_F color_{};
 	bool dynamicText_ = false;
 	TextStyle textStyle_{};
 	bool styleOverride_ = false;
@@ -1050,8 +1100,8 @@ private:
 
 class ExpandableNote final : public UIComponent {
 public:
-	ExpandableNote(std::wstring title, std::wstring body, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> titleFormat, ComPtr<IDWriteTextFormat> bodyFormat, ComPtr<ID2D1SolidColorBrush> surface, ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> textBrush, ComPtr<ID2D1SolidColorBrush> mutedBrush)
-		: title_(std::move(title)), body_(std::move(body)), dwriteFactory_(std::move(dwriteFactory)), titleFormat_(std::move(titleFormat)), bodyFormat_(std::move(bodyFormat)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)), titleStyle_(CaptureTextStyle(titleFormat_.Get(), textBrush_.Get())), bodyStyle_(CaptureTextStyle(bodyFormat_.Get(), mutedBrush_.Get())) {}
+	ExpandableNote(std::wstring title, std::wstring body, ComPtr<IDWriteFactory> dwriteFactory, ComPtr<IDWriteTextFormat> titleFormat, ComPtr<IDWriteTextFormat> bodyFormat, const D2D1_COLOR_F& surfaceColor, const D2D1_COLOR_F& outlineColor, const D2D1_COLOR_F& textColor, const D2D1_COLOR_F& mutedColor)
+		: title_(std::move(title)), body_(std::move(body)), dwriteFactory_(std::move(dwriteFactory)), titleFormat_(std::move(titleFormat)), bodyFormat_(std::move(bodyFormat)), surfaceColor_(surfaceColor), outlineColor_(outlineColor), textColor_(textColor), mutedColor_(mutedColor), titleStyle_(CaptureTextStyle(titleFormat_.Get(), textColor_)), bodyStyle_(CaptureTextStyle(bodyFormat_.Get(), mutedColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1080,17 +1130,19 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
-		outline_->SetOpacity(0.4f + 0.5f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		auto* surfaceBrush = PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_);
+		auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.4f + 0.5f * FocusProgress());
+		auto* textBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, titleStyleOverride_ ? titleStyle_.color : textColor_);
+		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surfaceBrush);
+		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outlineBrush, 1.0f + FocusProgress());
 		const D2D1_RECT_F headerRect = D2D1::RectF(bounds_.left + 14.0f, bounds_.top + 8.0f, bounds_.right - 28.0f, bounds_.top + 30.0f);
-		DrawStyledText(context, dwriteFactory_.Get(), titleFormat_.Get(), textBrush_.Get(), title_, headerRect, titleStyleOverride_ ? &titleStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), titleFormat_.Get(), textBrush, title_, headerRect, titleStyleOverride_ ? &titleStyle_ : nullptr);
 		const float expand = AnimationSlotValue(L"expand", 0.0f);
 		const float arrowCenterX = bounds_.right - 16.0f;
 		const float arrowCenterY = bounds_.top + 18.0f;
 		const float arrowLift = 3.0f * expand;
-		context->DrawLine(D2D1::Point2F(arrowCenterX - 5.0f, arrowCenterY - 2.0f + arrowLift), D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), outline_.Get(), 1.5f);
-		context->DrawLine(D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), D2D1::Point2F(arrowCenterX + 5.0f, arrowCenterY - 2.0f + arrowLift), outline_.Get(), 1.5f);
+		context->DrawLine(D2D1::Point2F(arrowCenterX - 5.0f, arrowCenterY - 2.0f + arrowLift), D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), outlineBrush, 1.5f);
+		context->DrawLine(D2D1::Point2F(arrowCenterX, arrowCenterY + 3.0f - arrowLift), D2D1::Point2F(arrowCenterX + 5.0f, arrowCenterY - 2.0f + arrowLift), outlineBrush, 1.5f);
 		if (expand <= 0.01f) {
 			return;
 		}
@@ -1101,11 +1153,12 @@ public:
 		if (bodyStyleOverride_) {
 			TextStyle animatedBodyStyle = bodyStyle_;
 			animatedBodyStyle.color.a *= expand;
-			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush_.Get(), body_, bodyRect, &animatedBodyStyle, {}, DWRITE_WORD_WRAPPING_WRAP);
+			auto* mutedBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, bodyStyle_.color, expand);
+			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush, body_, bodyRect, &animatedBodyStyle, {}, DWRITE_WORD_WRAPPING_WRAP);
 		}
 		else {
-			mutedBrush_->SetOpacity(expand);
-			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush_.Get(), body_, bodyRect, nullptr, {}, DWRITE_WORD_WRAPPING_WRAP);
+			auto* mutedBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, mutedColor_, expand);
+			DrawStyledText(context, dwriteFactory_.Get(), bodyFormat_.Get(), mutedBrush, body_, bodyRect, nullptr, {}, DWRITE_WORD_WRAPPING_WRAP);
 		}
 		context->PopAxisAlignedClip();
 	}
@@ -1134,10 +1187,10 @@ private:
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> titleFormat_;
 	ComPtr<IDWriteTextFormat> bodyFormat_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> mutedBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
+	D2D1_COLOR_F mutedColor_{};
 	TextStyle titleStyle_{};
 	TextStyle bodyStyle_{};
 	bool titleStyleOverride_ = false;
@@ -1147,8 +1200,8 @@ private:
 
 class ScrollArea final : public UIComponent {
 public:
-	ScrollArea(ComPtr<ID2D1SolidColorBrush> fill, ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> scrollThumb, ComPtr<ID2D1SolidColorBrush> scrollTrack)
-		: fill_(std::move(fill)), outline_(std::move(outline)), scrollThumb_(std::move(scrollThumb)), scrollTrack_(std::move(scrollTrack)) {}
+	ScrollArea(const D2D1_COLOR_F& fillColor, const D2D1_COLOR_F& outlineColor, const D2D1_COLOR_F& scrollThumbColor, const D2D1_COLOR_F& scrollTrackColor)
+		: fillColor_(fillColor), outlineColor_(outlineColor), scrollThumbColor_(scrollThumbColor), scrollTrackColor_(scrollTrackColor) {}
 
 	bool IsDynamic() const override {
 		return scrollBar_.dragging || ScrollBarOpacity() > 0.01f || ScrollRevealActive();
@@ -1222,14 +1275,14 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		if (!visible_ || !fill_ || !outline_) {
+		if (!visible_) {
 			return;
 		}
 		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 		auto rounded = D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius);
-		context->FillRoundedRectangle(rounded, fill_.Get());
-		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f);
-		DrawRadixScrollbar(context, scrollBar_, scrollThumb_ ? scrollThumb_.Get() : outline_.Get(), scrollTrack_ ? scrollTrack_.Get() : outline_.Get(), ScrollBarOpacity());
+		context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, fillColor_));
+		context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.0f);
+		DrawRadixScrollbar(context, scrollBar_, PrepareSharedBrush(context, SharedBrushSlot::Primary, scrollThumbColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, scrollTrackColor_), ScrollBarOpacity());
 	}
 
 	CursorKind CursorAt(D2D1_POINT_2F point) const override {
@@ -1364,10 +1417,10 @@ private:
 		return D2D1::RectF(bounds_.left + 2.0f, bounds_.top + 2.0f, bounds_.right - 2.0f, bounds_.bottom - 2.0f);
 	}
 
-	ComPtr<ID2D1SolidColorBrush> fill_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> scrollThumb_;
-	ComPtr<ID2D1SolidColorBrush> scrollTrack_;
+	D2D1_COLOR_F fillColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F scrollThumbColor_{};
+	D2D1_COLOR_F scrollTrackColor_{};
 	float contentHeight_ = 0.0f;
 	float scrollOffset_ = 0.0f;
 	float dragStartY_ = 0.0f;
@@ -1384,13 +1437,13 @@ public:
 	Button(std::wstring text,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> primaryFill,
-		ComPtr<ID2D1SolidColorBrush> secondaryFill,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& primaryFillColor,
+		const D2D1_COLOR_F& secondaryFillColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		std::function<void()> onClick,
 		bool primary)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), primaryFill_(std::move(primaryFill)), secondaryFill_(std::move(secondaryFill)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), primary_(primary), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), primaryFillColor_(primaryFillColor), secondaryFillColor_(secondaryFillColor), outlineColor_(outlineColor), textColor_(textColor), onClick_(std::move(onClick)), primary_(primary), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1417,22 +1470,21 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		auto rounded = D2D1::RoundedRect(bounds_, 12.0f, 12.0f);
-		auto* fill = primary_ ? primaryFill_.Get() : secondaryFill_.Get();
+		auto* fill = PrepareSharedBrush(context, SharedBrushSlot::Primary, primary_ ? primaryFillColor_ : secondaryFillColor_, 1.0f - 0.18f * HoverProgress() - 0.12f * PressProgress());
 		const float hover = HoverProgress();
 		const float press = PressProgress();
-		fill->SetOpacity(1.0f - 0.18f * hover - 0.12f * press);
 		context->FillRoundedRectangle(rounded, fill);
-		outline_->SetOpacity(0.55f + 0.45f * FocusProgress());
-		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f + FocusProgress());
-		textBrush_->SetOpacity(enabled_ ? 1.0f : 0.5f);
+		auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress());
+		context->DrawRoundedRectangle(rounded, outlineBrush, 1.0f + FocusProgress());
 		const D2D1_RECT_F textRect = D2D1::RectF(bounds_.left + textPaddingX_, bounds_.top + textPaddingY_, bounds_.right - textPaddingX_, bounds_.bottom - textPaddingY_);
 		TextStyle effectiveStyle = textStyle_;
 		effectiveStyle.horizontalAlign = horizontalAlign_;
 		effectiveStyle.verticalAlign = verticalAlign_;
+		effectiveStyle.color = textStyleOverride_ ? textStyle_.color : ApplyBrushOpacity(textColor_, enabled_ ? 1.0f : 0.5f);
 		auto* layout = layoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top, &effectiveStyle);
-		auto styledBrush = CreateBrush(context, effectiveStyle.color);
+		auto* styledBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, effectiveStyle.color);
 		if (layout) {
-			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout, styledBrush ? styledBrush.Get() : textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout, styledBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 		}
 	}
 
@@ -1458,10 +1510,10 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> primaryFill_;
-	ComPtr<ID2D1SolidColorBrush> secondaryFill_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F primaryFillColor_{};
+	D2D1_COLOR_F secondaryFillColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	std::function<void()> onClick_;
 	bool primary_ = false;
 	HorizontalAlign horizontalAlign_ = HorizontalAlign::Center;
@@ -1475,8 +1527,8 @@ private:
 
 class ImageFrame final : public UIComponent {
 public:
-	ImageFrame(ComPtr<ID2D1SolidColorBrush> outline, ComPtr<ID2D1SolidColorBrush> accent, ComPtr<ID2D1SolidColorBrush> muted)
-		: outline_(std::move(outline)), accent_(std::move(accent)), muted_(std::move(muted)) {}
+	ImageFrame(const D2D1_COLOR_F& outlineColor, const D2D1_COLOR_F& accentColor, const D2D1_COLOR_F& mutedColor)
+		: outlineColor_(outlineColor), accentColor_(accentColor), mutedColor_(mutedColor) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1499,7 +1551,7 @@ public:
 		const auto metrics = ComputeMetrics();
 		UpdateScrollBarAnimations(metrics);
 		auto rounded = D2D1::RoundedRect(bounds_, 14.0f, 14.0f);
-		context->FillRoundedRectangle(rounded, muted_.Get());
+		context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, mutedColor_));
 		const float offsetX = (metrics.contentWidth - metrics.viewportWidth) * scrollX_;
 		const float offsetY = (metrics.contentHeight - metrics.viewportHeight) * scrollY_;
 		context->PushAxisAlignedClip(metrics.viewport, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
@@ -1510,17 +1562,15 @@ public:
 				const float left = metrics.viewport.left + tileW * col - offsetX;
 				const float top = metrics.viewport.top + tileH * row - offsetY;
 				const float alpha = ((row + col) % 2 == 0) ? 0.18f : 0.08f;
-				accent_->SetOpacity(alpha);
-				context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(left, top, left + tileW - 8.0f, top + tileH - 8.0f), 8.0f, 8.0f), accent_.Get());
+				context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(left, top, left + tileW - 8.0f, top + tileH - 8.0f), 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, alpha));
 			}
 		}
-		accent_->SetOpacity(0.78f);
-		context->DrawLine(D2D1::Point2F(metrics.viewport.left + 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.72f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), accent_.Get(), 2.0f);
-		context->DrawLine(D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth - 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.64f - offsetY), accent_.Get(), 2.0f);
+		auto* accentBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.78f);
+		context->DrawLine(D2D1::Point2F(metrics.viewport.left + 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.72f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), accentBrush, 2.0f);
+		context->DrawLine(D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth - 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.64f - offsetY), accentBrush, 2.0f);
 		context->PopAxisAlignedClip();
 		DrawScrollBars(context, metrics);
-		outline_->SetOpacity(0.55f);
-		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f);
+		context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Tertiary, outlineColor_, 0.55f), 1.0f);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override {
@@ -1675,10 +1725,10 @@ private:
 
 	void DrawScrollBars(ID2D1DeviceContext* context, const Metrics& metrics) {
 		if (metrics.renderHorizontal) {
-			DrawRadixScrollbar(context, metrics.horizontalScroll, accent_.Get(), outline_.Get(), metrics.horizontalOpacity);
+			DrawRadixScrollbar(context, metrics.horizontalScroll, PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), metrics.horizontalOpacity);
 		}
 		if (metrics.renderVertical) {
-			DrawRadixScrollbar(context, metrics.verticalScroll, accent_.Get(), outline_.Get(), metrics.verticalOpacity);
+			DrawRadixScrollbar(context, metrics.verticalScroll, PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), metrics.verticalOpacity);
 		}
 	}
 
@@ -1719,9 +1769,9 @@ private:
 		}
 	}
 
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> muted_;
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F mutedColor_{};
 	float scrollX_ = 0.0f;
 	float scrollY_ = 0.0f;
 	mutable bool horizontalScrollHovered_ = false;
@@ -1742,12 +1792,12 @@ public:
 	ImageButton(std::wstring text,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		std::function<void()> onClick)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onClick_(std::move(onClick)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), onClick_(std::move(onClick)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1765,25 +1815,23 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		auto rounded = D2D1::RoundedRect(bounds_, 12.0f, 12.0f);
-		surface_->SetOpacity(1.0f - 0.12f * HoverProgress() - 0.08f * PressProgress());
-		context->FillRoundedRectangle(rounded, surface_.Get());
-		outline_->SetOpacity(0.55f + 0.45f * FocusProgress());
-		context->DrawRoundedRectangle(rounded, outline_.Get(), 1.0f + FocusProgress());
+		context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_, 1.0f - 0.12f * HoverProgress() - 0.08f * PressProgress()));
+		context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 		const D2D1_RECT_F imageRect = D2D1::RectF(bounds_.left + 12.0f, bounds_.top + 8.0f, bounds_.left + 48.0f, bounds_.bottom - 8.0f);
-		accent_->SetOpacity(0.25f);
-		context->FillRoundedRectangle(D2D1::RoundedRect(imageRect, 8.0f, 8.0f), accent_.Get());
-		accent_->SetOpacity(0.85f);
-		context->DrawLine(D2D1::Point2F(imageRect.left + 8.0f, imageRect.bottom - 10.0f), D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), accent_.Get(), 2.0f);
-		context->DrawLine(D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), D2D1::Point2F(imageRect.right - 8.0f, imageRect.bottom - 12.0f), accent_.Get(), 2.0f);
-		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(imageRect.right - 12.0f, imageRect.top + 12.0f), 4.0f, 4.0f), accent_.Get());
+		context->FillRoundedRectangle(D2D1::RoundedRect(imageRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.25f));
+		auto* accentBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.85f);
+		context->DrawLine(D2D1::Point2F(imageRect.left + 8.0f, imageRect.bottom - 10.0f), D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), accentBrush, 2.0f);
+		context->DrawLine(D2D1::Point2F(imageRect.left + 18.0f, imageRect.top + 16.0f), D2D1::Point2F(imageRect.right - 8.0f, imageRect.bottom - 12.0f), accentBrush, 2.0f);
+		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(imageRect.right - 12.0f, imageRect.top + 12.0f), 4.0f, 4.0f), accentBrush);
 		const D2D1_RECT_F textRect = D2D1::RectF(imageRect.right + 12.0f, bounds_.top + 6.0f, bounds_.right - 12.0f, bounds_.bottom - 6.0f);
 		TextStyle effectiveStyle = textStyle_;
 		effectiveStyle.horizontalAlign = horizontalAlign_;
 		effectiveStyle.verticalAlign = verticalAlign_;
+		effectiveStyle.color = textStyleOverride_ ? textStyle_.color : textColor_;
 		auto* layout = layoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), text_, textRect.right - textRect.left, textRect.bottom - textRect.top, &effectiveStyle);
-		auto styledBrush = CreateBrush(context, effectiveStyle.color);
+		auto* styledBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, effectiveStyle.color);
 		if (layout) {
-			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout, styledBrush ? styledBrush.Get() : textBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			context->DrawTextLayout(D2D1::Point2F(textRect.left, textRect.top), layout, styledBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 		}
 	}
 
@@ -1805,10 +1853,10 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	std::function<void()> onClick_;
 	HorizontalAlign horizontalAlign_ = HorizontalAlign::Left;
 	VerticalAlign verticalAlign_ = VerticalAlign::Center;
@@ -1822,13 +1870,13 @@ public:
 	Checkbox(std::wstring text,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
-		ComPtr<ID2D1SolidColorBrush> outline,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& textColor,
+		const D2D1_COLOR_F& outlineColor,
 		bool initialValue,
 		std::function<void(bool)> onChanged)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), checked_(initialValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), outlineColor_(outlineColor), checked_(initialValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1846,15 +1894,13 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		D2D1_RECT_F box = D2D1::RectF(bounds_.left, bounds_.top + 7.0f, bounds_.left + 22.0f, bounds_.top + 29.0f);
-		context->FillRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), surface_.Get());
-		outline_->SetOpacity(0.55f + 0.45f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->FillRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 		const float check = checkAnimation_.Value();
 		if (check > 0.01f) {
-			accent_->SetOpacity(0.45f + 0.35f * check + 0.2f * HoverProgress());
-			context->FillRoundedRectangle(D2D1::RoundedRect(InflateRect(box, 3.0f), 4.0f, 4.0f), accent_.Get());
+			context->FillRoundedRectangle(D2D1::RoundedRect(InflateRect(box, 3.0f), 4.0f, 4.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.45f + 0.35f * check + 0.2f * HoverProgress()));
 		}
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), text_, D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -1882,10 +1928,10 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F textColor_{};
+	D2D1_COLOR_F outlineColor_{};
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
 	bool checked_ = false;
@@ -1898,14 +1944,14 @@ public:
 	RadioButton(std::wstring text,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
-		ComPtr<ID2D1SolidColorBrush> outline,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& textColor,
+		const D2D1_COLOR_F& outlineColor,
 		std::shared_ptr<int> selectedValue,
 		int ownValue,
 		std::function<void(int)> onChanged)
-		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), selectedValue_(std::move(selectedValue)), ownValue_(ownValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: text_(std::move(text)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), outlineColor_(outlineColor), selectedValue_(std::move(selectedValue)), ownValue_(ownValue), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -1925,15 +1971,13 @@ public:
 		Animate(selectionAnimation_, *selectedValue_ == ownValue_ ? 1.0f : 0.0f, 0.10);
 		const float cx = bounds_.left + 11.0f;
 		const float cy = bounds_.top + 18.0f;
-		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), surface_.Get());
-		outline_->SetOpacity(0.55f + 0.45f * FocusProgress());
-		context->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 		const float selected = selectionAnimation_.Value();
 		if (selected > 0.01f) {
-			accent_->SetOpacity(0.5f + 0.3f * selected + 0.2f * HoverProgress());
-			context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f + selected * 2.0f, 3.0f + selected * 2.0f), accent_.Get());
+			context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f + selected * 2.0f, 3.0f + selected * 2.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.5f + 0.3f * selected + 0.2f * HoverProgress()));
 		}
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text_, D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), text_, D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), textStyleOverride_ ? &textStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -1961,10 +2005,10 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F textColor_{};
+	D2D1_COLOR_F outlineColor_{};
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
 	std::shared_ptr<int> selectedValue_;
@@ -1978,13 +2022,13 @@ public:
 	Slider(std::wstring label,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
-		ComPtr<ID2D1SolidColorBrush> outline,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& textColor,
+		const D2D1_COLOR_F& outlineColor,
 		float initialValue,
 		std::function<void(float)> onChanged)
-		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), outline_(std::move(outline)), value_(Clamp01(initialValue)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), outlineColor_(outlineColor), value_(Clamp01(initialValue)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -2001,17 +2045,16 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 		D2D1_RECT_F track = TrackBounds();
-		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), surface_.Get());
+		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 		const float value = valueAnimation_.Value();
 		D2D1_RECT_F fill = D2D1::RectF(track.left, track.top, track.left + (track.right - track.left) * value, track.bottom);
-		context->FillRoundedRectangle(D2D1::RoundedRect(fill, 8.0f, 8.0f), accent_.Get());
-		outline_->SetOpacity(0.45f + 0.55f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->FillRoundedRectangle(D2D1::RoundedRect(fill, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, outlineColor_, 0.45f + 0.55f * FocusProgress()), 1.0f + FocusProgress());
 		float handleX = fill.right;
 		const float handleRadius = 7.0f + HoverProgress() + PressProgress();
-		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handleX, (track.top + track.bottom) * 0.5f), handleRadius, handleRadius), outline_.Get());
+		context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(handleX, (track.top + track.bottom) * 0.5f), handleRadius, handleRadius), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, outlineColor_));
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); UpdateValue(point); }
@@ -2047,10 +2090,10 @@ private:
 	std::wstring label_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F textColor_{};
+	D2D1_COLOR_F outlineColor_{};
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
 	float value_ = 0.0f;
@@ -2063,11 +2106,11 @@ public:
 	ProgressBar(std::wstring label,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& textColor,
 		UIAnimation* animation)
-		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), textBrush_(std::move(textBrush)), animation_(animation), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), textColor_(textColor), animation_(animation), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 
@@ -2081,20 +2124,20 @@ public:
 		float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
 		ss << label_ << L"  " << static_cast<int>(progress * 100.0f) << L"%";
 		auto text = ss.str();
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), text, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), text, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 		D2D1_RECT_F track = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.top + 32.0f);
-		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), surface_.Get());
+		context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 		D2D1_RECT_F fill = D2D1::RectF(track.left, track.top, track.left + (track.right - track.left) * progress, track.bottom);
-		context->FillRoundedRectangle(D2D1::RoundedRect(fill, 8.0f, 8.0f), accent_.Get());
+		context->FillRoundedRectangle(D2D1::RoundedRect(fill, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_));
 	}
 
 private:
 	std::wstring label_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F textColor_{};
 	UIAnimation* animation_ = nullptr;
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
@@ -2107,16 +2150,16 @@ public:
 		std::wstring initialText,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
-		ComPtr<ID2D1SolidColorBrush> mutedBrush,
-		ComPtr<ID2D1SolidColorBrush> selectionBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
+		const D2D1_COLOR_F& mutedColor,
+		const D2D1_COLOR_F& selectionColor,
 		bool multiline,
 		std::function<void(std::wstring_view)> onChanged)
-		: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), mutedBrush_(std::move(mutedBrush)), selectionBrush_(std::move(selectionBrush)), multiline_(multiline), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())), labelStyle_(CaptureTextStyle(format_.Get(), mutedBrush_.Get())) {
+		: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), outlineColor_(outlineColor), textColor_(textColor), mutedColor_(mutedColor), selectionColor_(selectionColor), multiline_(multiline), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)), labelStyle_(CaptureTextStyle(format_.Get(), mutedColor_)) {
 		caret_ = text_.size();
-			selectionAnchor_ = caret_;
+		selectionAnchor_ = caret_;
 	}
 
 	bool IsDynamic() const override { return true; }
@@ -2174,26 +2217,24 @@ public:
 		if (multiline_ && VerticalOverflowHintActive() && verticalScrollOpacity < 0.01f) {
 			verticalScrollOpacity = 1.0f;
 		}
-		auto* textBrush = textBrush_.Get();
-		auto* mutedBrush = mutedBrush_.Get();
-		auto* surfaceBrush = surface_.Get();
-		auto* outlineBrush = outline_.Get();
-		auto* selectionBrush = selectionBrush_.Get();
+		auto* textBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_.color : textColor_);
+		auto* mutedBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, mutedColor_);
+		auto* surfaceBrush = PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_);
+		auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_);
+		auto* selectionBrush = PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_);
 		const D2D1_RECT_F labelRect = D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f);
 		auto* labelLayout = labelLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), label_, labelRect.right - labelRect.left, labelRect.bottom - labelRect.top, labelStyleOverride_ ? &labelStyle_ : nullptr);
-		auto labelBrush = labelStyleOverride_ ? CreateBrush(context, labelStyle_.color) : nullptr;
-		auto styledTextBrush = styleOverride_ ? CreateBrush(context, textStyle_.color) : nullptr;
+		auto* labelBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, labelStyleOverride_ ? labelStyle_.color : mutedColor_);
+		auto* styledTextBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_.color : textColor_);
 		if (labelLayout) {
-			context->DrawTextLayout(D2D1::Point2F(labelRect.left, labelRect.top), labelLayout, labelBrush ? labelBrush.Get() : mutedBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+			context->DrawTextLayout(D2D1::Point2F(labelRect.left, labelRect.top), labelLayout, labelBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 		}
 		D2D1_RECT_F box = TextBounds();
 		if (focused_) {
-			selectionBrush->SetOpacity(0.10f);
-			context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(box.left - 1.0f, box.top - 1.0f, box.right + 1.0f, box.bottom + 1.0f), 12.0f, 12.0f), selectionBrush);
+			context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(box.left - 1.0f, box.top - 1.0f, box.right + 1.0f, box.bottom + 1.0f), 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_, 0.10f));
 		}
 		context->FillRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), surfaceBrush);
-		outlineBrush->SetOpacity(0.58f + FocusProgress() * 0.42f);
-		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), outlineBrush, focused_ ? 1.8f : 1.0f);
+		context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.58f + FocusProgress() * 0.42f), focused_ ? 1.8f : 1.0f);
 		UpdateScrollbarVisibilityAnimations(visual);
 		SyncScrollOffsets(visual.layout, visual.content);
 		if (!multiline_) {
@@ -2227,19 +2268,18 @@ public:
 		}
 		else {
 			if (multiline_) {
-				context->DrawTextLayout(origin, visual.layout, styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_NONE);
+				context->DrawTextLayout(origin, visual.layout, styledTextBrush, D2D1_DRAW_TEXT_OPTIONS_NONE);
 			}
 			else {
 				const float textHeight = (std::max)(detail::kLineHeight + 2.0f, visual.metrics.height);
 				const float textWidth = MeasureSingleLineContentWidth(visual.renderText) + 24.0f;
 				const D2D1_RECT_F textRect = D2D1::RectF(origin.x, origin.y, origin.x + textWidth, origin.y + textHeight);
-				context->DrawTextW(visual.renderText.c_str(), static_cast<UINT32>(visual.renderText.size()), format_.Get(), textRect, styledTextBrush ? styledTextBrush.Get() : textBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+				context->DrawTextW(visual.renderText.c_str(), static_cast<UINT32>(visual.renderText.size()), format_.Get(), textRect, styledTextBrush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
 			}
-			DrawImeUnderline(context, visual.layout, origin, outlineBrush);
+			DrawImeUnderline(context, visual.layout, origin, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_));
 		}
 		if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
-			const auto caretColor = styledTextBrush ? styledTextBrush->GetColor() : textBrush->GetColor();
-			DrawCaret(context, visual.layout, origin, caretColor, caretOpacityAnimation_.Value());
+			DrawCaret(context, visual.layout, origin, styleOverride_ ? textStyle_.color : textColor_, caretOpacityAnimation_.Value());
 		}
 		context->PopAxisAlignedClip();
 		if (visual.renderHorizontalScroll) {
@@ -2303,6 +2343,7 @@ public:
 		const size_t index = HitTestText(point);
 		caret_ = index;
 		selectionAnchor_ = index;
+		desiredCaretX_.reset();
 		ensureCaretVisible_ = true;
 		ResetCaretBlink();
 	}
@@ -2331,6 +2372,7 @@ public:
 		}
 		if (draggingSelection_) {
 			caret_ = HitTestText(point);
+			desiredCaretX_.reset();
 			ensureCaretVisible_ = true;
 			ResetCaretBlink();
 		}
@@ -2394,6 +2436,7 @@ public:
 			case 'a':
 				selectionAnchor_ = 0;
 				caret_ = text_.size();
+				desiredCaretX_.reset();
 				return;
 			case 'C':
 			case 'c':
@@ -2425,6 +2468,7 @@ public:
 				text_.erase(caret_ - 1, 1);
 				--caret_;
 				selectionAnchor_ = caret_;
+				desiredCaretX_.reset();
 				NotifyChanged();
 			}
 			break;
@@ -2434,6 +2478,7 @@ public:
 			}
 			if (caret_ < text_.size()) {
 				text_.erase(caret_, 1);
+				desiredCaretX_.reset();
 				NotifyChanged();
 			}
 			break;
@@ -2451,12 +2496,12 @@ public:
 			break;
 		case VK_UP:
 			if (multiline_) {
-				MoveCaret(MoveVertical(-1), modifiers.shift);
+				MoveCaret(MoveVertical(-1), modifiers.shift, true);
 			}
 			break;
 		case VK_DOWN:
 			if (multiline_) {
-				MoveCaret(MoveVertical(1), modifiers.shift);
+				MoveCaret(MoveVertical(1), modifiers.shift, true);
 			}
 			break;
 		default:
@@ -2888,12 +2933,11 @@ private:
 			x += origin.x;
 			y += origin.y;
 		}
-		auto caretBrush = CreateBrush(context, caretColor);
+		auto* caretBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, caretColor, opacity);
 		if (!caretBrush) {
 			return;
 		}
-		caretBrush->SetOpacity((std::clamp)(opacity, 0.0f, 1.0f));
-		context->FillRectangle(D2D1::RectF(x, y, x + 1.0f, y + (std::max)(metrics.height, 18.0f)), caretBrush.Get());
+		context->FillRectangle(D2D1::RectF(x, y, x + 1.0f, y + (std::max)(metrics.height, 18.0f)), caretBrush);
 	}
 
 	void SyncScrollOffsets(IDWriteTextLayout* layout, const D2D1_RECT_F& content) {
@@ -2960,7 +3004,7 @@ private:
 	}
 
 	void DrawScrollBar(ID2D1DeviceContext* context, const ScrollbarState& state, float opacity) {
-		DrawRadixScrollbar(context, state, selectionBrush_.Get(), outline_.Get(), opacity);
+		DrawRadixScrollbar(context, state, PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), opacity);
 	}
 
 	void UpdateCaretBlink() {
@@ -3037,18 +3081,22 @@ private:
 		imeActive_ = false;
 		imeComposition_.clear();
 		compositionReplaceLength_ = 0;
+		desiredCaretX_.reset();
 	}
 
-	void MoveCaret(size_t index, bool extendSelection) {
+	void MoveCaret(size_t index, bool extendSelection, bool preserveDesiredColumn = false) {
 		caret_ = (std::min)(index, text_.size());
 		if (!extendSelection) {
 			selectionAnchor_ = caret_;
+		}
+		if (!preserveDesiredColumn) {
+			desiredCaretX_.reset();
 		}
 		ensureCaretVisible_ = true;
 		ResetCaretBlink();
 	}
 
-	size_t MoveVertical(int direction) const {
+	size_t MoveVerticalByLineBreak(int direction) const {
 		const size_t currentLineStart = text_.rfind(L'\n', caret_ == 0 ? 0 : caret_ - 1);
 		const size_t lineStart = currentLineStart == std::wstring::npos ? 0 : currentLineStart + 1;
 		const size_t lineEnd = text_.find(L'\n', caret_);
@@ -3071,6 +3119,33 @@ private:
 		return nextStart + (std::min)(column, boundedNextEnd - nextStart);
 	}
 
+	size_t MoveVertical(int direction) const {
+		const auto visual = ComputeVisualState();
+		if (!visual.layout) {
+			return MoveVerticalByLineBreak(direction);
+		}
+		FLOAT caretX = 0.0f;
+		FLOAT caretY = 0.0f;
+		DWRITE_HIT_TEST_METRICS caretMetrics{};
+		if (FAILED(visual.layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
+			return MoveVerticalByLineBreak(direction);
+		}
+		const float lineHeight = (std::max)(caretMetrics.height, detail::kLineHeight);
+		const float targetX = desiredCaretX_.has_value() ? *desiredCaretX_ : caretX;
+		desiredCaretX_ = targetX;
+		const float targetY = direction < 0
+			? (std::max)(0.0f, caretY - lineHeight * 0.5f)
+			: caretY + lineHeight * 1.5f;
+		BOOL trailing = FALSE;
+		BOOL inside = FALSE;
+		DWRITE_HIT_TEST_METRICS targetMetrics{};
+		if (FAILED(visual.layout->HitTestPoint(targetX, targetY, &trailing, &inside, &targetMetrics))) {
+			return direction < 0 ? 0 : text_.size();
+		}
+		const size_t index = targetMetrics.textPosition + (trailing ? targetMetrics.length : 0);
+		return (std::min)(index, text_.size());
+	}
+
 	void NotifyChanged() {
 		if (onChanged_) {
 			onChanged_(text_);
@@ -3082,11 +3157,11 @@ private:
 	std::wstring text_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> mutedBrush_;
-	ComPtr<ID2D1SolidColorBrush> selectionBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
+	D2D1_COLOR_F mutedColor_{};
+	D2D1_COLOR_F selectionColor_{};
 	bool multiline_ = false;
 	float scrollX_ = 0.0f;
 	float scrollY_ = 0.0f;
@@ -3118,6 +3193,7 @@ private:
 	LONG imeCursorPos_ = 0;
 	size_t compositionAnchor_ = 0;
 	size_t compositionReplaceLength_ = 0;
+	mutable std::optional<float> desiredCaretX_;
 	std::function<void(std::wstring_view)> onChanged_;
 	TextStyle textStyle_{};
 	TextStyle labelStyle_{};
@@ -3133,12 +3209,12 @@ public:
 	ListBox(std::vector<std::wstring> items,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		std::function<void(std::wstring_view)> onChanged)
-		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -3168,9 +3244,8 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		UpdateScrollBarAnimation(ShouldRevealScrollBar());
-		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
-		outline_->SetOpacity(0.5f + 0.5f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.5f + 0.5f * FocusProgress()), 1.0f + FocusProgress());
 		constexpr float kRowStride = 26.0f;
 		const bool showScrollBar = NeedsScrollBar();
 		const bool renderScrollBar = showScrollBar || ScrollBarOpacity() > 0.01f;
@@ -3190,18 +3265,16 @@ public:
 			const float textTop = rowRect.top + (std::max)(0.0f, std::floor(((rowRect.bottom - rowRect.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
 			const D2D1_RECT_F textRect = D2D1::RectF(rowRect.left + 12.0f, textTop, rowRect.right - 12.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f);
 			if (index == selectedIndex_) {
-				accent_->SetOpacity(0.16f + 0.12f * FocusProgress());
-				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), accent_.Get());
+				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.16f + 0.12f * FocusProgress()));
 			}
 			if (hoveredRow_ && *hoveredRow_ == index) {
-				accent_->SetOpacity(0.08f + 0.08f * HoverProgress());
-				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), accent_.Get());
+				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.08f + 0.08f * HoverProgress()));
 			}
-			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 		context->PopAxisAlignedClip();
 		if (renderScrollBar) {
-			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get(), ScrollBarOpacity());
+			DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), ScrollBarOpacity());
 		}
 	}
 
@@ -3383,10 +3456,10 @@ private:
 	std::vector<std::wstring> items_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
 	size_t selectedIndex_ = 0;
@@ -3409,12 +3482,12 @@ public:
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
 		ComPtr<IDWriteTextFormat> captionFormat,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		std::vector<std::wstring> items)
-		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), captionFormat_(std::move(captionFormat)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), items_(std::move(items)) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), captionFormat_(std::move(captionFormat)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), items_(std::move(items)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -3435,7 +3508,7 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		DrawStyledText(context, dwriteFactory_.Get(), captionFormat_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), captionFormat_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, labelStyleOverride_ ? labelStyle_.color : textColor_), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
 		UpdateScrollBarAnimation(ShouldRevealScrollBar());
 		const bool showScroll = NeedsScrollBar();
 		const bool renderScroll = showScroll || ScrollBarOpacity() > 0.01f;
@@ -3444,9 +3517,8 @@ public:
 		if (renderScroll) {
 			contentViewport.bottom -= kScrollGutter;
 		}
-		context->FillRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), surface_.Get());
-		outline_->SetOpacity(0.45f + 0.45f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), outline_.Get(), 1.0f + FocusProgress());
+		context->FillRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(viewport, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.45f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 		context->PushAxisAlignedClip(D2D1::RectF(contentViewport.left + 8.0f, contentViewport.top + 8.0f, contentViewport.right - 8.0f, contentViewport.bottom - 8.0f), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 		float x = contentViewport.left + 12.0f - scrollOffset_;
 		const float laneHeight = (std::max)(1.0f, contentViewport.bottom - contentViewport.top);
@@ -3458,14 +3530,13 @@ public:
 			const D2D1_RECT_F pill = D2D1::RectF(x, pillTop, x + pillWidth, pillTop + pillHeight);
 			const float textTop = pill.top + (std::max)(0.0f, std::floor(((pill.bottom - pill.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
 			const D2D1_RECT_F textRect = D2D1::RectF(pill.left + 14.0f, textTop, pill.right - 14.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f);
-			accent_->SetOpacity(index == selectedIndex_ ? 0.18f : 0.08f);
-			context->FillRoundedRectangle(D2D1::RoundedRect(pill, 999.0f, 999.0f), accent_.Get());
-			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], textRect, itemStyleOverride_ ? &itemStyle_ : nullptr);
+			context->FillRoundedRectangle(D2D1::RoundedRect(pill, 999.0f, 999.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, index == selectedIndex_ ? 0.18f : 0.08f));
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, itemStyleOverride_ ? itemStyle_.color : textColor_), items_[index], textRect, itemStyleOverride_ ? &itemStyle_ : nullptr);
 			x += pillWidth + 12.0f;
 		}
 		context->PopAxisAlignedClip();
 		if (renderScroll) {
-			DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get(), ScrollBarOpacity());
+			DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), ScrollBarOpacity());
 		}
 	}
 
@@ -3616,10 +3687,10 @@ private:
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
 	ComPtr<IDWriteTextFormat> captionFormat_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	TextStyle labelStyle_{};
 	TextStyle itemStyle_{};
 	bool labelStyleOverride_ = false;
@@ -3641,12 +3712,12 @@ public:
 	ComboBox(std::vector<std::wstring> items,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		std::function<void(std::wstring_view)> onChanged)
-		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: items_(std::move(items)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), onChanged_(std::move(onChanged)), textStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -3666,33 +3737,32 @@ public:
 
 	void Render(ID2D1DeviceContext* context) override {
 		const float openAmount = openAnimation_.Value();
-		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), surface_.Get());
-		outline_->SetOpacity(0.5f + 0.5f * (std::max)(FocusProgress(), openAmount));
-		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), outline_.Get(), 1.0f + (std::max)(FocusProgress(), openAmount));
+		context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.5f + 0.5f * (std::max)(FocusProgress(), openAmount)), 1.0f + (std::max)(FocusProgress(), openAmount));
 		if (!items_.empty()) {
 			const std::wstring& selected = items_[selectedIndex_];
 			const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), selected, textStyleOverride_ ? &textStyle_ : nullptr);
 			const float textTop = bounds_.top + (std::max)(0.0f, std::floor(((bounds_.bottom - bounds_.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
-			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), selected, D2D1::RectF(bounds_.left + 14.0f, textTop, bounds_.right - 30.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f), textStyleOverride_ ? &textStyle_ : nullptr);
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), selected, D2D1::RectF(bounds_.left + 14.0f, textTop, bounds_.right - 30.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 		}
-		context->DrawLine(D2D1::Point2F(bounds_.right - 18.0f, bounds_.top + 14.0f), D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), outline_.Get(), 1.8f);
-		context->DrawLine(D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), D2D1::Point2F(bounds_.right - 6.0f, bounds_.top + 14.0f), outline_.Get(), 1.8f);
+		auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_);
+		context->DrawLine(D2D1::Point2F(bounds_.right - 18.0f, bounds_.top + 14.0f), D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), outlineBrush, 1.8f);
+		context->DrawLine(D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), D2D1::Point2F(bounds_.right - 6.0f, bounds_.top + 14.0f), outlineBrush, 1.8f);
 		if (openAmount <= 0.01f) {
 			return;
 		}
 		D2D1_RECT_F popup = PopupBounds(openAmount);
-		context->FillRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), surface_.Get());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), outline_.Get(), 1.5f);
+		context->FillRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.5f);
 		for (size_t index = 0; index < items_.size(); ++index) {
 			D2D1_RECT_F rowRect = PopupRowRect(popup, index);
 			const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), items_[index], textStyleOverride_ ? &textStyle_ : nullptr);
 			const float textTop = rowRect.top + (std::max)(0.0f, std::floor(((rowRect.bottom - rowRect.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
 			const D2D1_RECT_F textRect = D2D1::RectF(rowRect.left + 12.0f, textTop, rowRect.right - 12.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f);
 			if (hoveredIndex_ && *hoveredIndex_ == index) {
-				accent_->SetOpacity(0.18f);
-				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), accent_.Get());
+				context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.18f));
 			}
-			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
+			DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 		}
 	}
 
@@ -3790,10 +3860,10 @@ private:
 	std::vector<std::wstring> items_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	TextStyle textStyle_{};
 	bool textStyleOverride_ = false;
 	size_t selectedIndex_ = 0;
@@ -3806,13 +3876,13 @@ private:
 class ScrollBar final : public UIComponent {
 public:
 	ScrollBar(ScrollOrientation orientation,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
 		float value,
 		float pageSize,
 		std::function<void(float)> onChanged)
-		: orientation_(orientation), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), value_(Clamp01(value)), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {}
+		: orientation_(orientation), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), value_(Clamp01(value)), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -3833,9 +3903,8 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		outline_->SetOpacity(0.5f + 0.5f * FocusProgress());
-		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 10.0f, 10.0f), outline_.Get(), focused_ ? 1.4f : 1.0f);
-		DrawRadixScrollbar(context, MakeScrollState(), accent_.Get(), outline_.Get());
+		context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.5f + 0.5f * FocusProgress()), focused_ ? 1.4f : 1.0f);
+		DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_));
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); UpdateValue(point); }
@@ -3884,9 +3953,9 @@ private:
 	}
 
 	ScrollOrientation orientation_ = ScrollOrientation::Horizontal;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
 	float value_ = 0.0f;
 	float pageSize_ = 0.2f;
 	UIAnimation valueAnimation_{};
@@ -3898,13 +3967,13 @@ public:
 	Knob(std::wstring label,
 		ComPtr<IDWriteFactory> dwriteFactory,
 		ComPtr<IDWriteTextFormat> format,
-		ComPtr<ID2D1SolidColorBrush> surface,
-		ComPtr<ID2D1SolidColorBrush> accent,
-		ComPtr<ID2D1SolidColorBrush> outline,
-		ComPtr<ID2D1SolidColorBrush> textBrush,
+		const D2D1_COLOR_F& surfaceColor,
+		const D2D1_COLOR_F& accentColor,
+		const D2D1_COLOR_F& outlineColor,
+		const D2D1_COLOR_F& textColor,
 		float value,
 		std::function<void(float)> onChanged)
-		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surface_(std::move(surface)), accent_(std::move(accent)), outline_(std::move(outline)), textBrush_(std::move(textBrush)), value_(Clamp01(value)), onChanged_(std::move(onChanged)), labelStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())), valueStyle_(CaptureTextStyle(format_.Get(), textBrush_.Get())) {}
+		: label_(std::move(label)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), textColor_(textColor), value_(Clamp01(value)), onChanged_(std::move(onChanged)), labelStyle_(CaptureTextStyle(format_.Get(), textColor_)), valueStyle_(CaptureTextStyle(format_.Get(), textColor_)) {}
 
 	bool IsDynamic() const override { return true; }
 	bool IsFocusable() const override { return true; }
@@ -3930,23 +3999,21 @@ public:
 	}
 
 	void Render(ID2D1DeviceContext* context) override {
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, labelStyleOverride_ ? labelStyle_.color : textColor_), label_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), labelStyleOverride_ ? &labelStyle_ : nullptr);
 		D2D1_POINT_2F center{ (bounds_.left + bounds_.right) * 0.5f, bounds_.top + 70.0f };
 		const float radius = 36.0f;
-		context->FillEllipse(D2D1::Ellipse(center, radius, radius), surface_.Get());
-		outline_->SetOpacity(0.6f + 0.4f * FocusProgress());
-		context->DrawEllipse(D2D1::Ellipse(center, radius, radius), outline_.Get(), 1.0f + FocusProgress());
+		context->FillEllipse(D2D1::Ellipse(center, radius, radius), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
+		context->DrawEllipse(D2D1::Ellipse(center, radius, radius), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.6f + 0.4f * FocusProgress()), 1.0f + FocusProgress());
 		const float value = valueAnimation_.Value();
 		constexpr float kPi = 3.1415926f;
 		constexpr float kTau = 6.2831853f;
 		const float angle = fullCircle_ ? (-kPi * 0.5f + value * kTau) : (kPi * (1.25f + value * 1.5f));
 		D2D1_POINT_2F handle{ center.x + std::cos(angle) * 26.0f, center.y + std::sin(angle) * 26.0f };
-		accent_->SetOpacity(0.7f + 0.15f * HoverProgress() + 0.15f * PressProgress());
-		context->DrawLine(center, handle, accent_.Get(), 3.0f);
+		context->DrawLine(center, handle, PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.7f + 0.15f * HoverProgress() + 0.15f * PressProgress()), 3.0f);
 		std::wstringstream ss;
 		ss << static_cast<int>(value * 100.0f);
 		auto valueText = ss.str();
-		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), textBrush_.Get(), valueText, D2D1::RectF(bounds_.left, center.y + 42.0f, bounds_.right, bounds_.bottom), valueStyleOverride_ ? &valueStyle_ : nullptr);
+		DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, valueStyleOverride_ ? valueStyle_.color : textColor_), valueText, D2D1::RectF(bounds_.left, center.y + 42.0f, bounds_.right, bounds_.bottom), valueStyleOverride_ ? &valueStyle_ : nullptr);
 	}
 
 	void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); anchor_ = point; anchorValue_ = value_; }
@@ -3978,10 +4045,10 @@ private:
 	std::wstring label_;
 	ComPtr<IDWriteFactory> dwriteFactory_;
 	ComPtr<IDWriteTextFormat> format_;
-	ComPtr<ID2D1SolidColorBrush> surface_;
-	ComPtr<ID2D1SolidColorBrush> accent_;
-	ComPtr<ID2D1SolidColorBrush> outline_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
+	D2D1_COLOR_F surfaceColor_{};
+	D2D1_COLOR_F accentColor_{};
+	D2D1_COLOR_F outlineColor_{};
+	D2D1_COLOR_F textColor_{};
 	TextStyle labelStyle_{};
 	TextStyle valueStyle_{};
 	bool labelStyleOverride_ = false;
@@ -4377,16 +4444,7 @@ private:
 		if (!graphics_.d2dContext || !graphics_.dwriteFactory) {
 			return;
 		}
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.988f, 0.988f, 0.992f, 0.98f), &panelBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.89f, 0.89f, 0.91f, 1.0f), &outlineBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.106f, 0.165f, 0.325f, 1.0f), &accentBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.106f, 0.165f, 0.325f, 0.14f), &accentSoftBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &textBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f), &mutedTextBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(1.0f, 1.0f, 1.0f, 1.0f), &surfaceBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.964f, 0.965f, 0.973f, 1.0f), &surfaceAltBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &primaryBrush_);
-		graphics_.d2dContext->CreateSolidColorBrush(detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f), &successBrush_);
+		detail::EnsureSharedBrushPool(graphics_.d2dContext.Get());
 
 		graphics_.dwriteFactory->CreateTextFormat(L"Segoe UI Semibold", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 20.0f, L"en-us", &titleFormat_);
 		graphics_.dwriteFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f, L"en-us", &buttonFormat_);
@@ -4407,27 +4465,37 @@ private:
 		rightLayoutOrder_.clear();
 		focusOrder_.clear();
 
+		const auto panelColor = detail::MakeColor(0.988f, 0.988f, 0.992f, 0.98f);
+		const auto outlineColor = detail::MakeColor(0.89f, 0.89f, 0.91f, 1.0f);
+		const auto accentColor = detail::MakeColor(0.106f, 0.165f, 0.325f, 1.0f);
+		const auto accentSoftColor = detail::MakeColor(0.106f, 0.165f, 0.325f, 0.14f);
+		const auto textColor = detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f);
+		const auto mutedTextColor = detail::MakeColor(0.45f, 0.45f, 0.50f, 1.0f);
+		const auto surfaceColor = detail::MakeColor(1.0f, 1.0f, 1.0f, 1.0f);
+		const auto surfaceAltColor = detail::MakeColor(0.964f, 0.965f, 0.973f, 1.0f);
+		const auto primaryColor = detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f);
+
 		auto selectedAimStyle = std::make_shared<int>(0);
 
-		auto leftCard = std::make_unique<CardSurface>(panelBrush_, outlineBrush_, accentBrush_, accentSoftBrush_);
+		auto leftCard = std::make_unique<CardSurface>(panelColor, outlineColor, accentColor, accentSoftColor);
 		leftCard->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f));
 		leftCard->SetZIndex(0);
 		leftCard_ = leftCard.get();
 		components_.push_back(std::move(leftCard));
 
-		auto rightCard = std::make_unique<CardSurface>(panelBrush_, outlineBrush_, accentBrush_, accentSoftBrush_);
+		auto rightCard = std::make_unique<CardSurface>(panelColor, outlineColor, accentColor, accentSoftColor);
 		rightCard->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth, 540.0f));
 		rightCard->SetZIndex(0);
 		rightCard_ = rightCard.get();
 		components_.push_back(std::move(rightCard));
 
-		auto title = std::make_unique<TextBlock>(L"Command Surface", graphics_.dwriteFactory, titleFormat_, textBrush_);
+		auto title = std::make_unique<TextBlock>(L"Command Surface", graphics_.dwriteFactory, titleFormat_, textColor);
 		title->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 34.0f));
 		title->SetZIndex(1);
 		leftLayoutOrder_.push_back(title.get());
 		components_.push_back(std::move(title));
 
-		auto subtitle = std::make_unique<TextBlock>(L"Radix / shadcn inspired tokens, focus rings, clipped surfaces and composite widgets.", graphics_.dwriteFactory, captionFormat_, mutedTextBrush_);
+		auto subtitle = std::make_unique<TextBlock>(L"Radix / shadcn inspired tokens, focus rings, clipped surfaces and composite widgets.", graphics_.dwriteFactory, captionFormat_, mutedTextColor);
 		subtitle->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 32.0f));
 		subtitle->SetZIndex(1);
 		subtitle->SetStyledRanges({
@@ -4437,14 +4505,14 @@ private:
 		leftLayoutOrder_.push_back(subtitle.get());
 		components_.push_back(std::move(subtitle));
 
-		auto preview = std::make_unique<ImageFrame>(outlineBrush_, accentBrush_, surfaceAltBrush_);
+		auto preview = std::make_unique<ImageFrame>(outlineColor, accentColor, surfaceAltColor);
 		preview->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 110.0f));
 		preview->SetZIndex(1);
 		preview_ = preview.get();
 		leftLayoutOrder_.push_back(preview.get());
 		components_.push_back(std::move(preview));
 
-		auto previewButton = std::make_unique<ImageButton>(L"Open Preview", graphics_.dwriteFactory, buttonFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this]() {
+		auto previewButton = std::make_unique<ImageButton>(L"Open Preview", graphics_.dwriteFactory, buttonFormat_, surfaceColor, accentColor, outlineColor, textColor, [this]() {
 			SetStatus(L"Image button activated from the header-only UI host.");
 		});
 		previewButton->SetTextAlignment(HorizontalAlign::Left, VerticalAlign::Center);
@@ -4454,7 +4522,7 @@ private:
 		leftLayoutOrder_.push_back(previewButton.get());
 		components_.push_back(std::move(previewButton));
 
-		auto resetButton = std::make_unique<Button>(L"Reset Canvas", graphics_.dwriteFactory, buttonFormat_, primaryBrush_, surfaceAltBrush_, outlineBrush_, surfaceBrush_, [this]() {
+		auto resetButton = std::make_unique<Button>(L"Reset Canvas", graphics_.dwriteFactory, buttonFormat_, primaryColor, surfaceAltColor, outlineColor, surfaceColor, [this]() {
 			if (callbacks_.onResetCanvas) {
 				callbacks_.onResetCanvas();
 			}
@@ -4467,7 +4535,7 @@ private:
 		leftLayoutOrder_.push_back(resetButton.get());
 		components_.push_back(std::move(resetButton));
 
-		auto checkbox = std::make_unique<Checkbox>(L"Mirror show-grid state", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, true, [this](bool checked) {
+		auto checkbox = std::make_unique<Checkbox>(L"Mirror show-grid state", graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, textColor, outlineColor, true, [this](bool checked) {
 			if (callbacks_.onGridChanged) {
 				callbacks_.onGridChanged(checked);
 			}
@@ -4479,7 +4547,7 @@ private:
 		leftLayoutOrder_.push_back(checkbox.get());
 		components_.push_back(std::move(checkbox));
 
-		auto radio0 = std::make_unique<RadioButton>(L"Aim style 0: ring", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 0, [this](int value) {
+		auto radio0 = std::make_unique<RadioButton>(L"Aim style 0: ring", graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, textColor, outlineColor, selectedAimStyle, 0, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to ring mode.");
 		});
@@ -4489,7 +4557,7 @@ private:
 		leftLayoutOrder_.push_back(radio0.get());
 		components_.push_back(std::move(radio0));
 
-		auto radio1 = std::make_unique<RadioButton>(L"Aim style 1: dot", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 1, [this](int value) {
+		auto radio1 = std::make_unique<RadioButton>(L"Aim style 1: dot", graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, textColor, outlineColor, selectedAimStyle, 1, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to dot mode.");
 		});
@@ -4499,7 +4567,7 @@ private:
 		leftLayoutOrder_.push_back(radio1.get());
 		components_.push_back(std::move(radio1));
 
-		auto radio2 = std::make_unique<RadioButton>(L"Aim style 2: triangle", graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, textBrush_, outlineBrush_, selectedAimStyle, 2, [this](int value) {
+		auto radio2 = std::make_unique<RadioButton>(L"Aim style 2: triangle", graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, textColor, outlineColor, selectedAimStyle, 2, [this](int value) {
 			if (callbacks_.onAimStyleChanged) callbacks_.onAimStyleChanged(value);
 			SetStatus(L"Aim style switched to triangle mode.");
 		});
@@ -4509,7 +4577,7 @@ private:
 		leftLayoutOrder_.push_back(radio2.get());
 		components_.push_back(std::move(radio2));
 
-		auto slider = std::make_unique<Slider>(L"Aim radius", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, outlineBrush_, 0.2f, [this](float value) {
+		auto slider = std::make_unique<Slider>(L"Aim radius", graphics_.dwriteFactory, captionFormat_, surfaceAltColor, accentColor, textColor, outlineColor, 0.2f, [this](float value) {
 			if (callbacks_.onAimRadiusChanged) callbacks_.onAimRadiusChanged(5.0f + value * 75.0f);
 			std::wstringstream ss;
 			ss << L"Aim radius updated to " << static_cast<int>(5.0f + value * 75.0f) << L" px.";
@@ -4521,13 +4589,13 @@ private:
 		leftLayoutOrder_.push_back(slider.get());
 		components_.push_back(std::move(slider));
 
-		auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, textBrush_, &progressAnimation_);
+		auto progress = std::make_unique<ProgressBar>(L"UIAnimation bridge", graphics_.dwriteFactory, captionFormat_, surfaceAltColor, accentColor, textColor, &progressAnimation_);
 		progress->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 40.0f));
 		progress->SetZIndex(3);
 		leftLayoutOrder_.push_back(progress.get());
 		components_.push_back(std::move(progress));
 
-		auto singleInput = std::make_unique<TextInput>(L"Single-line input", L"Type a command...", L"draw hitmarker", graphics_.dwriteFactory, fieldFormat_, surfaceBrush_, outlineBrush_, textBrush_, mutedTextBrush_, accentBrush_, false, [this](std::wstring_view value) {
+		auto singleInput = std::make_unique<TextInput>(L"Single-line input", L"Type a command...", L"draw hitmarker", graphics_.dwriteFactory, fieldFormat_, surfaceColor, outlineColor, textColor, mutedTextColor, accentColor, false, [this](std::wstring_view value) {
 			std::wstring status = L"Single-line input: ";
 			status.append(value);
 			SetStatus(status);
@@ -4539,7 +4607,7 @@ private:
 		rightLayoutOrder_.push_back(singleInput_);
 		components_.push_back(std::move(singleInput));
 
-		auto multiInput = std::make_unique<TextInput>(L"Multiline editor", L"Notes...", L"Header-only migration complete.\nNext: richer text selection and IME support.", graphics_.dwriteFactory, fieldFormat_, surfaceBrush_, outlineBrush_, textBrush_, mutedTextBrush_, accentBrush_, true, [this](std::wstring_view) {
+		auto multiInput = std::make_unique<TextInput>(L"Multiline editor", L"Notes...", L"Header-only migration complete.\nNext: richer text selection and IME support.", graphics_.dwriteFactory, fieldFormat_, surfaceColor, outlineColor, textColor, mutedTextColor, accentColor, true, [this](std::wstring_view) {
 			SetStatus(L"Multiline editor changed.");
 		});
 		multiInput->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 118.0f));
@@ -4549,7 +4617,7 @@ private:
 		rightLayoutOrder_.push_back(multiInput_);
 		components_.push_back(std::move(multiInput));
 
-		auto listBox = std::make_unique<ListBox>(std::vector<std::wstring>{ L"Aster", L"Beryl", L"Cinder", L"Delta", L"Ember", L"Flint", L"Grove", L"Halo", L"Iris", L"Juniper", L"Kite", L"Lumen" }, graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
+		auto listBox = std::make_unique<ListBox>(std::vector<std::wstring>{ L"Aster", L"Beryl", L"Cinder", L"Delta", L"Ember", L"Flint", L"Grove", L"Halo", L"Iris", L"Juniper", L"Kite", L"Lumen" }, graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, outlineColor, textColor, [this](std::wstring_view value) {
 			std::wstring status = L"List box selected: ";
 			status.append(value);
 			SetStatus(status);
@@ -4561,7 +4629,7 @@ private:
 		rightLayoutOrder_.push_back(listBox_);
 		components_.push_back(std::move(listBox));
 
-		auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release" }, graphics_.dwriteFactory, bodyFormat_, surfaceBrush_, accentBrush_, outlineBrush_, textBrush_, [this](std::wstring_view value) {
+		auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release" }, graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, outlineColor, textColor, [this](std::wstring_view value) {
 			std::wstring status = L"Combo box selected: ";
 			status.append(value);
 			SetStatus(status);
@@ -4573,14 +4641,14 @@ private:
 		rightLayoutOrder_.push_back(comboBox_);
 		components_.push_back(std::move(comboBox));
 
-		auto chipStrip = std::make_unique<ChipStrip>(L"Horizontal overflow", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, std::vector<std::wstring>{ L"Telemetry", L"Render Thread", L"Composition", L"Clipboard", L"IME", L"Selection", L"VirtualSurface", L"Animation" });
+		auto chipStrip = std::make_unique<ChipStrip>(L"Horizontal overflow", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltColor, accentColor, outlineColor, textColor, std::vector<std::wstring>{ L"Telemetry", L"Render Thread", L"Composition", L"Clipboard", L"IME", L"Selection", L"VirtualSurface", L"Animation" });
 		chipStrip->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 76.0f));
 		chipStrip->SetZIndex(3);
 		focusOrder_.push_back(chipStrip.get());
 		rightLayoutOrder_.push_back(chipStrip.get());
 		components_.push_back(std::move(chipStrip));
 
-		auto knob = std::make_unique<Knob>(L"Encoder", graphics_.dwriteFactory, captionFormat_, surfaceAltBrush_, accentBrush_, outlineBrush_, textBrush_, 0.42f, [this](float value) {
+		auto knob = std::make_unique<Knob>(L"Encoder", graphics_.dwriteFactory, captionFormat_, surfaceAltColor, accentColor, outlineColor, textColor, 0.42f, [this](float value) {
 			std::wstringstream ss;
 			ss << L"Knob rotated to " << static_cast<int>(value * 100.0f) << L"%.";
 			SetStatus(ss.str());
@@ -4593,7 +4661,7 @@ private:
 		rightLayoutOrder_.push_back(knob_);
 		components_.push_back(std::move(knob));
 
-		auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltBrush_, outlineBrush_, textBrush_, mutedTextBrush_);
+		auto statusText = std::make_unique<ExpandableNote>(L"Animation extension demo", L"This block uses the generic animation-slot API on UIComponent. Click to expand or collapse and reuse the same slot pattern in custom components.", graphics_.dwriteFactory, bodyFormat_, captionFormat_, surfaceAltColor, outlineColor, textColor, mutedTextColor);
 		statusText->SetBounds(D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 84.0f));
 		statusText->SetZIndex(3);
 		statusText_ = statusText.get();
@@ -4827,16 +4895,6 @@ private:
 	bool dynamicDirty_ = true;
 
 	ComPtr<ID2D1CommandList> staticLayer_;
-	ComPtr<ID2D1SolidColorBrush> panelBrush_;
-	ComPtr<ID2D1SolidColorBrush> outlineBrush_;
-	ComPtr<ID2D1SolidColorBrush> accentBrush_;
-	ComPtr<ID2D1SolidColorBrush> accentSoftBrush_;
-	ComPtr<ID2D1SolidColorBrush> textBrush_;
-	ComPtr<ID2D1SolidColorBrush> mutedTextBrush_;
-	ComPtr<ID2D1SolidColorBrush> surfaceBrush_;
-	ComPtr<ID2D1SolidColorBrush> surfaceAltBrush_;
-	ComPtr<ID2D1SolidColorBrush> primaryBrush_;
-	ComPtr<ID2D1SolidColorBrush> successBrush_;
 	ComPtr<IDWriteTextFormat> titleFormat_;
 	ComPtr<IDWriteTextFormat> buttonFormat_;
 	ComPtr<IDWriteTextFormat> bodyFormat_;
