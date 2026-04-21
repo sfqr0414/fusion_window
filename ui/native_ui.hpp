@@ -263,7 +263,7 @@ namespace fusion::ui {
 				return;
 			}
 			bounds_ = bounds;
-			MarkDirty();
+			MarkContentChanged();
 		}
 
 		const D2D1_RECT_F& Bounds() const {
@@ -275,7 +275,7 @@ namespace fusion::ui {
 				return;
 			}
 			zIndex_ = zIndex;
-			MarkDirty();
+			MarkContentChanged();
 		}
 
 		int ZIndex() const {
@@ -299,7 +299,7 @@ namespace fusion::ui {
 				Animate(pressAnimation_, 0.0f, 0.10);
 				Animate(focusAnimation_, 0.0f, 0.10);
 			}
-			MarkDirty();
+			MarkContentChanged();
 		}
 
 		bool Enabled() const {
@@ -311,7 +311,7 @@ namespace fusion::ui {
 				return;
 			}
 			enabled_ = enabled;
-			MarkDirty();
+			MarkContentChanged();
 		}
 
 		bool Focused() const {
@@ -353,14 +353,21 @@ namespace fusion::ui {
 			dirty_ = true;
 		}
 
+		void MarkContentChanged() {
+			contentChanged_ = true;
+			cacheDirty_ = true;
+			dirty_ = true;
+		}
+
 		void ClearRenderCache() {
 			renderCache_.Reset();
 			renderCacheFingerprint_ = 0;
+			cacheDirty_ = true;
 			dirty_ = true;
 		}
 
 		bool NeedsCacheRefresh() const {
-			return dirty_ || IsAnimating() || !renderCache_ || renderCacheFingerprint_ != ComputeRenderFingerprint();
+			return cacheDirty_ || !renderCache_ || (renderCacheFingerprint_ != ComputeRenderFingerprint() && !IsOnlyAnimating());
 		}
 
 		bool RenderCached(ID2D1DeviceContext* context) {
@@ -371,16 +378,26 @@ namespace fusion::ui {
 			if (!SupportsCachedRendering()) {
 				Render(context);
 				dirty_ = false;
+				cacheDirty_ = false;
 				renderCacheFingerprint_ = ComputeRenderFingerprint();
 				return true;
 			}
+			const bool animationOnly = IsOnlyAnimating();
 			if (NeedsCacheRefresh()) {
-				RebuildRenderCache(context);
-				rebuilt = true;
+				if (!animationOnly) {
+					RebuildRenderCache(context);
+					rebuilt = true;
+				}
+			}
+			if (animationOnly || !renderCache_) {
+				Render(context);
+				dirty_ = false;
+				return rebuilt;
 			}
 			if (renderCache_) {
 				context->DrawImage(renderCache_.Get());
 			}
+			dirty_ = false;
 			return rebuilt;
 		}
 
@@ -483,7 +500,18 @@ namespace fusion::ui {
 	protected:
 		virtual void OnAttachAnimations() {}
 
+		virtual bool IsOnlyAnimating() const {
+			return IsAnimating() && !contentChanged_;
+		}
+
+		void ResetContentChanged() {
+			contentChanged_ = false;
+		}
+
 		void Animate(UIAnimation& animation, float target, double duration = 0.16, double accel = 0.3, double decel = 0.3) {
+			if (!ShouldAnimate(animation, target)) {
+				return;
+			}
 			MarkDirty();
 			if (animator_) {
 				animator_->Animate(animation, target, duration, accel, decel);
@@ -494,6 +522,9 @@ namespace fusion::ui {
 		}
 
 		void AnimateLinear(UIAnimation& animation, float target, double duration = 0.16) {
+			if (!ShouldAnimate(animation, target)) {
+				return;
+			}
 			MarkDirty();
 			if (animator_) {
 				animator_->AnimateLinear(animation, target, duration);
@@ -551,17 +582,27 @@ namespace fusion::ui {
 		UIAnimation focusAnimation_{};
 		std::unordered_map<std::wstring, UIAnimation> customAnimations_;
 		bool dirty_ = true;
+		bool cacheDirty_ = true;
+		bool contentChanged_ = true;
 		ComPtr<ID2D1CommandList> renderCache_;
 		std::size_t renderCacheFingerprint_ = 0;
 
 	private:
+		static bool ShouldAnimate(const UIAnimation& animation, float target) {
+			double finalValue = 0.0;
+			if (animation.Variable() && SUCCEEDED(animation.Variable()->GetFinalValue(&finalValue))) {
+				return std::fabs(finalValue - static_cast<double>(target)) > 1e-4;
+			}
+			return std::fabs(static_cast<double>(animation.Value()) - static_cast<double>(target)) > 1e-4;
+		}
+
 		std::size_t ComputeRenderFingerprint() const {
 			auto hashCombine = [](std::size_t seed, std::size_t value) {
 				return seed ^ (value + 0x9e3779b9 + (seed << 6) + (seed >> 2));
-			};
+				};
 			auto quantize = [](float value) {
 				return static_cast<std::size_t>(std::lround(value * 1000.0f));
-			};
+				};
 			std::size_t seed = 0;
 			seed = hashCombine(seed, quantize(bounds_.left));
 			seed = hashCombine(seed, quantize(bounds_.top));
@@ -602,6 +643,8 @@ namespace fusion::ui {
 			context->SetTarget(previousTarget.Get());
 			renderCache_->Close();
 			renderCacheFingerprint_ = ComputeRenderFingerprint();
+			cacheDirty_ = false;
+			ResetContentChanged();
 			dirty_ = false;
 		}
 	};
@@ -628,7 +671,14 @@ namespace fusion::ui {
 					contentHeight += gap_;
 				}
 				const float height = item->Bounds().bottom - item->Bounds().top;
-				item->SetBounds(D2D1::RectF(bounds.left + padding_, y, bounds.right - padding_, y + height));
+				const D2D1_RECT_F arrangedBounds = D2D1::RectF(bounds.left + padding_, y, bounds.right - padding_, y + height);
+				const auto& currentBounds = item->Bounds();
+				if (std::fabs(currentBounds.left - arrangedBounds.left) > 0.01f
+					|| std::fabs(currentBounds.top - arrangedBounds.top) > 0.01f
+					|| std::fabs(currentBounds.right - arrangedBounds.right) > 0.01f
+					|| std::fabs(currentBounds.bottom - arrangedBounds.bottom) > 0.01f) {
+					item->SetBounds(arrangedBounds);
+				}
 				y += height + gap_;
 				contentHeight += height;
 				hasVisibleItems = true;
@@ -1200,17 +1250,18 @@ namespace fusion::ui {
 
 			void SetText(std::wstring text) {
 				text_ = std::move(text);
-				MarkDirty();
+				MarkContentChanged();
 			}
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
 				styleOverride_ = true;
+				MarkContentChanged();
 			}
 
 			void SetStyledRanges(std::vector<StyledTextRange> ranges) {
 				styledRanges_ = std::move(ranges);
-				MarkDirty();
+				MarkContentChanged();
 			}
 
 			bool IsDynamic() const override {
@@ -1253,22 +1304,24 @@ namespace fusion::ui {
 
 			void SetTitle(std::wstring title) {
 				title_ = std::move(title);
-				MarkDirty();
+				MarkContentChanged();
 			}
 
 			void SetBody(std::wstring body) {
 				body_ = std::move(body);
-				MarkDirty();
+				MarkContentChanged();
 			}
 
 			void SetTitleStyle(const TextStyle& style) {
 				titleStyle_ = style;
 				titleStyleOverride_ = true;
+				MarkContentChanged();
 			}
 
 			void SetBodyStyle(const TextStyle& style) {
 				bodyStyle_ = style;
 				bodyStyleOverride_ = true;
+				MarkContentChanged();
 			}
 
 			void OnAttachAnimations() override {
@@ -1370,10 +1423,10 @@ namespace fusion::ui {
 				if (hadOverflow != hasOverflow) {
 					hintedContentHeight_ = hasOverflow ? contentHeight_ : previousContentHeight;
 					TouchScrollReveal();
+					UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				}
 				UpdateScrollBarViewport();
 				SetScrollOffset(scrollOffset_);
-				UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				MarkDirty();
 			}
 
@@ -1427,7 +1480,6 @@ namespace fusion::ui {
 				if (!visible_) {
 					return;
 				}
-				UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				auto rounded = D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius);
 				context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, fillColor_));
 				context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.0f);
@@ -1446,6 +1498,7 @@ namespace fusion::ui {
 				UIComponent::OnHover(hovered);
 				if (!hovered && !scrollBar_.dragging) {
 					scrollBar_.hovered = false;
+					UpdateScrollBarAnimation(false);
 				}
 			}
 
@@ -1457,6 +1510,7 @@ namespace fusion::ui {
 				scrollBar_.dragging = true;
 				scrollBar_.hovered = true;
 				TouchScrollReveal();
+				UpdateScrollBarAnimation(true);
 				dragStartY_ = point.y;
 				startScrollOffset_ = scrollOffset_;
 				if (!scrollBar_.HitThumb(point)) {
@@ -1468,6 +1522,10 @@ namespace fusion::ui {
 
 			void OnPointerMove(D2D1_POINT_2F point) override {
 				scrollBar_.hovered = scrollBar_.HitTrack(point);
+				if (scrollBar_.hovered) {
+					TouchScrollReveal();
+				}
+				UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				if (!scrollBar_.dragging) {
 					return;
 				}
@@ -1492,6 +1550,7 @@ namespace fusion::ui {
 				if (scrollBar_.hovered) {
 					TouchScrollReveal();
 				}
+				UpdateScrollBarAnimation(ShouldRevealScrollBar());
 				UIComponent::OnPointerUp(point);
 			}
 
@@ -1504,6 +1563,7 @@ namespace fusion::ui {
 				const bool changed = !NearlyEqual(previousOffset, scrollOffset_, 0.05f);
 				if (changed) {
 					TouchScrollReveal();
+					UpdateScrollBarAnimation(true);
 				}
 				return changed;
 			}
@@ -2241,7 +2301,16 @@ namespace fusion::ui {
 
 		private:
 			D2D1_RECT_F TrackBounds() const {
-				return D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.top + 32.0f);
+				if (!trackBoundsValid_
+					|| !detail::NearlyEqual(cachedTrackBoundsHost_.left, bounds_.left, 0.01f)
+					|| !detail::NearlyEqual(cachedTrackBoundsHost_.top, bounds_.top, 0.01f)
+					|| !detail::NearlyEqual(cachedTrackBoundsHost_.right, bounds_.right, 0.01f)
+					|| !detail::NearlyEqual(cachedTrackBoundsHost_.bottom, bounds_.bottom, 0.01f)) {
+					cachedTrackBoundsHost_ = bounds_;
+					cachedTrackBounds_ = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.top + 32.0f);
+					trackBoundsValid_ = true;
+				}
+				return cachedTrackBounds_;
 			}
 			void UpdateValue(D2D1_POINT_2F point) {
 				D2D1_RECT_F track = TrackBounds();
@@ -2269,6 +2338,9 @@ namespace fusion::ui {
 			bool textStyleOverride_ = false;
 			float value_ = 0.0f;
 			UIAnimation valueAnimation_{};
+			mutable bool trackBoundsValid_ = false;
+			mutable D2D1_RECT_F cachedTrackBoundsHost_{ D2D1::RectF() };
+			mutable D2D1_RECT_F cachedTrackBounds_{ D2D1::RectF() };
 			std::function<void(float)> onChanged_;
 		};
 
@@ -2297,11 +2369,15 @@ namespace fusion::ui {
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
-				std::wstringstream ss;
 				float progress = Clamp01(animation_ ? animation_->Value() : 0.0f);
-				ss << label_ << L"  " << static_cast<int>(progress * 100.0f) << L"%";
-				auto text = ss.str();
-				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), text, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
+				const int progressPercent = static_cast<int>(progress * 100.0f);
+				if (cachedProgressPercent_ != progressPercent) {
+					std::wstringstream ss;
+					ss << label_ << L"  " << progressPercent << L"%";
+					cachedProgressLabel_ = ss.str();
+					cachedProgressPercent_ = progressPercent;
+				}
+				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), cachedProgressLabel_, D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 				D2D1_RECT_F track = D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.top + 32.0f);
 				context->FillRoundedRectangle(D2D1::RoundedRect(track, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				D2D1_RECT_F fill = D2D1::RectF(track.left, track.top, track.left + (track.right - track.left) * progress, track.bottom);
@@ -2318,6 +2394,8 @@ namespace fusion::ui {
 			UIAnimation* animation_ = nullptr;
 			TextStyle textStyle_{};
 			bool textStyleOverride_ = false;
+			mutable int cachedProgressPercent_ = -1;
+			mutable std::wstring cachedProgressLabel_;
 		};
 
 		class TextInput final : public UIComponent {
@@ -2367,15 +2445,20 @@ namespace fusion::ui {
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
 				styleOverride_ = true;
+				InvalidateTextLayoutState();
+				MarkContentChanged();
 			}
 
 			void SetLabelStyle(const TextStyle& style) {
 				labelStyle_ = style;
 				labelStyleOverride_ = true;
+				MarkContentChanged();
 			}
 
 			void SetStyledRanges(std::vector<StyledTextRange> ranges) {
 				styledRanges_ = std::move(ranges);
+				InvalidateTextLayoutState();
+				MarkContentChanged();
 			}
 
 			void OnAttachAnimations() override {
@@ -2763,6 +2846,8 @@ namespace fusion::ui {
 				}
 				imeComposition_ = std::move(composition);
 				imeCursorPos_ = cursorPos;
+				InvalidateTextLayoutState();
+				MarkContentChanged();
 				ensureCaretVisible_ = true;
 				ResetCaretBlink();
 			}
@@ -2771,6 +2856,8 @@ namespace fusion::ui {
 				imeActive_ = false;
 				imeComposition_.clear();
 				compositionReplaceLength_ = 0;
+				InvalidateTextLayoutState();
+				MarkContentChanged();
 				ResetCaretBlink();
 			}
 
@@ -2883,10 +2970,7 @@ namespace fusion::ui {
 						state.content.bottom -= kSingleLineScrollGutter;
 					}
 					state.layout = CreateLayout(state.renderText, state.content);
-					state.metrics = {};
-					if (state.layout) {
-						state.layout->GetMetrics(&state.metrics);
-					}
+					state.metrics = state.layout ? cachedTextLayoutMetrics_ : DWRITE_TEXT_METRICS{};
 					};
 
 				refreshLayout();
@@ -2939,11 +3023,19 @@ namespace fusion::ui {
 			}
 
 			void UpdateScrollbarVisibilityAnimations(const VisualState& visual) {
+				const bool horizontalVisible = visual.renderHorizontalScroll && (horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal || HorizontalScrollRevealActive());
+				const bool verticalVisible = visual.renderVerticalScroll && (verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical || VerticalScrollRevealActive());
 				if (!multiline_) {
-					AnimateLinear(horizontalScrollVisibilityAnimation_, visual.renderHorizontalScroll && (horizontalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Horizontal || HorizontalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+					if (horizontalVisible != horizontalScrollVisibleTarget_) {
+						horizontalScrollVisibleTarget_ = horizontalVisible;
+						AnimateLinear(horizontalScrollVisibilityAnimation_, horizontalVisible ? 1.0f : 0.0f, 0.16);
+					}
 				}
 				if (multiline_) {
-					AnimateLinear(verticalScrollVisibilityAnimation_, visual.renderVerticalScroll && (verticalScrollHovered_ || scrollDragMode_ == ScrollDragMode::Vertical || VerticalScrollRevealActive()) ? 1.0f : 0.0f, 0.16);
+					if (verticalVisible != verticalScrollVisibleTarget_) {
+						verticalScrollVisibleTarget_ = verticalVisible;
+						AnimateLinear(verticalScrollVisibilityAnimation_, verticalVisible ? 1.0f : 0.0f, 0.16);
+					}
 				}
 			}
 
@@ -3018,12 +3110,62 @@ namespace fusion::ui {
 			IDWriteTextLayout* CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
 				const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, MeasureSingleLineContentWidth(renderText) + 24.0f);
 				const float height = multiline_ ? 32768.0f : (content.bottom - content.top);
-				return contentLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), renderText, width, height, styleOverride_ ? &textStyle_ : nullptr, styledRanges_, multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+				const auto wrapping = multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP;
+				const bool hasOverride = styleOverride_;
+				auto rectEqual = [](const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) {
+					return detail::NearlyEqual(lhs.left, rhs.left, 0.01f)
+						&& detail::NearlyEqual(lhs.top, rhs.top, 0.01f)
+						&& detail::NearlyEqual(lhs.right, rhs.right, 0.01f)
+						&& detail::NearlyEqual(lhs.bottom, rhs.bottom, 0.01f);
+					};
+				const bool layoutMatches = cachedTextLayoutValid_
+					&& cachedLayoutText_ == renderText
+					&& rectEqual(cachedLayoutContentRect_, content)
+					&& detail::NearlyEqual(cachedLayoutWidth_, width, 0.01f)
+					&& detail::NearlyEqual(cachedLayoutHeight_, height, 0.01f)
+					&& cachedLayoutWrapping_ == wrapping
+					&& cachedLayoutHasStyleOverride_ == hasOverride
+					&& (!hasOverride || detail::TextStyleEqual(cachedLayoutStyle_, textStyle_))
+					&& detail::StyledRangesEqual(cachedLayoutRanges_, styledRanges_);
+				if (!layoutMatches) {
+					cachedTextLayout_ = contentLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), renderText, width, height, hasOverride ? &textStyle_ : nullptr, styledRanges_, wrapping);
+					cachedLayoutText_.assign(renderText.begin(), renderText.end());
+					cachedLayoutContentRect_ = content;
+					cachedLayoutWidth_ = width;
+					cachedLayoutHeight_ = height;
+					cachedLayoutWrapping_ = wrapping;
+					cachedLayoutHasStyleOverride_ = hasOverride;
+					cachedLayoutStyle_ = textStyle_;
+					cachedLayoutRanges_ = styledRanges_;
+					cachedTextLayoutMetrics_ = {};
+					if (cachedTextLayout_) {
+						cachedTextLayout_->GetMetrics(&cachedTextLayoutMetrics_);
+					}
+					cachedTextLayoutValid_ = true;
+				}
+				return cachedTextLayout_;
 			}
 
 			float MeasureSingleLineContentWidth(std::wstring_view renderText) const {
-				const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), renderText, styleOverride_ ? &textStyle_ : nullptr, DWRITE_WORD_WRAPPING_NO_WRAP);
-				return (std::max)(1.0f, metrics.widthIncludingTrailingWhitespace + 2.0f);
+				const bool hasOverride = styleOverride_;
+				const bool cacheHit = cachedSingleLineWidthValid_
+					&& cachedSingleLineText_ == renderText
+					&& cachedSingleLineHasStyleOverride_ == hasOverride
+					&& (!hasOverride || detail::TextStyleEqual(cachedSingleLineStyle_, textStyle_));
+				if (!cacheHit) {
+					const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), renderText, hasOverride ? &textStyle_ : nullptr, DWRITE_WORD_WRAPPING_NO_WRAP);
+					cachedSingleLineText_.assign(renderText.begin(), renderText.end());
+					cachedSingleLineHasStyleOverride_ = hasOverride;
+					cachedSingleLineStyle_ = textStyle_;
+					cachedSingleLineWidth_ = (std::max)(1.0f, metrics.widthIncludingTrailingWhitespace + 2.0f);
+					cachedSingleLineWidthValid_ = true;
+				}
+				return cachedSingleLineWidth_;
+			}
+
+			void InvalidateTextLayoutState() {
+				cachedTextLayoutValid_ = false;
+				cachedSingleLineWidthValid_ = false;
 			}
 
 			void ShiftStyledRanges(size_t start, ptrdiff_t delta, size_t removedLength = 0) {
@@ -3335,6 +3477,8 @@ namespace fusion::ui {
 			}
 
 			void NotifyChanged() {
+				InvalidateTextLayoutState();
+				MarkContentChanged();
 				if (onChanged_) {
 					onChanged_(text_);
 				}
@@ -3364,6 +3508,8 @@ namespace fusion::ui {
 			mutable bool verticalScrollHovered_ = false;
 			mutable std::chrono::steady_clock::time_point horizontalScrollRevealUntil_{};
 			mutable std::chrono::steady_clock::time_point verticalScrollRevealUntil_{};
+			bool horizontalScrollVisibleTarget_ = false;
+			bool verticalScrollVisibleTarget_ = false;
 			mutable bool previousHorizontalOverflow_ = false;
 			mutable bool previousVerticalOverflow_ = false;
 			mutable float lastHorizontalMaxScroll_ = 0.0f;
@@ -3388,6 +3534,22 @@ namespace fusion::ui {
 			bool styleOverride_ = false;
 			bool labelStyleOverride_ = false;
 			std::vector<StyledTextRange> styledRanges_;
+			mutable bool cachedTextLayoutValid_ = false;
+			mutable IDWriteTextLayout* cachedTextLayout_ = nullptr;
+			mutable DWRITE_TEXT_METRICS cachedTextLayoutMetrics_{};
+			mutable std::wstring cachedLayoutText_;
+			mutable D2D1_RECT_F cachedLayoutContentRect_{ D2D1::RectF() };
+			mutable float cachedLayoutWidth_ = 0.0f;
+			mutable float cachedLayoutHeight_ = 0.0f;
+			mutable DWRITE_WORD_WRAPPING cachedLayoutWrapping_ = DWRITE_WORD_WRAPPING_NO_WRAP;
+			mutable bool cachedLayoutHasStyleOverride_ = false;
+			mutable TextStyle cachedLayoutStyle_{};
+			mutable std::vector<StyledTextRange> cachedLayoutRanges_;
+			mutable bool cachedSingleLineWidthValid_ = false;
+			mutable std::wstring cachedSingleLineText_;
+			mutable bool cachedSingleLineHasStyleOverride_ = false;
+			mutable TextStyle cachedSingleLineStyle_{};
+			mutable float cachedSingleLineWidth_ = 0.0f;
 			mutable TextLayoutCache labelLayoutCache_;
 			mutable TextLayoutCache contentLayoutCache_;
 		};
@@ -4112,8 +4274,19 @@ namespace fusion::ui {
 			}
 
 			D2D1_RECT_F PopupBounds(float openAmount = 1.0f) const {
-				const float fullHeight = PopupExpandedHeight();
-				return D2D1::RectF(bounds_.left, bounds_.bottom + 6.0f, bounds_.right, bounds_.bottom + 6.0f + fullHeight * openAmount);
+				if (!cachedPopupBoundsValid_
+					|| !detail::NearlyEqual(cachedPopupHostBounds_.left, bounds_.left, 0.01f)
+					|| !detail::NearlyEqual(cachedPopupHostBounds_.top, bounds_.top, 0.01f)
+					|| !detail::NearlyEqual(cachedPopupHostBounds_.right, bounds_.right, 0.01f)
+					|| !detail::NearlyEqual(cachedPopupHostBounds_.bottom, bounds_.bottom, 0.01f)
+					|| !detail::NearlyEqual(cachedPopupOpenAmount_, openAmount, 0.001f)) {
+					const float fullHeight = PopupExpandedHeight();
+					cachedPopupHostBounds_ = bounds_;
+					cachedPopupOpenAmount_ = openAmount;
+					cachedPopupBounds_ = D2D1::RectF(bounds_.left, bounds_.bottom + 6.0f, bounds_.right, bounds_.bottom + 6.0f + fullHeight * openAmount);
+					cachedPopupBoundsValid_ = true;
+				}
+				return cachedPopupBounds_;
 			}
 
 			float PopupRowHeight() const {
@@ -4309,6 +4482,10 @@ namespace fusion::ui {
 			mutable std::chrono::steady_clock::time_point popupScrollRevealUntil_{};
 			std::optional<size_t> hoveredIndex_;
 			std::function<void(std::wstring_view)> onChanged_;
+			mutable bool cachedPopupBoundsValid_ = false;
+			mutable D2D1_RECT_F cachedPopupHostBounds_{ D2D1::RectF() };
+			mutable D2D1_RECT_F cachedPopupBounds_{ D2D1::RectF() };
+			mutable float cachedPopupOpenAmount_ = -1.0f;
 			static constexpr size_t kPopupMaxVisibleRows = 5;
 			static constexpr float kPopupScrollGutter = 18.0f;
 		};
@@ -5029,6 +5206,7 @@ namespace fusion::ui {
 				viewport_ = viewport;
 				dpiScale_ = dpiScale;
 				layoutDirty_ = true;
+				hitIndexDirty_ = true;
 				staticLayerDirty_ = true;
 				dynamicDirty_ = true;
 			}
@@ -5071,11 +5249,10 @@ namespace fusion::ui {
 					}
 				}
 				if (captured_) {
+					const float previousScrollOffset = ScrollOffsetForCard(captured_);
 					captured_->OnPointerMove(point);
 					captured_->MarkDirty();
-					if (captured_ == leftCard_ || captured_ == rightCard_) {
-						layoutDirty_ = true;
-					}
+					RefreshCardLayoutIfScrollChanged(captured_, previousScrollOffset);
 				}
 				dynamicDirty_ = true;
 				return;
@@ -5091,9 +5268,10 @@ namespace fusion::ui {
 					captured_ = cardScrollTarget;
 					UpdateCardHoverState(point, cardScrollTarget);
 					currentCursor_ = CursorKind::Arrow;
+					const float previousScrollOffset = cardScrollTarget->ScrollOffset();
 					cardScrollTarget->OnPointerDown(point);
 					cardScrollTarget->MarkDirty();
-					layoutDirty_ = true;
+					RefreshCardLayoutIfScrollChanged(cardScrollTarget, previousScrollOffset);
 					dynamicDirty_ = true;
 					return;
 				}
@@ -5111,11 +5289,10 @@ namespace fusion::ui {
 			}
 			case WM_LBUTTONUP: {
 				if (captured_) {
+					const float previousScrollOffset = ScrollOffsetForCard(captured_);
 					captured_->OnPointerUp(point);
 					captured_->MarkDirty();
-					if (captured_ == leftCard_ || captured_ == rightCard_) {
-						layoutDirty_ = true;
-					}
+					RefreshCardLayoutIfScrollChanged(captured_, previousScrollOffset);
 					captured_ = nullptr;
 					UIComponent* target = PointInViewport(point) ? ResolvePointerTarget(point, true) : nullptr;
 					UpdateCardHoverState(point, target);
@@ -5150,7 +5327,6 @@ namespace fusion::ui {
 					}
 				}
 
-				SyncHitIndex();
 				std::vector<UIComponent*> candidates;
 				hitIndex_.GatherCandidates(point, candidates);
 				std::vector<UIComponent*> ordered;
@@ -5171,9 +5347,10 @@ namespace fusion::ui {
 				}
 
 				if (auto* card = CardAtPoint(point)) {
+					const float previousScrollOffset = card->ScrollOffset();
 					if (card->OnMouseWheel(delta, point)) {
 						card->MarkDirty();
-						layoutDirty_ = true;
+						RefreshCardLayoutIfScrollChanged(card, previousScrollOffset);
 						dynamicDirty_ = true;
 					}
 				}
@@ -5282,7 +5459,9 @@ namespace fusion::ui {
 				lastFrameCacheRebuildCount_ += comboBox_->RenderCached(targetContext) ? 1 : 0;
 				++lastFrameRenderedComponentCount_;
 			}
+#ifndef NDEBUG
 			RenderCacheDiagnostics(targetContext);
+#endif
 			dynamicDirty_ = false;
 		}
 
@@ -5384,6 +5563,7 @@ namespace fusion::ui {
 		}
 
 		void RenderCacheDiagnostics(ID2D1DeviceContext* context) {
+#ifndef NDEBUG
 			if (!context || !captionFormat_) {
 				return;
 			}
@@ -5393,6 +5573,72 @@ namespace fusion::ui {
 			std::wstringstream ss;
 			ss << L"Dirty redraws " << lastFrameCacheRebuildCount_ << L" / " << lastFrameRenderedComponentCount_;
 			detail::DrawStyledText(context, graphics_.dwriteFactory.Get(), captionFormat_.Get(), detail::PrepareSharedBrush(context, detail::SharedBrushSlot::Tertiary, detail::MakeColor(0.09f, 0.09f, 0.11f, 1.0f)), ss.str(), D2D1::RectF(panel.left + 10.0f, panel.top + 1.0f, panel.right - 10.0f, panel.bottom - 1.0f));
+#else
+			(void)context;
+#endif
+		}
+
+		bool RectEquals(const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) const {
+			return detail::NearlyEqual(lhs.left, rhs.left, 0.01f)
+				&& detail::NearlyEqual(lhs.top, rhs.top, 0.01f)
+				&& detail::NearlyEqual(lhs.right, rhs.right, 0.01f)
+				&& detail::NearlyEqual(lhs.bottom, rhs.bottom, 0.01f);
+		}
+
+		bool ApplyArrangedBounds(UIComponent* component, const D2D1_RECT_F& bounds) {
+			if (!component) {
+				return false;
+			}
+			auto remembered = lastLayoutBounds_.find(component);
+			if (remembered != lastLayoutBounds_.end() && RectEquals(remembered->second, bounds)) {
+				return false;
+			}
+			lastLayoutBounds_[component] = bounds;
+			component->SetBounds(bounds);
+			return true;
+		}
+
+		std::span<UIComponent*> LayoutItemsForCard(CardSurface* card) {
+			if (card == leftCard_) {
+				return std::span<UIComponent*>(leftLayoutOrder_.data(), leftLayoutOrder_.size());
+			}
+			if (card == rightCard_) {
+				return std::span<UIComponent*>(rightLayoutOrder_.data(), rightLayoutOrder_.size());
+			}
+			return {};
+		}
+
+		float ScrollOffsetForCard(UIComponent* component) const {
+			auto* card = dynamic_cast<CardSurface*>(component);
+			return card ? card->ScrollOffset() : -1.0f;
+		}
+
+		void UpsertHitIndex(std::span<UIComponent*> items) {
+			for (auto* item : items) {
+				if (item) {
+					hitIndex_.Upsert(item);
+				}
+			}
+			hitIndexDirty_ = false;
+		}
+
+		void RefreshCardLayout(CardSurface* card) {
+			if (!card) {
+				return;
+			}
+			ArrangeCard(card, LayoutItemsForCard(card));
+			hitIndex_.Upsert(card);
+			UpsertHitIndex(LayoutItemsForCard(card));
+		}
+
+		void RefreshCardLayoutIfScrollChanged(UIComponent* component, float previousScrollOffset) {
+			auto* card = dynamic_cast<CardSurface*>(component);
+			if (!card || previousScrollOffset < 0.0f) {
+				return;
+			}
+			if (!detail::NearlyEqual(previousScrollOffset, card->ScrollOffset(), 0.05f)) {
+				RefreshCardLayout(card);
+			}
 		}
 
 		void ArrangeCard(CardSurface* card, std::span<UIComponent*> items) {
@@ -5666,8 +5912,8 @@ namespace fusion::ui {
 				const float cardWidth = (std::min)(detail::kCardWidth, (availableWidth - gap) * 0.5f);
 				const D2D1_RECT_F leftCardBounds = D2D1::RectF(viewport_.left + 24.0f, top, viewport_.left + 24.0f + cardWidth, bottom);
 				const D2D1_RECT_F rightCardBounds = D2D1::RectF(leftCardBounds.right + gap, top, leftCardBounds.right + gap + cardWidth, bottom);
-				leftCard_->SetBounds(leftCardBounds);
-				rightCard_->SetBounds(rightCardBounds);
+				ApplyArrangedBounds(leftCard_, leftCardBounds);
+				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(leftCard_, leftLayoutOrder_);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
 			}
@@ -5682,7 +5928,7 @@ namespace fusion::ui {
 				}
 				const float cardWidth = (std::min)(detail::kCardWidth, (std::max)(300.0f, availableWidth));
 				const D2D1_RECT_F rightCardBounds = D2D1::RectF(viewport_.right - cardWidth - 24.0f, top, viewport_.right - 24.0f, bottom);
-				rightCard_->SetBounds(rightCardBounds);
+				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
 			}
 
@@ -5731,17 +5977,7 @@ namespace fusion::ui {
 				}
 			}
 			hitIndex_.Rebuild(hittable, viewport_);
-		}
-
-		void SyncHitIndex() {
-			if (layoutDirty_) {
-				return;
-			}
-			for (const auto& component : components_) {
-				if (component) {
-					hitIndex_.Upsert(component.get());
-				}
-			}
+			hitIndexDirty_ = false;
 		}
 
 		void ClearHover() {
@@ -5781,7 +6017,6 @@ namespace fusion::ui {
 			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup() && comboBox_->HitTest(graphics_.d2dFactory.Get(), point)) {
 				return comboBox_;
 			}
-			SyncHitIndex();
 			return hitIndex_.QueryTopHit(point, graphics_.d2dFactory.Get());
 		}
 
@@ -5824,7 +6059,9 @@ namespace fusion::ui {
 		std::vector<UIComponent*> rightLayoutOrder_;
 		std::vector<UIComponent*> focusOrder_;
 		std::unique_ptr<LayoutBase> layout_;
+		std::unordered_map<UIComponent*, D2D1_RECT_F> lastLayoutBounds_;
 		QuadtreeHitIndex hitIndex_{};
+		bool hitIndexDirty_ = true;
 		UIComponent* hovered_ = nullptr;
 		UIComponent* focused_ = nullptr;
 		UIComponent* captured_ = nullptr;
