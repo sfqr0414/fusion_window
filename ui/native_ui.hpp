@@ -3914,6 +3914,7 @@ namespace fusion::ui {
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
 			bool IsAnimating() const override { return UIComponent::IsAnimating() || openAnimation_.IsAnimating(); }
+			bool WantsFrameTick() const override { return HasOpenPopup() || PopupScrollRevealActive(); }
 
 			void SetTextStyle(const TextStyle& style) {
 				textStyle_ = style;
@@ -3925,11 +3926,12 @@ namespace fusion::ui {
 			}
 
 			bool HitTest(ID2D1Factory1*, D2D1_POINT_2F point) const override {
-				return PointInRect(bounds_, point) || (open_ && PointInRect(PopupBounds(), point));
+				return PointInRect(bounds_, point) || (HasOpenPopup() && PointInRect(PopupBounds(openAnimation_.Value()), point));
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
 				const float openAmount = openAnimation_.Value();
+				UpdatePopupScrollBarAnimation(ShouldRevealPopupScrollBar());
 				context->FillRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.5f + 0.5f * (std::max)(FocusProgress(), openAmount)), 1.0f + (std::max)(FocusProgress(), openAmount));
 				if (!items_.empty()) {
@@ -3938,63 +3940,138 @@ namespace fusion::ui {
 					const float textTop = bounds_.top + (std::max)(0.0f, std::floor(((bounds_.bottom - bounds_.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
 					DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), selected, D2D1::RectF(bounds_.left + 14.0f, textTop, bounds_.right - 30.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f), textStyleOverride_ ? &textStyle_ : nullptr);
 				}
-				auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_);
-				context->DrawLine(D2D1::Point2F(bounds_.right - 18.0f, bounds_.top + 14.0f), D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), outlineBrush, 1.8f);
-				context->DrawLine(D2D1::Point2F(bounds_.right - 12.0f, bounds_.top + 22.0f), D2D1::Point2F(bounds_.right - 6.0f, bounds_.top + 14.0f), outlineBrush, 1.8f);
+				DrawIndicatorChevron(context, openAmount);
 				if (openAmount <= 0.01f) {
 					return;
 				}
 				D2D1_RECT_F popup = PopupBounds(openAmount);
 				context->FillRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				context->DrawRoundedRectangle(D2D1::RoundedRect(popup, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.5f);
-				for (size_t index = 0; index < items_.size(); ++index) {
-					D2D1_RECT_F rowRect = PopupRowRect(popup, index);
-					const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), items_[index], textStyleOverride_ ? &textStyle_ : nullptr);
-					const float textTop = rowRect.top + (std::max)(0.0f, std::floor(((rowRect.bottom - rowRect.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
-					const D2D1_RECT_F textRect = D2D1::RectF(rowRect.left + 12.0f, textTop, rowRect.right - 12.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f);
-					if (hoveredIndex_ && *hoveredIndex_ == index) {
-						context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.18f));
+				const bool renderScrollBar = NeedsPopupScrollBar() || PopupScrollBarOpacity() > 0.01f;
+				const D2D1_RECT_F popupContent = PopupContentBounds(popup, renderScrollBar);
+				if (popupContent.right > popupContent.left && popupContent.bottom > popupContent.top) {
+					context->PushAxisAlignedClip(popupContent, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+					for (size_t index = 0; index < items_.size(); ++index) {
+						D2D1_RECT_F rowRect = PopupRowRect(popupContent, index);
+						if (rowRect.bottom < popupContent.top || rowRect.top > popupContent.bottom) {
+							continue;
+						}
+						const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), items_[index], textStyleOverride_ ? &textStyle_ : nullptr);
+						const float textTop = rowRect.top + (std::max)(0.0f, std::floor(((rowRect.bottom - rowRect.top) - (std::max)(metrics.height, detail::kLineHeight)) * 0.5f));
+						const D2D1_RECT_F textRect = D2D1::RectF(rowRect.left + 12.0f, textTop, rowRect.right - 12.0f, textTop + (std::max)(metrics.height, detail::kLineHeight) + 1.0f);
+						if (index == selectedIndex_) {
+							context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, 0.14f + 0.1f * openAmount));
+						}
+						if (hoveredIndex_ && *hoveredIndex_ == index) {
+							context->FillRoundedRectangle(D2D1::RoundedRect(rowRect, 8.0f, 8.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, accentColor_, index == selectedIndex_ ? 0.26f : 0.18f));
+						}
+						DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
 					}
-					DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyleOverride_ ? textStyle_.color : textColor_), items_[index], textRect, textStyleOverride_ ? &textStyle_ : nullptr);
+					context->PopAxisAlignedClip();
+				}
+				if (renderScrollBar) {
+					DrawRadixScrollbar(context, MakePopupScrollState(popup), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), PopupScrollBarOpacity());
 				}
 			}
 
 			void OnPointerMove(D2D1_POINT_2F point) override {
-				if (!open_) {
+				if (!HasOpenPopup()) {
 					return;
+				}
+				const D2D1_RECT_F popup = PopupBounds(openAnimation_.Value());
+				if (popupDraggingScroll_ && pressed_ && NeedsPopupScrollBar()) {
+					TouchPopupScrollReveal();
+					const auto state = MakePopupScrollState(popup);
+					const auto track = state.TrackBounds();
+					const auto thumb = state.ThumbBounds();
+					const float travel = (std::max)(1.0f, (track.bottom - track.top) - (thumb.bottom - thumb.top));
+					popupScrollOffset_ = (std::clamp)(popupScrollOrigin_ + ((point.y - popupDragOriginY_) / travel) * PopupMaxScrollOffset(), 0.0f, PopupMaxScrollOffset());
+					return;
+				}
+				popupScrollBarHovered_ = NeedsPopupScrollBar() && MakePopupScrollState(popup).HitTrack(point);
+				if (popupScrollBarHovered_) {
+					TouchPopupScrollReveal();
 				}
 				hoveredIndex_ = PopupRowFromPoint(point);
 			}
 
 			void OnAttachAnimations() override {
+				RegisterAnimationSlot(L"popupScrollbarVisibility", 0.0f);
 				if (animator_) {
 					animator_->Attach(openAnimation_, open_ ? 1.0f : 0.0f);
 				}
 			}
 
-			void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
+			void OnPointerDown(D2D1_POINT_2F point) override {
+				UIComponent::OnPointerDown(point);
+				if (!HasOpenPopup() || !NeedsPopupScrollBar()) {
+					return;
+				}
+				const D2D1_RECT_F popup = PopupBounds(openAnimation_.Value());
+				auto state = MakePopupScrollState(popup);
+				if (!state.HitTrack(point)) {
+					return;
+				}
+				popupDraggingScroll_ = true;
+				popupScrollBarHovered_ = true;
+				TouchPopupScrollReveal();
+				popupDragOriginY_ = point.y;
+				popupScrollOrigin_ = popupScrollOffset_;
+				if (!state.HitThumb(point)) {
+					popupScrollOffset_ = (std::clamp)(ScrollbarOffsetForPointer(state, point.y), 0.0f, PopupMaxScrollOffset());
+					popupScrollOrigin_ = popupScrollOffset_;
+				}
+			}
 
 			void OnPointerUp(D2D1_POINT_2F point) override {
 				if (!pressed_) {
 					return;
 				}
+				const bool wasDraggingScroll = popupDraggingScroll_;
 				UIComponent::OnPointerUp(point);
-				if (PointInRect(bounds_, point)) {
-					open_ = !open_;
-					Animate(openAnimation_, open_ ? 1.0f : 0.0f, 0.14);
+				if (wasDraggingScroll) {
+					popupDraggingScroll_ = false;
+					popupScrollBarHovered_ = HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point);
+					if (popupScrollBarHovered_) {
+						TouchPopupScrollReveal();
+					}
 					return;
 				}
-				if (open_) {
+				if (PointInRect(bounds_, point)) {
+					TogglePopup();
+					return;
+				}
+				if (HasOpenPopup()) {
 					auto row = PopupRowFromPoint(point);
 					if (row && *row < items_.size()) {
-						selectedIndex_ = *row;
-						if (onChanged_) {
-							onChanged_(items_[selectedIndex_]);
-						}
+						SelectIndex(*row);
 					}
-					open_ = false;
-					Animate(openAnimation_, 0.0f, 0.14);
+					ClosePopup();
 				}
+			}
+
+			void OnHover(bool hovered) override {
+				UIComponent::OnHover(hovered);
+				if (!hovered && !popupDraggingScroll_) {
+					popupScrollBarHovered_ = false;
+					if (!HasOpenPopup()) {
+						hoveredIndex_.reset();
+					}
+				}
+			}
+
+			bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
+				if (!HasOpenPopup() || !PointInRect(PopupBounds(openAnimation_.Value()), point) || !NeedsPopupScrollBar()) {
+					return false;
+				}
+				const float previous = popupScrollOffset_;
+				popupScrollOffset_ = (std::clamp)(popupScrollOffset_ + (delta > 0 ? -PopupRowHeight() : PopupRowHeight()), 0.0f, PopupMaxScrollOffset());
+				const bool changed = !NearlyEqual(previous, popupScrollOffset_, 0.05f);
+				if (changed) {
+					TouchPopupScrollReveal();
+				}
+				hoveredIndex_ = PopupRowFromPoint(point);
+				return changed;
 			}
 
 			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
@@ -4002,34 +4079,40 @@ namespace fusion::ui {
 					return;
 				}
 				if (key == VK_SPACE || key == VK_RETURN) {
-					open_ = !open_;
-					Animate(openAnimation_, open_ ? 1.0f : 0.0f, 0.14);
+					TogglePopup();
 					return;
 				}
 				if (key == VK_ESCAPE) {
-					open_ = false;
-					Animate(openAnimation_, 0.0f, 0.14);
+					ClosePopup();
 					return;
 				}
 				if (key == VK_UP && selectedIndex_ > 0) {
-					--selectedIndex_;
+					SelectIndex(selectedIndex_ - 1);
+					return;
 				}
 				if (key == VK_DOWN && selectedIndex_ + 1 < items_.size()) {
-					++selectedIndex_;
-				}
-				if (onChanged_) {
-					onChanged_(items_[selectedIndex_]);
+					SelectIndex(selectedIndex_ + 1);
 				}
 			}
 
 		private:
 			std::size_t ExtraRenderFingerprint() const override {
 				const std::size_t hovered = hoveredIndex_.has_value() ? (*hoveredIndex_ + 1) : 0;
-				return (selectedIndex_ << 1) ^ (hovered << 3) ^ (static_cast<std::size_t>(open_) << 5) ^ (static_cast<std::size_t>(std::lround(openAnimation_.Value() * 1000.0f)) << 6);
+				const std::size_t quantizedScroll = static_cast<std::size_t>(std::lround(popupScrollOffset_ * 1000.0f));
+				const std::size_t quantizedOpen = static_cast<std::size_t>(std::lround(openAnimation_.Value() * 1000.0f));
+				const std::size_t quantizedScrollBar = static_cast<std::size_t>(std::lround(PopupScrollBarOpacity() * 1000.0f));
+				return (selectedIndex_ << 1)
+					^ (hovered << 3)
+					^ (static_cast<std::size_t>(open_) << 5)
+					^ (quantizedOpen << 6)
+					^ (quantizedScroll << 7)
+					^ (quantizedScrollBar << 8)
+					^ (static_cast<std::size_t>(popupScrollBarHovered_) << 9)
+					^ (static_cast<std::size_t>(popupDraggingScroll_) << 10);
 			}
 
 			D2D1_RECT_F PopupBounds(float openAmount = 1.0f) const {
-				const float fullHeight = static_cast<float>(items_.size()) * PopupRowHeight() + 12.0f;
+				const float fullHeight = PopupExpandedHeight();
 				return D2D1::RectF(bounds_.left, bounds_.bottom + 6.0f, bounds_.right, bounds_.bottom + 6.0f + fullHeight * openAmount);
 			}
 
@@ -4037,22 +4120,172 @@ namespace fusion::ui {
 				return 28.0f;
 			}
 
-			D2D1_RECT_F PopupRowRect(const D2D1_RECT_F& popup, size_t index) const {
-				const float rowTop = popup.top + 6.0f + static_cast<float>(index) * PopupRowHeight();
-				return D2D1::RectF(popup.left + 6.0f, rowTop + 1.0f, popup.right - 6.0f, rowTop + PopupRowHeight() - 3.0f);
+			float PopupExpandedHeight() const {
+				return static_cast<float>(PopupVisibleRows()) * PopupRowHeight() + 12.0f;
+			}
+
+			size_t PopupVisibleRows() const {
+				return (std::min)(items_.size(), kPopupMaxVisibleRows);
+			}
+
+			float PopupContentHeight() const {
+				return static_cast<float>(items_.size()) * PopupRowHeight() + 12.0f;
+			}
+
+			float PopupMaxScrollOffset() const {
+				return (std::max)(0.0f, PopupContentHeight() - PopupExpandedHeight());
+			}
+
+			bool NeedsPopupScrollBar() const {
+				return PopupMaxScrollOffset() > 0.5f;
+			}
+
+			D2D1_RECT_F PopupContentBounds(const D2D1_RECT_F& popup, bool reserveScrollbar) const {
+				D2D1_RECT_F content = D2D1::RectF(popup.left + 6.0f, popup.top + 6.0f, popup.right - 6.0f, popup.bottom - 6.0f);
+				if (reserveScrollbar) {
+					content.right = (std::max)(content.left + 1.0f, content.right - kPopupScrollGutter);
+				}
+				content.bottom = (std::max)(content.top + 1.0f, content.bottom);
+				return content;
+			}
+
+			D2D1_RECT_F PopupRowRect(const D2D1_RECT_F& popupContent, size_t index) const {
+				const float rowTop = popupContent.top + static_cast<float>(index) * PopupRowHeight() - popupScrollOffset_;
+				return D2D1::RectF(popupContent.left + 1.0f, rowTop + 1.0f, popupContent.right - 1.0f, rowTop + PopupRowHeight() - 3.0f);
+			}
+
+			ScrollbarState MakePopupScrollState(const D2D1_RECT_F& popup) const {
+				ScrollbarState state{ ScrollOrientation::Vertical };
+				state.viewport = popup;
+				state.contentExtent = PopupContentHeight();
+				state.offset = popupScrollOffset_;
+				state.inset = 6.0f;
+				state.edgePadding = 2.0f;
+				state.hovered = popupScrollBarHovered_ || popupDraggingScroll_;
+				state.dragging = popupDraggingScroll_;
+				return state;
+			}
+
+			float PopupScrollBarOpacity() const {
+				return AnimationSlotValue(L"popupScrollbarVisibility", 0.0f);
+			}
+
+			bool PopupScrollRevealActive() const {
+				return popupScrollRevealUntil_ > std::chrono::steady_clock::now();
+			}
+
+			void TouchPopupScrollReveal() const {
+				popupScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+			}
+
+			bool ShouldRevealPopupScrollBar() const {
+				return NeedsPopupScrollBar() && HasOpenPopup() && (popupScrollBarHovered_ || popupDraggingScroll_ || PopupScrollRevealActive());
+			}
+
+			void UpdatePopupScrollBarAnimation(bool visible) {
+				if (visible == popupScrollBarVisibleTarget_) {
+					return;
+				}
+				popupScrollBarVisibleTarget_ = visible;
+				AnimateSlotLinear(L"popupScrollbarVisibility", visible ? 1.0f : 0.0f, 0.16);
+			}
+
+			void EnsureSelectedVisible() {
+				if (items_.empty()) {
+					popupScrollOffset_ = 0.0f;
+					return;
+				}
+				const float rowTop = static_cast<float>(selectedIndex_) * PopupRowHeight();
+				const float rowBottom = rowTop + PopupRowHeight();
+				if (rowTop < popupScrollOffset_) {
+					popupScrollOffset_ = rowTop;
+				}
+				else if (rowBottom > popupScrollOffset_ + PopupExpandedHeight() - 12.0f) {
+					popupScrollOffset_ = rowBottom - (PopupExpandedHeight() - 12.0f);
+				}
+				popupScrollOffset_ = (std::clamp)(popupScrollOffset_, 0.0f, PopupMaxScrollOffset());
+			}
+
+			void SelectIndex(size_t index) {
+				if (items_.empty()) {
+					return;
+				}
+				selectedIndex_ = (std::min)(index, items_.size() - 1);
+				EnsureSelectedVisible();
+				hoveredIndex_ = selectedIndex_;
+				if (onChanged_) {
+					onChanged_(items_[selectedIndex_]);
+				}
+			}
+
+			void TogglePopup() {
+				if (open_) {
+					ClosePopup();
+				}
+				else {
+					OpenPopup();
+				}
+			}
+
+			void OpenPopup() {
+				open_ = true;
+				popupDraggingScroll_ = false;
+				popupScrollBarHovered_ = false;
+				hoveredIndex_ = items_.empty() ? std::nullopt : std::optional<size_t>(selectedIndex_);
+				EnsureSelectedVisible();
+				Animate(openAnimation_, 1.0f, 0.14);
+				if (NeedsPopupScrollBar()) {
+					TouchPopupScrollReveal();
+				}
+			}
+
+			void ClosePopup() {
+				open_ = false;
+				popupDraggingScroll_ = false;
+				popupScrollBarHovered_ = false;
+				hoveredIndex_.reset();
+				UpdatePopupScrollBarAnimation(false);
+				Animate(openAnimation_, 0.0f, 0.14);
+			}
+
+			void DrawIndicatorChevron(ID2D1DeviceContext* context, float openAmount) {
+				auto* outlineBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.72f + 0.28f * openAmount);
+				const float centerX = bounds_.right - 12.0f;
+				const float leftX = centerX - 6.0f;
+				const float rightX = centerX + 6.0f;
+				const float upperY = bounds_.top + 14.0f;
+				const float lowerY = bounds_.top + 22.0f;
+				const float sideY = upperY + (lowerY - upperY) * openAmount;
+				const float tipY = lowerY - (lowerY - upperY) * openAmount;
+				context->DrawLine(D2D1::Point2F(leftX, sideY), D2D1::Point2F(centerX, tipY), outlineBrush, 1.8f);
+				context->DrawLine(D2D1::Point2F(centerX, tipY), D2D1::Point2F(rightX, sideY), outlineBrush, 1.8f);
 			}
 
 			std::optional<size_t> PopupRowFromPoint(D2D1_POINT_2F point) const {
-				D2D1_RECT_F popup = PopupBounds();
+				D2D1_RECT_F popup = PopupBounds(openAnimation_.Value());
 				if (!PointInRect(popup, point)) {
 					return std::nullopt;
 				}
-				const float relativeY = point.y - popup.top - 6.0f;
+				const bool renderScrollBar = NeedsPopupScrollBar() || PopupScrollBarOpacity() > 0.01f;
+				const D2D1_RECT_F popupContent = PopupContentBounds(popup, renderScrollBar);
+				if (!PointInRect(popupContent, point)) {
+					return std::nullopt;
+				}
+				const float relativeY = point.y - popupContent.top + popupScrollOffset_;
 				if (relativeY < 0.0f) {
 					return std::nullopt;
 				}
 				size_t row = static_cast<size_t>(relativeY / PopupRowHeight());
 				return row < items_.size() ? std::optional<size_t>(row) : std::nullopt;
+			}
+
+			CursorKind CursorAt(D2D1_POINT_2F point) const override {
+				if (HasOpenPopup() && NeedsPopupScrollBar() && MakePopupScrollState(PopupBounds(openAnimation_.Value())).HitTrack(point)) {
+					popupScrollBarHovered_ = true;
+					TouchPopupScrollReveal();
+					return CursorKind::Arrow;
+				}
+				return CursorKind::Arrow;
 			}
 
 			std::vector<std::wstring> items_;
@@ -4067,8 +4300,17 @@ namespace fusion::ui {
 			size_t selectedIndex_ = 0;
 			bool open_ = false;
 			UIAnimation openAnimation_{};
+			float popupScrollOffset_ = 0.0f;
+			bool popupDraggingScroll_ = false;
+			mutable bool popupScrollBarHovered_ = false;
+			bool popupScrollBarVisibleTarget_ = false;
+			float popupDragOriginY_ = 0.0f;
+			float popupScrollOrigin_ = 0.0f;
+			mutable std::chrono::steady_clock::time_point popupScrollRevealUntil_{};
 			std::optional<size_t> hoveredIndex_;
 			std::function<void(std::wstring_view)> onChanged_;
+			static constexpr size_t kPopupMaxVisibleRows = 5;
+			static constexpr float kPopupScrollGutter = 18.0f;
 		};
 
 		class ScrollBar final : public UIComponent {
@@ -4880,7 +5122,7 @@ namespace fusion::ui {
 			rightLayoutOrder_.push_back(listBox_);
 			components_.push_back(std::move(listBox));
 
-			auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release" }, graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, outlineColor, textColor, [this](std::wstring_view value) {
+			auto comboBox = std::make_unique<ComboBox>(std::vector<std::wstring>{ L"Telemetry", L"Diagnostics", L"Staging", L"Release", L"Canary", L"Recovery", L"Support", L"Archive" }, graphics_.dwriteFactory, bodyFormat_, surfaceColor, accentColor, outlineColor, textColor, [this](std::wstring_view value) {
 				std::wstring status = L"Combo box selected: ";
 				status.append(value);
 				SetStatus(status);
