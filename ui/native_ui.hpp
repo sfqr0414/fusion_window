@@ -4,10 +4,12 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -19,6 +21,7 @@
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <windows.h>
@@ -33,6 +36,110 @@
 namespace fusion::ui {
 
 	using Microsoft::WRL::ComPtr;
+
+	template <typename T>
+	class Generator {
+	public:
+		struct promise_type;
+		using handle_type = std::coroutine_handle<promise_type>;
+
+		struct promise_type {
+			T currentValue{};
+
+			auto get_return_object() {
+				return Generator(handle_type::from_promise(*this));
+			}
+
+			std::suspend_always initial_suspend() noexcept {
+				return {};
+			}
+
+			std::suspend_always final_suspend() noexcept {
+				return {};
+			}
+
+			std::suspend_always yield_value(T value) noexcept {
+				currentValue = std::move(value);
+				return {};
+			}
+
+			void return_void() noexcept {}
+
+			void unhandled_exception() {
+				std::terminate();
+			}
+		};
+
+		class iterator {
+		public:
+			iterator() = default;
+			explicit iterator(handle_type coroutine) : coroutine_(coroutine) {}
+
+			iterator& operator++() {
+				if (coroutine_) {
+					coroutine_.resume();
+					if (coroutine_.done()) {
+						coroutine_ = {};
+					}
+				}
+				return *this;
+			}
+
+			const T& operator*() const {
+				return coroutine_.promise().currentValue;
+			}
+
+			bool operator==(std::default_sentinel_t) const {
+				return !coroutine_;
+			}
+		private:
+			handle_type coroutine_{};
+		};
+
+		Generator() = default;
+		explicit Generator(handle_type coroutine) : coroutine_(coroutine) {}
+
+		Generator(Generator&& other) noexcept
+			: coroutine_(std::exchange(other.coroutine_, {})) {
+		}
+
+		Generator& operator=(Generator&& other) noexcept {
+			if (this != &other) {
+				if (coroutine_) {
+					coroutine_.destroy();
+				}
+				coroutine_ = std::exchange(other.coroutine_, {});
+			}
+			return *this;
+		}
+
+		~Generator() {
+			if (coroutine_) {
+				coroutine_.destroy();
+			}
+		}
+
+		iterator begin() {
+			if (!coroutine_) {
+				return iterator();
+			}
+			coroutine_.resume();
+			if (coroutine_.done()) {
+				return iterator();
+			}
+			return iterator(coroutine_);
+		}
+
+		std::default_sentinel_t end() const noexcept {
+			return {};
+		}
+
+		Generator(const Generator&) = delete;
+		Generator& operator=(const Generator&) = delete;
+
+	private:
+		handle_type coroutine_{};
+	};
 
 	struct GraphicsContext {
 		ComPtr<ID2D1Factory1> d2dFactory;
@@ -538,6 +645,10 @@ namespace fusion::ui {
 
 		void UseEqualComparator(Equal equal) {
 			equal_ = std::move(equal);
+		}
+
+		void Touch() {
+			NotifyDirty();
 		}
 
 	private:
@@ -2472,13 +2583,15 @@ namespace fusion::ui {
 
 			void Render(ID2D1DeviceContext* context) override {
 				D2D1_RECT_F box = D2D1::RectF(bounds_.left, bounds_.top + 7.0f, bounds_.left + 22.0f, bounds_.top + 29.0f);
+				TextStyle effectiveStyle = textStyle_.Get();
+				effectiveStyle.verticalAlign = VerticalAlign::Center;
 				context->FillRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				context->DrawRoundedRectangle(D2D1::RoundedRect(box, 6.0f, 6.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 				const float check = checkAnimation_.Value();
 				if (check > 0.01f) {
 					context->FillRoundedRectangle(D2D1::RoundedRect(InflateRect(box, 3.0f), 4.0f, 4.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.45f + 0.35f * check + 0.2f * HoverProgress()));
 				}
-				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyle_->color), text_.Get(), D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), &textStyle_.Get());
+				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, effectiveStyle.color), text_.Get(), D2D1::RectF(box.right + 12.0f, bounds_.top, bounds_.right, bounds_.bottom), &effectiveStyle);
 			}
 
 			void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
@@ -2540,11 +2653,13 @@ namespace fusion::ui {
 				  selectedValue_(std::move(selectedValue)),
 				  ownValue_(ownValue),
 				  onChanged_(std::move(onChanged)),
+				  selected_(selectedValue_ && selectedValue_->Get() == ownValue_, [this]() { MarkCacheDirty(); }),
 				  textStyle_(MakeTextStyleProperty(CaptureTextStyle(format_.Get(), textColor), [this]() { MarkContentChanged(); })),
 				  text(text_),
+				  selected(selected_),
 				  textStyle(textStyle_) {
 				if (selectedValue_) {
-					selectedValue_->AddOnDirty([this]() { MarkCacheDirty(); });
+						selectedValue_->AddOnDirty([this]() { SyncSelectionState(); });
 				}
 			}
 
@@ -2554,48 +2669,65 @@ namespace fusion::ui {
 
 			void OnAttachAnimations() override {
 				if (animator_) {
-					animator_->Attach(selectionAnimation_, selectedValue_ && selectedValue_->Get() == ownValue_ ? 1.0f : 0.0f);
+					animator_->Attach(selectionAnimation_, selected_ ? 1.0f : 0.0f);
 				}
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
-				Animate(selectionAnimation_, selectedValue_ && selectedValue_->Get() == ownValue_ ? 1.0f : 0.0f, 0.10);
 				const float cx = bounds_.left + 11.0f;
 				const float cy = bounds_.top + 18.0f;
+				TextStyle effectiveStyle = textStyle_.Get();
+				effectiveStyle.verticalAlign = VerticalAlign::Center;
 				context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				context->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.55f + 0.45f * FocusProgress()), 1.0f + FocusProgress());
 				const float selected = selectionAnimation_.Value();
 				if (selected > 0.01f) {
 					context->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx, cy), 3.0f + selected * 2.0f, 3.0f + selected * 2.0f), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, accentColor_, 0.5f + 0.3f * selected + 0.2f * HoverProgress()));
 				}
-				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, textStyle_->color), text_.Get(), D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), &textStyle_.Get());
+				DrawStyledText(context, dwriteFactory_.Get(), format_.Get(), PrepareSharedBrush(context, SharedBrushSlot::Tertiary, effectiveStyle.color), text_.Get(), D2D1::RectF(bounds_.left + 30.0f, bounds_.top, bounds_.right, bounds_.bottom), &effectiveStyle);
 			}
 
 			void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); }
 			void OnPointerUp(D2D1_POINT_2F point) override {
 				if (pressed_ && PointInRect(bounds_, point)) {
-					(*selectedValue_) = ownValue_;
-					Animate(selectionAnimation_, 1.0f, 0.14);
-					if (onChanged_) {
-						onChanged_(ownValue_);
-					}
+					ActivateSelection();
 				}
 				UIComponent::OnPointerUp(point);
 			}
 			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
 				if (key == VK_SPACE || key == VK_RETURN) {
-					(*selectedValue_) = ownValue_;
-					Animate(selectionAnimation_, 1.0f, 0.14);
-					if (onChanged_) {
-						onChanged_(ownValue_);
-					}
+					ActivateSelection();
 				}
 			}
 
 			Property<std::wstring>& text;
+			Property<bool>& selected;
 			TextStyleProperty& textStyle;
 
 		private:
+			void SyncSelectionState() {
+				const bool isSelected = selectedValue_ && selectedValue_->Get() == ownValue_;
+				if (selected_ != isSelected) {
+					selected_ = isSelected;
+					Animate(selectionAnimation_, isSelected ? 1.0f : 0.0f, 0.14);
+					return;
+				}
+				MarkCacheDirty();
+			}
+
+			void ActivateSelection() {
+				const bool wasSelected = selectedValue_ && selectedValue_->Get() == ownValue_;
+				if (selectedValue_) {
+					(*selectedValue_) = ownValue_;
+					if (wasSelected) {
+						selectedValue_->Touch();
+					}
+				}
+				if (onChanged_) {
+					onChanged_(ownValue_);
+				}
+			}
+
 			Property<std::wstring> text_;
 			ComPtr<IDWriteFactory> dwriteFactory_;
 			ComPtr<IDWriteTextFormat> format_;
@@ -2605,6 +2737,7 @@ namespace fusion::ui {
 			TextStyleProperty textStyle_;
 			std::shared_ptr<Property<int>> selectedValue_;
 			int ownValue_ = 0;
+			Property<bool> selected_;
 			UIAnimation selectionAnimation_{};
 			std::function<void(int)> onChanged_;
 		};
@@ -3073,6 +3206,9 @@ namespace fusion::ui {
 						selectionAnchor_ = 0;
 						caret_ = text_.size();
 						desiredCaretX_.reset();
+						ensureCaretVisible_ = true;
+						MarkCacheDirty();
+						ResetCaretBlink();
 						return;
 					case 'C':
 					case 'c':
@@ -3720,6 +3856,7 @@ namespace fusion::ui {
 			}
 
 			void ResetCaretBlink() {
+				MarkCacheDirty();
 				caretTargetVisible_ = true;
 				AnimateLinear(caretOpacityAnimation_, 1.0f, 0.06);
 				nextCaretBlinkToggle_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
@@ -5586,7 +5723,7 @@ namespace fusion::ui {
 		}
 
 		bool NeedsRedraw() const {
-			return HasLayoutDirty() || staticLayerDirty_ || dynamicDirty_ || HasDirtyComponents();
+			return HasLayoutDirty() || zOrderDirty_ || dynamicDirty_ || HasDirtyComponents() || NeedsRenderOrderRefresh();
 		}
 
 		bool NeedsContinuousRedraw() const {
@@ -5606,7 +5743,7 @@ namespace fusion::ui {
 				if (!hitIndex_.ContainsBounds(previousViewport) || !hitIndex_.ContainsBounds(viewport_)) {
 					hitIndexDirty_ = true;
 				}
-				staticLayerDirty_ = true;
+				zOrderDirty_ = true;
 				dynamicDirty_ = true;
 			}
 		}
@@ -5848,15 +5985,20 @@ namespace fusion::ui {
 			}
 			lastFrameCacheRebuildCount_ = 0;
 			lastFrameRenderedComponentCount_ = 0;
-			if (rightCard_ && rightCard_->Visible()) {
-				RenderCard(targetContext, rightCard_, rightLayoutOrder_);
-			}
-			if (leftCard_ && leftCard_->Visible()) {
-				RenderCard(targetContext, leftCard_, leftLayoutOrder_);
-			}
-			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup()) {
-				lastFrameCacheRebuildCount_ += comboBox_->RenderCached(targetContext) ? 1 : 0;
-				++lastFrameRenderedComponentCount_;
+			RefreshComponentClipOwners();
+			UpdateZOrderIfDirty();
+			UpdateStaticSegments(targetContext);
+			auto tasks = GenerateDrawTasks();
+			for (const auto& task : tasks) {
+				if (std::holds_alternative<DrawStaticSegment>(task)) {
+					const auto& staticTask = std::get<DrawStaticSegment>(task);
+					if (staticTask.commandList) {
+						targetContext->DrawImage(staticTask.commandList);
+					}
+					lastFrameRenderedComponentCount_ += static_cast<int>(staticTask.componentCount);
+					continue;
+				}
+				RenderDynamicTask(targetContext, std::get<DrawDynamicControl>(task));
 			}
 #ifndef NDEBUG
 			RenderCacheDiagnostics(targetContext);
@@ -5883,6 +6025,31 @@ namespace fusion::ui {
 		using ScrollBar = detail::ScrollBar;
 		using Knob = detail::Knob;
 		using ScrollOrientation = detail::ScrollOrientation;
+
+		struct RenderEntry {
+			UIComponent* component = nullptr;
+			CardSurface* clipOwner = nullptr;
+
+			bool operator==(const RenderEntry& other) const {
+				return component == other.component && clipOwner == other.clipOwner;
+			}
+		};
+
+		struct DrawStaticSegment {
+			ID2D1CommandList* commandList = nullptr;
+			size_t componentCount = 0;
+		};
+
+		struct DrawDynamicControl {
+			RenderEntry entry{};
+		};
+
+		using DrawTask = std::variant<DrawStaticSegment, DrawDynamicControl>;
+
+		struct StaticSegment {
+			std::vector<RenderEntry> entries;
+			ComPtr<ID2D1CommandList> commandList;
+		};
 
 		UIComponent* ResolveModalComponent(D2D1_POINT_2F point, bool captureOutside) const {
 			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup()) {
@@ -5940,14 +6107,55 @@ namespace fusion::ui {
 			updateCard(rightCard_);
 		}
 
-		void RenderCard(ID2D1DeviceContext* context, CardSurface* card, const std::vector<UIComponent*>& items) {
-			if (!context || !card || !card->Visible()) {
+		Generator<DrawTask> GenerateDrawTasks() const {
+			size_t segmentIndex = 0;
+			for (size_t index = 0; index < sortedComponents_.size();) {
+				auto* component = sortedComponents_[index];
+				if (!component) {
+					++index;
+					continue;
+				}
+				if (component->IsDynamic()) {
+					co_yield DrawDynamicControl{ RenderEntry{ component, ClipOwnerForComponent(component) } };
+					++index;
+					continue;
+				}
+
+				const size_t segmentStart = index;
+				while (index < sortedComponents_.size() && sortedComponents_[index] && !sortedComponents_[index]->IsDynamic()) {
+					++index;
+				}
+				const size_t segmentCount = index - segmentStart;
+				if (segmentIndex < staticSegments_.size() && staticSegments_[segmentIndex].commandList) {
+					co_yield DrawStaticSegment{ staticSegments_[segmentIndex].commandList.Get(), segmentCount };
+				}
+				else {
+					for (size_t itemIndex = segmentStart; itemIndex < index; ++itemIndex) {
+						auto* staticComponent = sortedComponents_[itemIndex];
+						if (staticComponent) {
+							co_yield DrawDynamicControl{ RenderEntry{ staticComponent, ClipOwnerForComponent(staticComponent) } };
+						}
+					}
+				}
+				++segmentIndex;
+			}
+		}
+
+		CardSurface* ClipOwnerForComponent(UIComponent* component) const {
+			auto found = componentClipOwners_.find(component);
+			return found == componentClipOwners_.end() ? nullptr : found->second;
+		}
+
+		void RefreshComponentClipOwners() {
+			componentClipOwners_.clear();
+			AssignClipOwners(leftLayoutOrder_, leftCard_);
+			AssignClipOwners(rightLayoutOrder_, rightCard_);
+		}
+
+		void AssignClipOwners(const std::vector<UIComponent*>& items, CardSurface* card) {
+			if (!card || !card->Visible()) {
 				return;
 			}
-			lastFrameCacheRebuildCount_ += card->RenderCached(context) ? 1 : 0;
-			++lastFrameRenderedComponentCount_;
-			const auto clip = card->ContentClipBounds();
-			context->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 			for (auto* item : items) {
 				if (!item || !item->Visible()) {
 					continue;
@@ -5955,10 +6163,155 @@ namespace fusion::ui {
 				if (item == comboBox_ && comboBox_ && comboBox_->HasOpenPopup()) {
 					continue;
 				}
-				lastFrameCacheRebuildCount_ += item->RenderCached(context) ? 1 : 0;
-				++lastFrameRenderedComponentCount_;
+				componentClipOwners_[item] = card;
 			}
-			context->PopAxisAlignedClip();
+		}
+
+		bool NeedsRenderOrderRefresh() const {
+			if (zOrderDirty_) {
+				return true;
+			}
+			size_t visibleCount = 0;
+			for (const auto& component : components_) {
+				if (component && component->Visible()) {
+					++visibleCount;
+				}
+			}
+			if (visibleCount != sortedComponents_.size()) {
+				return true;
+			}
+			for (size_t index = 0; index < sortedComponents_.size(); ++index) {
+				auto* component = sortedComponents_[index];
+				if (!component || !component->Visible()) {
+					return true;
+				}
+				if (index > 0 && sortedComponents_[index - 1] && sortedComponents_[index - 1]->ZIndex() > component->ZIndex()) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void UpdateZOrderIfDirty() {
+			if (!NeedsRenderOrderRefresh()) {
+				return;
+			}
+			sortedComponents_.clear();
+			sortedComponents_.reserve(components_.size());
+			for (const auto& component : components_) {
+				if (component && component->Visible()) {
+					sortedComponents_.push_back(component.get());
+				}
+			}
+			std::stable_sort(sortedComponents_.begin(), sortedComponents_.end(), [](const UIComponent* lhs, const UIComponent* rhs) {
+				return lhs->ZIndex() < rhs->ZIndex();
+			});
+			zOrderDirty_ = false;
+			hitIndexDirty_ = true;
+			if (!HasLayoutDirty()) {
+				RebuildHitIndex();
+			}
+		}
+
+		bool RenderEntryWithClip(ID2D1DeviceContext* context, const RenderEntry& entry) {
+			if (!context || !entry.component || !entry.component->Visible()) {
+				return false;
+			}
+			const bool useClip = entry.clipOwner && entry.clipOwner->Visible();
+			if (useClip) {
+				context->PushAxisAlignedClip(entry.clipOwner->ContentClipBounds(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+			}
+			const bool rebuilt = entry.component->RenderCached(context);
+			if (useClip) {
+				context->PopAxisAlignedClip();
+			}
+			return rebuilt;
+		}
+
+		void RenderDynamicTask(ID2D1DeviceContext* context, const DrawDynamicControl& task) {
+			if (RenderEntryWithClip(context, task.entry)) {
+				++lastFrameCacheRebuildCount_;
+			}
+			++lastFrameRenderedComponentCount_;
+		}
+
+		bool SameSegmentEntries(const std::vector<RenderEntry>& lhs, const std::vector<RenderEntry>& rhs) const {
+			if (lhs.size() != rhs.size()) {
+				return false;
+			}
+			for (size_t index = 0; index < lhs.size(); ++index) {
+				if (!(lhs[index] == rhs[index])) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		bool SegmentNeedsRebuild(const StaticSegment& segment) const {
+			if (!segment.commandList) {
+				return true;
+			}
+			for (const auto& entry : segment.entries) {
+				if (!entry.component || !entry.component->Visible() || entry.component->NeedsCacheRefresh() || entry.component->NeedsRedraw()) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void RebuildStaticSegment(ID2D1DeviceContext* context, StaticSegment& segment) {
+			if (!context) {
+				return;
+			}
+			ComPtr<ID2D1Image> previousTarget;
+			context->GetTarget(&previousTarget);
+			segment.commandList.Reset();
+			context->CreateCommandList(&segment.commandList);
+			if (!segment.commandList) {
+				return;
+			}
+			context->SetTarget(segment.commandList.Get());
+			for (const auto& entry : segment.entries) {
+				if (RenderEntryWithClip(context, entry)) {
+					++lastFrameCacheRebuildCount_;
+				}
+			}
+			context->SetTarget(previousTarget.Get());
+			segment.commandList->Close();
+		}
+
+		void UpdateStaticSegments(ID2D1DeviceContext* context) {
+			std::vector<StaticSegment> updatedSegments;
+			updatedSegments.reserve(staticSegments_.size());
+			size_t previousSegmentIndex = 0;
+			for (size_t index = 0; index < sortedComponents_.size();) {
+				auto* component = sortedComponents_[index];
+				if (!component) {
+					++index;
+					continue;
+				}
+				if (component->IsDynamic()) {
+					++index;
+					continue;
+				}
+
+				StaticSegment segment;
+				while (index < sortedComponents_.size() && sortedComponents_[index] && !sortedComponents_[index]->IsDynamic()) {
+					auto* staticComponent = sortedComponents_[index];
+					segment.entries.push_back(RenderEntry{ staticComponent, ClipOwnerForComponent(staticComponent) });
+					++index;
+				}
+
+				if (previousSegmentIndex < staticSegments_.size() && SameSegmentEntries(staticSegments_[previousSegmentIndex].entries, segment.entries)) {
+					segment.commandList = staticSegments_[previousSegmentIndex].commandList;
+				}
+				if (SegmentNeedsRebuild(segment)) {
+					RebuildStaticSegment(context, segment);
+				}
+				updatedSegments.push_back(std::move(segment));
+				++previousSegmentIndex;
+			}
+			staticSegments_ = std::move(updatedSegments);
 		}
 
 		void RenderCacheDiagnostics(ID2D1DeviceContext* context) {
@@ -6004,6 +6357,7 @@ namespace fusion::ui {
 			}
 			component->visible = visible;
 			QueueHitIndexUpdate(component);
+			zOrderDirty_ = true;
 			return true;
 		}
 
@@ -6145,7 +6499,7 @@ namespace fusion::ui {
 				FlushHitIndexUpdates();
 			}
 			layoutDirtyFlags_ = kLayoutDirtyNone;
-			staticLayerDirty_ = true;
+			zOrderDirty_ = true;
 			return true;
 		}
 
@@ -6445,31 +6799,7 @@ namespace fusion::ui {
 				FlushHitIndexUpdates();
 			}
 			layoutDirtyFlags_ = kLayoutDirtyNone;
-			staticLayerDirty_ = true;
-		}
-
-		void RebuildStaticLayer() {
-			if (!graphics_.d2dContext) {
-				return;
-			}
-			ComPtr<ID2D1Image> previousTarget;
-			graphics_.d2dContext->GetTarget(&previousTarget);
-			staticLayer_.Reset();
-			graphics_.d2dContext->CreateCommandList(&staticLayer_);
-			if (!staticLayer_) {
-				return;
-			}
-			graphics_.d2dContext->SetTarget(staticLayer_.Get());
-			graphics_.d2dContext->BeginDraw();
-			for (const auto& component : components_) {
-				if (component->Visible() && !component->IsDynamic()) {
-					component->Render(graphics_.d2dContext.Get());
-				}
-			}
-			graphics_.d2dContext->EndDraw();
-			staticLayer_->Close();
-			graphics_.d2dContext->SetTarget(previousTarget.Get());
-			staticLayerDirty_ = false;
+			zOrderDirty_ = true;
 		}
 
 		void RebuildHitIndex() {
@@ -6569,10 +6899,9 @@ namespace fusion::ui {
 		static constexpr unsigned kLayoutDirtySize = 1u << 1;
 		static constexpr unsigned kLayoutDirtyAll = kLayoutDirtyStructure | kLayoutDirtySize;
 		unsigned layoutDirtyFlags_ = kLayoutDirtyAll;
-		bool staticLayerDirty_ = true;
+		bool zOrderDirty_ = true;
 		bool dynamicDirty_ = true;
 
-		ComPtr<ID2D1CommandList> staticLayer_;
 		ComPtr<IDWriteTextFormat> titleFormat_;
 		ComPtr<IDWriteTextFormat> buttonFormat_;
 		ComPtr<IDWriteTextFormat> bodyFormat_;
@@ -6580,6 +6909,9 @@ namespace fusion::ui {
 		ComPtr<IDWriteTextFormat> captionFormat_;
 
 		std::vector<std::unique_ptr<UIComponent>> components_;
+		std::vector<UIComponent*> sortedComponents_;
+		std::vector<StaticSegment> staticSegments_;
+		std::unordered_map<UIComponent*, CardSurface*> componentClipOwners_;
 		std::vector<UIComponent*> leftLayoutOrder_;
 		std::vector<UIComponent*> rightLayoutOrder_;
 		std::vector<UIComponent*> focusOrder_;

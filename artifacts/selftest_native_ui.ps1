@@ -684,6 +684,11 @@ if ($twoColumn) {
     Click-Client $checkboxX $checkboxY
     Click-Client $radio2X $radio2Y
     Click-Client $radio1X $radio1Y
+    for ($i = 0; $i -lt 4; $i++) {
+        Click-Client $radio1X $radio1Y
+        Start-Sleep -Milliseconds 45
+    }
+    Save-Capture 'native_ui_00c_radio_rapid_same.png'
     Drag-Client $sliderStartX $sliderY $sliderEndX $sliderY
     Drag-Client $previewHScrollStartX $previewHScrollY $previewHScrollEndX $previewHScrollY
     Drag-Client $previewVScrollX $previewVScrollStartY $previewVScrollX $previewVScrollEndY
