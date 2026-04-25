@@ -153,6 +153,7 @@ namespace fusion::ui {
 		std::function<void(int)> onAimStyleChanged;
 		std::function<void(float)> onAimRadiusChanged;
 		std::function<void()> onResetCanvas;
+		std::function<void(bool)> onTextInputFocusChanged;
 	};
 
 	struct KeyModifiers {
@@ -4213,8 +4214,14 @@ namespace fusion::ui {
 				if (!layout || imeActive_ || !HasSelection()) {
 					return;
 				}
-				const size_t start = SelectionStart();
-				const size_t length = SelectionLength();
+				const size_t textLength = DisplayText().size();
+				const size_t start = (std::min)(SelectionStart(), textLength);
+				const size_t length = (std::min)(SelectionLength(), textLength - start);
+				if (length == 0) {
+					cachedSelectionMetrics_.clear();
+					selectionMetricsDirty_ = true;
+					return;
+				}
 				if (selectionMetricsDirty_
 					|| cachedSelectionLayout_ != layout
 					|| start != cachedSelectionStart_
@@ -4252,17 +4259,35 @@ namespace fusion::ui {
 				if (!layout || !imeActive_ || imeComposition_.empty()) {
 					return;
 				}
-				std::array<DWRITE_HIT_TEST_METRICS, 8> stackMetrics{};
+				const UINT32 textLength = static_cast<UINT32>(DisplayText().size());
+				const UINT32 start = (std::min)(static_cast<UINT32>(compositionAnchor_), textLength);
+				const UINT32 rawLength = static_cast<UINT32>(imeComposition_.size());
+				const UINT32 length = (std::min)(rawLength, textLength - start);
+				if (length == 0) {
+					return;
+				}
+
 				UINT32 actualCount = 0;
-				const UINT32 start = static_cast<UINT32>(compositionAnchor_);
-				const UINT32 length = static_cast<UINT32>(imeComposition_.size());
-				HRESULT hr = layout->HitTestTextRange(start, length, origin.x, origin.y, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
+				HRESULT hr = layout->HitTestTextRange(start, length, 0.0f, 0.0f, nullptr, 0, &actualCount);
+				if (FAILED(hr) && hr != E_NOT_SUFFICIENT_BUFFER && hr != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+					return;
+				}
+				if (actualCount == 0) {
+					return;
+				}
+
+				std::vector<DWRITE_HIT_TEST_METRICS> metrics(actualCount);
+				hr = layout->HitTestTextRange(start, length, 0.0f, 0.0f, metrics.data(), actualCount, &actualCount);
 				if (FAILED(hr)) {
 					return;
 				}
-				for (UINT32 index = 0; index < actualCount; ++index) {
-					const auto& metric = stackMetrics[index];
-					context->DrawLine(D2D1::Point2F(metric.left, metric.top + metric.height + 1.0f), D2D1::Point2F(metric.left + metric.width, metric.top + metric.height + 1.0f), outlineBrush, 1.0f);
+				metrics.resize(actualCount);
+				for (const auto& metric : metrics) {
+					context->DrawLine(
+						D2D1::Point2F(origin.x + metric.left, origin.y + metric.top + metric.height + 1.0f),
+						D2D1::Point2F(origin.x + metric.left + metric.width, origin.y + metric.top + metric.height + 1.0f),
+						outlineBrush,
+						1.0f);
 				}
 			}
 
@@ -7819,12 +7844,20 @@ namespace fusion::ui {
 			if (focused_ == component) {
 				return;
 			}
+			auto isTextInput = [](UIComponent* target) {
+				return dynamic_cast<TextInput*>(target) != nullptr;
+			};
+			const bool hadTextInputFocus = isTextInput(focused_);
+			const bool nextTextInputFocus = isTextInput(component);
 			if (focused_) {
 				focused_->OnFocus(false);
 			}
 			focused_ = component;
 			if (focused_) {
 				focused_->OnFocus(true);
+			}
+			if (hadTextInputFocus != nextTextInputFocus && callbacks_.onTextInputFocusChanged) {
+				callbacks_.onTextInputFocusChanged(nextTextInputFocus);
 			}
 		}
 

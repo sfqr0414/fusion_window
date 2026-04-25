@@ -422,6 +422,9 @@ std::atomic<int> g_UiVisualBottom{ 0 };
 std::atomic<bool> g_InjectedCtrlDown{ false };
 std::atomic<bool> g_InjectedShiftDown{ false };
 std::atomic<bool> g_InjectedAltDown{ false };
+constexpr UINT WM_APP_SET_TEXTINPUT_IME = WM_APP + 0x4A;
+HIMC g_MainWindowImeContext = nullptr;
+bool g_MainWindowImeContextOwned = false;
 
 RECT GetCaptionButtonBounds(HWND hwnd) {
 	RECT rc{ 0, 0, 0, 0 };
@@ -1352,7 +1355,12 @@ public:
 			[this](bool show) { showGrid = show; },
 			[this](int style) { aimStyle = style; },
 			[this](float radius) { aimRadius = radius; },
-			[this]() { hitMarks.clear(); }
+			[this]() { hitMarks.clear(); },
+			[](bool focusedTextInput) {
+				if (g_hCanvas) {
+					PostMessageW(g_hCanvas, WM_APP_SET_TEXTINPUT_IME, focusedTextInput ? 1 : 0, 0);
+				}
+			}
 		};
 	}
 
@@ -1683,12 +1691,31 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		//SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
 		ExtendFrameIntoClient(hwnd);
 		PushTitleBarInfoToGPU(hwnd); // [新增]
-		ImmAssociateContext(hwnd, NULL);
+		g_MainWindowImeContext = ImmAssociateContext(hwnd, NULL);
+		if (!g_MainWindowImeContext) {
+			g_MainWindowImeContext = ImmCreateContext();
+			g_MainWindowImeContextOwned = g_MainWindowImeContext != nullptr;
+		}
+		else {
+			g_MainWindowImeContextOwned = false;
+		}
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
 
 		RECT rcClient;
 		GetClientRect(hwnd, &rcClient);
+		return 0;
+	}
+	case WM_APP_SET_TEXTINPUT_IME: {
+		const bool focusedTextInput = wParam != 0;
+		if (focusedTextInput) {
+			if (g_MainWindowImeContext) {
+				ImmAssociateContext(hwnd, g_MainWindowImeContext);
+			}
+		}
+		else {
+			ImmAssociateContext(hwnd, NULL);
+		}
 		return 0;
 	}
 	case WM_ERASEBKGND: {
@@ -1993,6 +2020,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		break;
 	}
 	case WM_DESTROY: {
+		if (g_MainWindowImeContext) {
+			ImmAssociateContext(hwnd, NULL);
+			if (g_MainWindowImeContextOwned) {
+				ImmDestroyContext(g_MainWindowImeContext);
+			}
+			g_MainWindowImeContext = nullptr;
+			g_MainWindowImeContextOwned = false;
+		}
 		g_CommandQueue.push(CmdExit{}); g_isRunning.store(false, std::memory_order_relaxed);
 		g_RenderEvent.Notify(); PostQuitMessage(0); return 0;
 	}

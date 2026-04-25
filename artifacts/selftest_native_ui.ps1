@@ -668,6 +668,7 @@ $knobOk = $false
 $expandCollapseOk = $false
 $comboPopupCaptured = $false
 $imeCandidateScreenshotCaptured = $false
+$imeBlurScreenshotCaptured = $false
 $multiChineseBulkScreenshotCaptured = $false
 $multiChineseSelectionScreenshotCaptured = $false
 $multiChineseSelectionLatencyMs = 0.0
@@ -776,8 +777,14 @@ Send-Text 'nihao'
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_01ae_single_ime_candidate.png' -useCopyFromScreen
 Send-KeyPress 0x1B 35
+Click-Client $noteX $noteVisibleY
+Start-Sleep -Milliseconds 140
+Save-Capture 'native_ui_01af_single_ime_blur.png' -useCopyFromScreen
+Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
+Start-Sleep -Milliseconds 90
 Send-KeyChord ([Native]::VK_CONTROL) 0x20 40
 $imeCandidateScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_01ae_single_ime_candidate.png'))
+$imeBlurScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_01af_single_ime_blur.png'))
 
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
@@ -1012,6 +1019,7 @@ $result = [pscustomobject]@{
     MultiInputArrowUpOneLine = $multiArrowUpOk
     MultiInputArrowDownOneLine = $multiArrowDownOk
     ImeCandidateScreenshotCaptured = $imeCandidateScreenshotCaptured
+    ImeBlurScreenshotCaptured = $imeBlurScreenshotCaptured
     MultiInputChineseBulkScreenshotCaptured = $multiChineseBulkScreenshotCaptured
     MultiInputChineseSelectionScreenshotCaptured = $multiChineseSelectionScreenshotCaptured
     MultiInputChineseSelectionLatencyMs = $multiChineseSelectionLatencyMs
@@ -1044,6 +1052,7 @@ $screenshotPaths = @(
     (Join-Path $PicDir 'native_ui_01aa_single_hover_scrollbar.png'),
     (Join-Path $PicDir 'native_ui_01ad_single_ime_before.png'),
     (Join-Path $PicDir 'native_ui_01ae_single_ime_candidate.png'),
+    (Join-Path $PicDir 'native_ui_01af_single_ime_blur.png'),
     (Join-Path $PicDir 'native_ui_01b_single_scrolled.png'),
     (Join-Path $PicDir 'native_ui_01c_single_collapsed.png'),
     (Join-Path $PicDir 'native_ui_02_multi_caret.png'),
@@ -1086,6 +1095,7 @@ if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
 if (-not $result.MultiInputArrowUpOneLine) { $failures += 'multi-input-arrow-up' }
 if (-not $result.MultiInputArrowDownOneLine) { $failures += 'multi-input-arrow-down' }
 if (-not $result.ImeCandidateScreenshotCaptured) { $failures += 'ime-candidate-screenshot' }
+if (-not $result.ImeBlurScreenshotCaptured) { $failures += 'ime-blur-screenshot' }
 if (-not $result.MultiInputChineseBulkScreenshotCaptured) { $failures += 'multi-input-chinese-bulk-screenshot' }
 if (-not $result.MultiInputChineseSelectionScreenshotCaptured) { $failures += 'multi-input-chinese-selection-screenshot' }
 if (-not $result.SliderExercised) { $failures += 'slider' }
