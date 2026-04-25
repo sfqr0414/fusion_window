@@ -650,9 +650,11 @@ $editMenuScreenPoint = Get-ScreenPoint $menuCenters[1] $menuClientY
 Save-Capture 'native_ui_01_initial.png'
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_00a_dirty_idle.png'
+Save-Capture 'native_ui_00d_layout_family_xy_parent.png'
 
 $previewAndButtonsOk = $false
 $selectionControlsOk = $false
+$layoutFamilyOk = $false
 $menuToggleOk = $false
 $menuHoverSwitchOk = $false
 $sliderOk = $false
@@ -667,6 +669,7 @@ $dirtyProbeX = if ($twoColumn) { $previewButtonX } else { $singleInputX }
 $dirtyProbeY = if ($twoColumn) { $previewButtonY } else { $singleInputY }
 Move-MouseScreen (Get-ScreenPoint $dirtyProbeX $dirtyProbeY).X (Get-ScreenPoint $dirtyProbeX $dirtyProbeY).Y 180
 Save-Capture 'native_ui_00b_dirty_hover.png'
+$layoutFamilyOk = Test-Path (Join-Path $PicDir 'native_ui_00d_layout_family_xy_parent.png')
 
 Move-MouseScreen $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
 Click-ScreenLeft $fileMenuScreenPoint.X $fileMenuScreenPoint.Y 180
@@ -887,6 +890,8 @@ if ($twoColumn) {
     Save-Capture 'native_ui_02bc_left_card_idle_scrollbar.png'
     Move-MouseScreen (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).X (Get-ScreenPoint $leftCardScrollX $leftCardScrollStartY).Y 140
     Drag-Client $leftCardScrollX $leftCardScrollStartY $leftCardScrollX $leftCardScrollEndY
+    Start-Sleep -Milliseconds 150
+    Save-Capture 'native_ui_02be_left_card_layout_align.png'
     Drag-Client $leftCardScrollX $leftCardScrollEndY $leftCardScrollX $leftCardScrollStartY
 }
 Move-MouseScreen (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).X (Get-ScreenPoint $rightCardScrollX $rightCardScrollStartY).Y 140
@@ -948,6 +953,8 @@ elseif (-not $launchedByScript) {
 $result = [pscustomobject]@{
     PreviewButtonsExercised = $previewAndButtonsOk
     SelectionControlsExercised = $selectionControlsOk
+    LayoutFamilyExercised = $layoutFamilyOk
+    LayoutAlignmentScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_02be_left_card_layout_align.png'))
     MenuToggleExercised = $menuToggleOk
     MenuHoverSwitchExercised = $menuHoverSwitchOk
     DirtyRenderScreenshotsCaptured = $dirtyRenderScreenshotsCaptured
@@ -978,6 +985,7 @@ $screenshotPaths = @(
     (Join-Path $PicDir 'native_ui_01_initial.png'),
     (Join-Path $PicDir 'native_ui_00a_dirty_idle.png'),
     (Join-Path $PicDir 'native_ui_00b_dirty_hover.png'),
+    (Join-Path $PicDir 'native_ui_00d_layout_family_xy_parent.png'),
     (Join-Path $PicDir 'native_ui_00_menu_open.png'),
     (Join-Path $PicDir 'native_ui_00_menu_hover_switch.png'),
     (Join-Path $PicDir 'native_ui_00_menu_closed.png'),
@@ -1002,6 +1010,7 @@ $screenshotPaths = @(
 if ($twoColumn) {
     $screenshotPaths += (Join-Path $PicDir 'native_ui_02ba_left_card_hover_scrollbar.png')
     $screenshotPaths += (Join-Path $PicDir 'native_ui_02bc_left_card_idle_scrollbar.png')
+    $screenshotPaths += (Join-Path $PicDir 'native_ui_02be_left_card_layout_align.png')
 }
 $screenshotPaths += @(
     (Join-Path $PicDir 'native_ui_02bb_right_card_hover_scrollbar.png'),
@@ -1013,6 +1022,8 @@ $result.Screenshots = $screenshotPaths -join ';'
 $failures = @()
 if (-not $result.PreviewButtonsExercised) { $failures += 'preview/buttons' }
 if (-not $result.SelectionControlsExercised) { $failures += 'selection-controls' }
+if (-not $result.LayoutFamilyExercised) { $failures += 'layout-family-xy-parent' }
+if ($twoColumn -and -not $result.LayoutAlignmentScreenshotCaptured) { $failures += 'layout-alignment-screenshot' }
 if (-not $result.MenuToggleExercised) { $failures += 'menu-toggle' }
 if (-not $result.MenuHoverSwitchExercised) { $failures += 'menu-hover-switch' }
 if (-not $result.DirtyRenderScreenshotsCaptured) { $failures += 'dirty-render-screenshots' }

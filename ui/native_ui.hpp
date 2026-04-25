@@ -173,6 +173,20 @@ namespace fusion::ui {
 		Bottom,
 	};
 
+	enum class LayoutHorizontalAlign {
+		Stretch,
+		Left,
+		Center,
+		Right,
+	};
+
+	enum class LayoutVerticalAlign {
+		Stretch,
+		Top,
+		Center,
+		Bottom,
+	};
+
 	struct TextStyle {
 		std::wstring fontFamily = L"Segoe UI";
 		float fontSize = 13.0f;
@@ -715,10 +729,15 @@ namespace fusion::ui {
 	class UIComponent {
 	public:
 		UIComponent()
-			: boundsProperty_(D2D1::RectF(), PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged), RectEqualComparator{}),
+			: boundsProperty_(D2D1::RectF(), PropertyCallback::Bind(this, &UIComponent::OnBoundsPropertyChanged), RectEqualComparator{}),
 			zIndex_(0, PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged)),
 			visible_(true, PropertyCallback::Bind(this, &UIComponent::OnVisiblePropertyChanged)),
 			enabled_(true, PropertyCallback::Bind(this, &UIComponent::MarkContentChanged)),
+			x_(0.0f, PropertyCallback::Bind(this, &UIComponent::OnPositionPropertyChanged)),
+			y_(0.0f, PropertyCallback::Bind(this, &UIComponent::OnPositionPropertyChanged)),
+			parent_(nullptr, PropertyCallback::Bind(this, &UIComponent::OnParentPropertyChanged)),
+			layoutHorizontalAlign_(LayoutHorizontalAlign::Stretch, PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged)),
+			layoutVerticalAlign_(LayoutVerticalAlign::Stretch, PropertyCallback::Bind(this, &UIComponent::MarkGeometryChanged)),
 			hovered_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
 			pressed_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
 			focused_(false, PropertyCallback::Bind(this, &UIComponent::MarkCacheDirty)),
@@ -726,6 +745,11 @@ namespace fusion::ui {
 			zIndex(zIndex_),
 			visible(visible_),
 			enabled(enabled_),
+			x(x_),
+			y(y_),
+			parent(parent_),
+			layoutHorizontalAlign(layoutHorizontalAlign_),
+			layoutVerticalAlign(layoutVerticalAlign_),
 			bounds_(boundsProperty_.ValueRef()) {
 		}
 
@@ -747,6 +771,46 @@ namespace fusion::ui {
 
 		const D2D1_RECT_F& Bounds() const {
 			return bounds_;
+		}
+
+		float X() const {
+			return x_;
+		}
+
+		float Y() const {
+			return y_;
+		}
+
+		UIComponent* Parent() const {
+			return parent_;
+		}
+
+		LayoutHorizontalAlign HorizontalLayoutAlign() const {
+			return layoutHorizontalAlign_;
+		}
+
+		LayoutVerticalAlign VerticalLayoutAlign() const {
+			return layoutVerticalAlign_;
+		}
+
+		bool IsLayoutManaged() const {
+			return layoutManaged_;
+		}
+
+		void SetLayoutManaged(bool managed) {
+			layoutManaged_ = managed;
+		}
+
+		void SetLayoutManagedBounds(const D2D1_RECT_F& bounds) {
+			layoutManaged_ = true;
+			if (RectEqualValue(bounds_, bounds)) {
+				positionSyncGuard_ = true;
+				x_.ValueRef() = bounds.left;
+				y_.ValueRef() = bounds.top;
+				positionSyncGuard_ = false;
+				return;
+			}
+			boundsProperty_ = bounds;
 		}
 
 		int ZIndex() const {
@@ -1036,10 +1100,48 @@ namespace fusion::ui {
 		Property<int>& zIndex;
 		Property<bool>& visible;
 		Property<bool>& enabled;
+		Property<float>& x;
+		Property<float>& y;
+		Property<UIComponent*>& parent;
+		Property<LayoutHorizontalAlign>& layoutHorizontalAlign;
+		Property<LayoutVerticalAlign>& layoutVerticalAlign;
 
 	protected:
 		D2D1_RECT_F& bounds_;
 		RectProperty boundsProperty_;
+		Property<float> x_;
+		Property<float> y_;
+		Property<UIComponent*> parent_;
+		Property<LayoutHorizontalAlign> layoutHorizontalAlign_;
+		Property<LayoutVerticalAlign> layoutVerticalAlign_;
+		bool positionSyncGuard_ = false;
+		bool layoutManaged_ = false;
+
+		void OnBoundsPropertyChanged() {
+			if (!positionSyncGuard_) {
+				positionSyncGuard_ = true;
+				x_.ValueRef() = bounds_.left;
+				y_.ValueRef() = bounds_.top;
+				positionSyncGuard_ = false;
+			}
+			MarkGeometryChanged();
+		}
+
+		void OnPositionPropertyChanged() {
+			if (positionSyncGuard_ || layoutManaged_) {
+				MarkGeometryChanged();
+				return;
+			}
+			const float width = bounds_.right - bounds_.left;
+			const float height = bounds_.bottom - bounds_.top;
+			positionSyncGuard_ = true;
+			boundsProperty_ = D2D1::RectF(x_, y_, x_ + width, y_ + height);
+			positionSyncGuard_ = false;
+		}
+
+		void OnParentPropertyChanged() {
+			MarkGeometryChanged();
+		}
 
 		void OnVisiblePropertyChanged() {
 			if (!visible_) {
@@ -1118,14 +1220,37 @@ namespace fusion::ui {
 				if (hasVisibleItems) {
 					contentHeight += gap_;
 				}
-				const float height = item->Bounds().bottom - item->Bounds().top;
-				const D2D1_RECT_F arrangedBounds = D2D1::RectF(bounds.left + padding_, y, bounds.right - padding_, y + height);
+				const float availableWidth = (std::max)(1.0f, (bounds.right - bounds.left) - padding_ * 2.0f);
+				const float intrinsicWidth = (std::max)(1.0f, item->Bounds().right - item->Bounds().left);
+				const float height = (std::max)(1.0f, item->Bounds().bottom - item->Bounds().top);
+				float arrangedWidth = availableWidth;
+				float x = bounds.left + padding_;
+				switch (item->HorizontalLayoutAlign()) {
+				case LayoutHorizontalAlign::Left:
+					arrangedWidth = (std::min)(intrinsicWidth, availableWidth);
+					x = bounds.left + padding_;
+					break;
+				case LayoutHorizontalAlign::Center:
+					arrangedWidth = (std::min)(intrinsicWidth, availableWidth);
+					x = bounds.left + padding_ + (availableWidth - arrangedWidth) * 0.5f;
+					break;
+				case LayoutHorizontalAlign::Right:
+					arrangedWidth = (std::min)(intrinsicWidth, availableWidth);
+					x = bounds.right - padding_ - arrangedWidth;
+					break;
+				case LayoutHorizontalAlign::Stretch:
+				default:
+					arrangedWidth = availableWidth;
+					x = bounds.left + padding_;
+					break;
+				}
+				const D2D1_RECT_F arrangedBounds = D2D1::RectF(x, y, x + arrangedWidth, y + height);
 				const auto& currentBounds = item->Bounds();
 				if (std::fabs(currentBounds.left - arrangedBounds.left) > 0.01f
 					|| std::fabs(currentBounds.top - arrangedBounds.top) > 0.01f
 					|| std::fabs(currentBounds.right - arrangedBounds.right) > 0.01f
 					|| std::fabs(currentBounds.bottom - arrangedBounds.bottom) > 0.01f) {
-					item->bounds = arrangedBounds;
+					item->SetLayoutManagedBounds(arrangedBounds);
 				}
 				y += height + gap_;
 				contentHeight += height;
@@ -1137,6 +1262,119 @@ namespace fusion::ui {
 	private:
 		float padding_ = 0.0f;
 		float gap_ = 0.0f;
+	};
+
+	class HorizontalStackLayout final : public LayoutBase {
+	public:
+		HorizontalStackLayout(float padding, float gap) : padding_(padding), gap_(gap) {}
+
+		float Arrange(std::span<UIComponent*> items, const D2D1_RECT_F& bounds, float, float scrollOffset = 0.0f) override {
+			float x = bounds.left + padding_ - scrollOffset;
+			float contentWidth = padding_;
+			bool hasVisibleItems = false;
+			for (auto* item : items) {
+				if (!item || !item->Visible()) {
+					continue;
+				}
+				if (hasVisibleItems) {
+					contentWidth += gap_;
+				}
+				const float availableHeight = (std::max)(1.0f, (bounds.bottom - bounds.top) - padding_ * 2.0f);
+				const float width = (std::max)(1.0f, item->Bounds().right - item->Bounds().left);
+				const float intrinsicHeight = (std::max)(1.0f, item->Bounds().bottom - item->Bounds().top);
+				float arrangedHeight = availableHeight;
+				float y = bounds.top + padding_;
+				switch (item->VerticalLayoutAlign()) {
+				case LayoutVerticalAlign::Top:
+					arrangedHeight = (std::min)(intrinsicHeight, availableHeight);
+					y = bounds.top + padding_;
+					break;
+				case LayoutVerticalAlign::Center:
+					arrangedHeight = (std::min)(intrinsicHeight, availableHeight);
+					y = bounds.top + padding_ + (availableHeight - arrangedHeight) * 0.5f;
+					break;
+				case LayoutVerticalAlign::Bottom:
+					arrangedHeight = (std::min)(intrinsicHeight, availableHeight);
+					y = bounds.bottom - padding_ - arrangedHeight;
+					break;
+				case LayoutVerticalAlign::Stretch:
+				default:
+					arrangedHeight = availableHeight;
+					y = bounds.top + padding_;
+					break;
+				}
+				const D2D1_RECT_F arrangedBounds = D2D1::RectF(x, y, x + width, y + arrangedHeight);
+				item->SetLayoutManagedBounds(arrangedBounds);
+				x += width + gap_;
+				contentWidth += width;
+				hasVisibleItems = true;
+			}
+			return contentWidth + padding_;
+		}
+
+	private:
+		float padding_ = 0.0f;
+		float gap_ = 0.0f;
+	};
+
+	class AlignmentLayout final : public LayoutBase {
+	public:
+		AlignmentLayout(float padding, LayoutHorizontalAlign horizontalAlign, LayoutVerticalAlign verticalAlign)
+			: padding_(padding), horizontalAlign_(horizontalAlign), verticalAlign_(verticalAlign) {}
+
+		float Arrange(std::span<UIComponent*> items, const D2D1_RECT_F& bounds, float, float scrollOffset = 0.0f) override {
+			float maxBottom = bounds.top + padding_;
+			for (auto* item : items) {
+				if (!item || !item->Visible()) {
+					continue;
+				}
+				const float availableWidth = (std::max)(1.0f, (bounds.right - bounds.left) - padding_ * 2.0f);
+				const float availableHeight = (std::max)(1.0f, (bounds.bottom - bounds.top) - padding_ * 2.0f);
+				const float width = (std::min)((std::max)(1.0f, item->Bounds().right - item->Bounds().left), availableWidth);
+				const float height = (std::min)((std::max)(1.0f, item->Bounds().bottom - item->Bounds().top), availableHeight);
+
+				const auto resolveX = [&](LayoutHorizontalAlign align) {
+					switch (align) {
+					case LayoutHorizontalAlign::Left:
+						return bounds.left + padding_;
+					case LayoutHorizontalAlign::Center:
+						return bounds.left + padding_ + (availableWidth - width) * 0.5f;
+					case LayoutHorizontalAlign::Right:
+						return bounds.right - padding_ - width;
+					case LayoutHorizontalAlign::Stretch:
+					default:
+						return bounds.left + padding_;
+					}
+				};
+
+				const auto resolveY = [&](LayoutVerticalAlign align) {
+					switch (align) {
+					case LayoutVerticalAlign::Top:
+						return bounds.top + padding_ - scrollOffset;
+					case LayoutVerticalAlign::Center:
+						return bounds.top + padding_ + (availableHeight - height) * 0.5f - scrollOffset;
+					case LayoutVerticalAlign::Bottom:
+						return bounds.bottom - padding_ - height - scrollOffset;
+					case LayoutVerticalAlign::Stretch:
+					default:
+						return bounds.top + padding_ - scrollOffset;
+					}
+				};
+
+				const LayoutHorizontalAlign resolvedHorizontal = item->HorizontalLayoutAlign() == LayoutHorizontalAlign::Stretch ? horizontalAlign_ : item->HorizontalLayoutAlign();
+				const LayoutVerticalAlign resolvedVertical = item->VerticalLayoutAlign() == LayoutVerticalAlign::Stretch ? verticalAlign_ : item->VerticalLayoutAlign();
+				const float x = resolveX(resolvedHorizontal);
+				const float y = resolveY(resolvedVertical);
+				item->SetLayoutManagedBounds(D2D1::RectF(x, y, x + width, y + height));
+				maxBottom = (std::max)(maxBottom, y + height);
+			}
+			return (maxBottom - bounds.top) + padding_;
+		}
+
+	private:
+		float padding_ = 0.0f;
+		LayoutHorizontalAlign horizontalAlign_ = LayoutHorizontalAlign::Left;
+		LayoutVerticalAlign verticalAlign_ = LayoutVerticalAlign::Top;
 	};
 
 	namespace detail {
@@ -6150,6 +6388,16 @@ namespace fusion::ui {
 			componentClipOwners_.clear();
 			AssignClipOwners(leftLayoutOrder_, leftCard_);
 			AssignClipOwners(rightLayoutOrder_, rightCard_);
+			for (const auto& component : components_) {
+				if (!component || !component->Visible()) {
+					continue;
+				}
+				auto* parent = component->Parent();
+				auto* parentCard = dynamic_cast<CardSurface*>(parent);
+				if (parentCard && parentCard->Visible()) {
+					componentClipOwners_[component.get()] = parentCard;
+				}
+			}
 		}
 
 		void AssignClipOwners(const std::vector<UIComponent*>& items, CardSurface* card) {
@@ -6435,6 +6683,13 @@ namespace fusion::ui {
 			if (!card) {
 				return;
 			}
+			for (auto* item : items) {
+				if (!item) {
+					continue;
+				}
+				item->parent = card;
+				item->SetLayoutManaged(true);
+			}
 			float contentHeight = layout_->Arrange(items, card->LayoutBounds(false), dpiScale_, card->ScrollOffset());
 			card->RefreshContentMetrics(contentHeight);
 			if (card->ShouldReserveVerticalScrollBar()) {
@@ -6661,6 +6916,49 @@ namespace fusion::ui {
 			leftLayoutOrder_.push_back(progress.get());
 			components_.push_back(std::move(progress));
 
+			auto layoutFamilyTitle = std::make_unique<TextBlock>(L"Layout family: left / center / right + x,y,parent", graphics_.dwriteFactory, captionFormat_, mutedTextColor);
+			layoutFamilyTitle->bounds = D2D1::RectF(0.0f, 0.0f, detail::kCardWidth - 48.0f, 24.0f);
+			layoutFamilyTitle->zIndex = 3;
+			leftLayoutOrder_.push_back(layoutFamilyTitle.get());
+			components_.push_back(std::move(layoutFamilyTitle));
+
+			auto leftAlignedButton = std::make_unique<Button>(L"Left aligned", graphics_.dwriteFactory, bodyFormat_, primaryColor, surfaceAltColor, outlineColor, surfaceColor, [this]() {
+				UpdateStatus(L"Layout demo: left alignment.");
+				}, true);
+			leftAlignedButton->bounds = D2D1::RectF(0.0f, 0.0f, 162.0f, 30.0f);
+			leftAlignedButton->layoutHorizontalAlign = LayoutHorizontalAlign::Left;
+			leftAlignedButton->x = 9999.0f;
+			leftAlignedButton->y = 9999.0f;
+			leftAlignedButton->zIndex = 3;
+			leftLayoutOrder_.push_back(leftAlignedButton.get());
+			components_.push_back(std::move(leftAlignedButton));
+
+			auto centerAlignedButton = std::make_unique<Button>(L"Center aligned", graphics_.dwriteFactory, bodyFormat_, primaryColor, surfaceAltColor, outlineColor, surfaceColor, [this]() {
+				UpdateStatus(L"Layout demo: center alignment.");
+				}, true);
+			centerAlignedButton->bounds = D2D1::RectF(0.0f, 0.0f, 162.0f, 30.0f);
+			centerAlignedButton->layoutHorizontalAlign = LayoutHorizontalAlign::Center;
+			centerAlignedButton->x = -9999.0f;
+			centerAlignedButton->y = -9999.0f;
+			centerAlignedButton->zIndex = 3;
+			leftLayoutOrder_.push_back(centerAlignedButton.get());
+			components_.push_back(std::move(centerAlignedButton));
+
+			auto rightAlignedButton = std::make_unique<Button>(L"Right aligned", graphics_.dwriteFactory, bodyFormat_, primaryColor, surfaceAltColor, outlineColor, surfaceColor, [this]() {
+				UpdateStatus(L"Layout demo: right alignment.");
+				}, true);
+			rightAlignedButton->bounds = D2D1::RectF(0.0f, 0.0f, 162.0f, 30.0f);
+			rightAlignedButton->layoutHorizontalAlign = LayoutHorizontalAlign::Right;
+			rightAlignedButton->zIndex = 3;
+			leftLayoutOrder_.push_back(rightAlignedButton.get());
+			components_.push_back(std::move(rightAlignedButton));
+
+			auto xyParentBadge = std::make_unique<TextBlock>(L"x/y + parent (clipped by parent)", graphics_.dwriteFactory, captionFormat_, detail::MakeColor(0.30f, 0.30f, 0.36f, 1.0f));
+			xyParentBadge->bounds = D2D1::RectF(0.0f, 0.0f, 220.0f, 22.0f);
+			xyParentBadge->zIndex = 4;
+			xyParentBadge_ = xyParentBadge.get();
+			components_.push_back(std::move(xyParentBadge));
+
 			auto singleInput = std::make_unique<TextInput>(L"Single-line input", L"Type a command...", L"draw hitmarker", graphics_.dwriteFactory, fieldFormat_, surfaceColor, outlineColor, textColor, mutedTextColor, accentColor, false, [this](std::wstring_view value) {
 				std::wstring status = L"Single-line input: ";
 				status.append(value);
@@ -6770,6 +7068,14 @@ namespace fusion::ui {
 				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(leftCard_, leftLayoutOrder_);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
+			}
+
+			if (xyParentBadge_ && rightCard_ && rightCard_->Visible()) {
+				xyParentBadge_->SetLayoutManaged(false);
+				xyParentBadge_->parent = rightCard_;
+				const D2D1_RECT_F clip = rightCard_->ContentClipBounds();
+				xyParentBadge_->x = clip.left + 10.0f;
+				xyParentBadge_->y = clip.bottom - 24.0f;
 			}
 			else {
 				UpdateComponentVisibility(leftCard_, false);
@@ -6939,6 +7245,7 @@ namespace fusion::ui {
 		ListBox* listBox_ = nullptr;
 		ComboBox* comboBox_ = nullptr;
 		Knob* knob_ = nullptr;
+		TextBlock* xyParentBadge_ = nullptr;
 		int lastFrameCacheRebuildCount_ = 0;
 		int lastFrameRenderedComponentCount_ = 0;
 	};
