@@ -944,6 +944,18 @@ namespace fusion::ui {
 		virtual void OnImeComposition(HWND, LPARAM) {}
 		virtual void OnImeEnd(HWND) {}
 
+		virtual bool HasOpenPopup() const {
+			return false;
+		}
+
+		virtual bool CapturePointerOutsidePopup() const {
+			return false;
+		}
+
+		virtual bool PopupHitTest(D2D1_POINT_2F point) const {
+			return HasOpenPopup() && PointInRect(bounds_, point);
+		}
+
 		virtual bool HitTest(ID2D1Factory1* factory, D2D1_POINT_2F point) const {
 			if (!visible_ || !enabled_) {
 				return false;
@@ -4833,8 +4845,16 @@ namespace fusion::ui {
 			bool IsAnimating() const override { return UIComponent::IsAnimating() || openAnimation_.IsAnimating(); }
 			bool WantsFrameTick() const override { return HasOpenPopup() || PopupScrollRevealActive(); }
 
-			bool HasOpenPopup() const {
+			bool HasOpenPopup() const override {
 				return open_ || openAnimation_.Value() > 0.01f;
+			}
+
+			bool CapturePointerOutsidePopup() const override {
+				return true;
+			}
+
+			bool PopupHitTest(D2D1_POINT_2F point) const override {
+				return PointInRect(bounds_, point) || (HasOpenPopup() && PointInRect(PopupBounds(openAnimation_.Value()), point));
 			}
 
 			bool HitTest(ID2D1Factory1*, D2D1_POINT_2F point) const override {
@@ -5450,9 +5470,7 @@ namespace fusion::ui {
 
 	} // namespace detail
 
-	class DemoUiHost {
-	public:
-		class QuadtreeHitIndex {
+	class QuadtreeHitIndex {
 		public:
 			void Clear() {
 				for (auto& node : nodes_) {
@@ -5949,11 +5967,125 @@ namespace fusion::ui {
 			int mortonDepth_ = 1;
 		};
 
+	class DirtyManager {
+	public:
+		bool NeedsRedraw(bool layoutDirty, bool hasDirtyComponents, bool needsRenderOrderRefresh) const {
+			return layoutDirty || zOrderDirty_ || dynamicDirty_ || hasDirtyComponents || needsRenderOrderRefresh;
+		}
+
+		void MarkZOrderDirty() {
+			zOrderDirty_ = true;
+		}
+
+		void MarkDynamicDirty() {
+			dynamicDirty_ = true;
+		}
+
+		void ClearDynamicDirty() {
+			dynamicDirty_ = false;
+		}
+
+		void ClearZOrderDirty() {
+			zOrderDirty_ = false;
+		}
+
+		bool& ZOrderDirtyRef() { return zOrderDirty_; }
+		bool& DynamicDirtyRef() { return dynamicDirty_; }
+
+		std::vector<UIComponent*>& SortedComponentsRef() { return sortedComponents_; }
+		std::vector<UIComponent*>& LeftLayoutOrderRef() { return leftLayoutOrder_; }
+		std::vector<UIComponent*>& RightLayoutOrderRef() { return rightLayoutOrder_; }
+		std::vector<UIComponent*>& PendingHitIndexUpdatesRef() { return pendingHitIndexUpdates_; }
+
+		void SyncLayoutOrders(const std::vector<std::unique_ptr<UIComponent>>& components) {
+			auto existsInComponents = [&](UIComponent* candidate) {
+				for (const auto& component : components) {
+					if (component.get() == candidate) {
+						return true;
+					}
+				}
+				return false;
+			};
+
+			auto cleanup = [&](std::vector<UIComponent*>& items) {
+				std::vector<UIComponent*> filtered;
+				filtered.reserve(items.size());
+				for (auto* item : items) {
+					if (!item || !existsInComponents(item)) {
+						continue;
+					}
+					if (std::find(filtered.begin(), filtered.end(), item) == filtered.end()) {
+						filtered.push_back(item);
+					}
+				}
+				items.swap(filtered);
+			};
+
+			cleanup(leftLayoutOrder_);
+			cleanup(rightLayoutOrder_);
+		}
+
+	private:
+		bool zOrderDirty_ = true;
+		bool dynamicDirty_ = true;
+		std::vector<UIComponent*> sortedComponents_;
+		std::vector<UIComponent*> leftLayoutOrder_;
+		std::vector<UIComponent*> rightLayoutOrder_;
+		std::vector<UIComponent*> pendingHitIndexUpdates_;
+	};
+
+	class EventDispatcher {
+	public:
+		UIComponent* ResolveModalComponent(const std::vector<std::unique_ptr<UIComponent>>& components, D2D1_POINT_2F point, bool captureOutside) const {
+			UIComponent* best = nullptr;
+			int bestZ = (std::numeric_limits<int>::min)();
+			for (const auto& component : components) {
+				if (!component || !component->Visible() || !component->HasOpenPopup()) {
+					continue;
+				}
+				const bool popupHit = component->PopupHitTest(point);
+				if (!captureOutside && !popupHit) {
+					continue;
+				}
+				if (captureOutside && !component->CapturePointerOutsidePopup() && !popupHit) {
+					continue;
+				}
+				if (component->ZIndex() >= bestZ) {
+					best = component.get();
+					bestZ = component->ZIndex();
+				}
+			}
+			return best;
+		}
+	};
+
+	class RenderEngine {
+	public:
+		void InvalidateStaticCaches() {
+			cacheGeneration_++;
+		}
+
+		size_t CacheGeneration() const {
+			return cacheGeneration_;
+		}
+
+	private:
+		size_t cacheGeneration_ = 1;
+	};
+
+	class DemoUiHost {
+	public:
 		DemoUiHost(GraphicsContext graphics, HostCallbacks callbacks)
 			: graphics_(std::move(graphics)), callbacks_(std::move(callbacks)) {
 			animationSystem_.Initialize();
 			InitializeResources();
-			BuildDemoScene();
+		}
+
+		virtual ~DemoUiHost() = default;
+
+		void InitializeScene() {
+			BuildScene();
+			dirtyManager_.SyncLayoutOrders(components_);
 		}
 
 		CursorKind CurrentCursor() const {
@@ -5961,7 +6093,7 @@ namespace fusion::ui {
 		}
 
 		bool NeedsRedraw() const {
-			return HasLayoutDirty() || zOrderDirty_ || dynamicDirty_ || HasDirtyComponents() || NeedsRenderOrderRefresh();
+			return dirtyManager_.NeedsRedraw(HasLayoutDirty(), HasDirtyComponents(), NeedsRenderOrderRefresh());
 		}
 
 		bool NeedsContinuousRedraw() const {
@@ -6226,7 +6358,7 @@ namespace fusion::ui {
 			RefreshComponentClipOwners();
 			UpdateZOrderIfDirty();
 			UpdateStaticSegments(targetContext);
-			auto tasks = GenerateDrawTasks();
+			auto tasks = GenerateDrawTasks(sortedComponents_, staticSegments_, componentClipOwners_);
 			for (const auto& task : tasks) {
 				if (std::holds_alternative<DrawStaticSegment>(task)) {
 					const auto& staticTask = std::get<DrawStaticSegment>(task);
@@ -6290,12 +6422,7 @@ namespace fusion::ui {
 		};
 
 		UIComponent* ResolveModalComponent(D2D1_POINT_2F point, bool captureOutside) const {
-			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup()) {
-				if (captureOutside || comboBox_->HitTest(graphics_.d2dFactory.Get(), point)) {
-					return comboBox_;
-				}
-			}
-			return nullptr;
+			return eventDispatcher_.ResolveModalComponent(components_, point, captureOutside);
 		}
 
 		UIComponent* ResolvePointerTarget(D2D1_POINT_2F point, bool captureOutsideModal) {
@@ -6345,33 +6472,41 @@ namespace fusion::ui {
 			updateCard(rightCard_);
 		}
 
-		Generator<DrawTask> GenerateDrawTasks() const {
+		static Generator<DrawTask> GenerateDrawTasks(
+			std::vector<UIComponent*> sortedSnapshot,
+			std::vector<StaticSegment> staticSegmentsSnapshot,
+			std::unordered_map<UIComponent*, CardSurface*> clipOwnersSnapshot) {
+			auto clipOwnerFor = [&](UIComponent* component) -> CardSurface* {
+				auto found = clipOwnersSnapshot.find(component);
+				return found == clipOwnersSnapshot.end() ? nullptr : found->second;
+			};
+
 			size_t segmentIndex = 0;
-			for (size_t index = 0; index < sortedComponents_.size();) {
-				auto* component = sortedComponents_[index];
+			for (size_t index = 0; index < sortedSnapshot.size();) {
+				auto* component = sortedSnapshot[index];
 				if (!component) {
 					++index;
 					continue;
 				}
 				if (component->IsDynamic()) {
-					co_yield DrawDynamicControl{ RenderEntry{ component, ClipOwnerForComponent(component) } };
+					co_yield DrawDynamicControl{ RenderEntry{ component, clipOwnerFor(component) } };
 					++index;
 					continue;
 				}
 
 				const size_t segmentStart = index;
-				while (index < sortedComponents_.size() && sortedComponents_[index] && !sortedComponents_[index]->IsDynamic()) {
+				while (index < sortedSnapshot.size() && sortedSnapshot[index] && !sortedSnapshot[index]->IsDynamic()) {
 					++index;
 				}
 				const size_t segmentCount = index - segmentStart;
-				if (segmentIndex < staticSegments_.size() && staticSegments_[segmentIndex].commandList) {
-					co_yield DrawStaticSegment{ staticSegments_[segmentIndex].commandList.Get(), segmentCount };
+				if (segmentIndex < staticSegmentsSnapshot.size() && staticSegmentsSnapshot[segmentIndex].commandList) {
+					co_yield DrawStaticSegment{ staticSegmentsSnapshot[segmentIndex].commandList.Get(), segmentCount };
 				}
 				else {
 					for (size_t itemIndex = segmentStart; itemIndex < index; ++itemIndex) {
-						auto* staticComponent = sortedComponents_[itemIndex];
+						auto* staticComponent = sortedSnapshot[itemIndex];
 						if (staticComponent) {
-							co_yield DrawDynamicControl{ RenderEntry{ staticComponent, ClipOwnerForComponent(staticComponent) } };
+							co_yield DrawDynamicControl{ RenderEntry{ staticComponent, clipOwnerFor(staticComponent) } };
 						}
 					}
 				}
@@ -6408,7 +6543,7 @@ namespace fusion::ui {
 				if (!item || !item->Visible()) {
 					continue;
 				}
-				if (item == comboBox_ && comboBox_ && comboBox_->HasOpenPopup()) {
+				if (item->HasOpenPopup()) {
 					continue;
 				}
 				componentClipOwners_[item] = card;
@@ -6776,7 +6911,11 @@ namespace fusion::ui {
 			if (captionFormat_) captionFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
 		}
 
-		void BuildDemoScene() {
+	protected:
+		virtual void BuildScene() {
+		}
+
+		void BuildDefaultScene() {
 			layout_ = std::make_unique<VerticalStackLayout>(24.0f, 8.0f);
 			components_.clear();
 			leftLayoutOrder_.clear();
@@ -6955,8 +7094,10 @@ namespace fusion::ui {
 
 			auto xyParentBadge = std::make_unique<TextBlock>(L"x/y + parent (clipped by parent)", graphics_.dwriteFactory, captionFormat_, detail::MakeColor(0.30f, 0.30f, 0.36f, 1.0f));
 			xyParentBadge->bounds = D2D1::RectF(0.0f, 0.0f, 220.0f, 22.0f);
-			xyParentBadge->zIndex = 4;
+			xyParentBadge->zIndex = 3;
+			xyParentBadge->layoutHorizontalAlign = LayoutHorizontalAlign::Left;
 			xyParentBadge_ = xyParentBadge.get();
+			rightLayoutOrder_.push_back(xyParentBadge_);
 			components_.push_back(std::move(xyParentBadge));
 
 			auto singleInput = std::make_unique<TextInput>(L"Single-line input", L"Type a command...", L"draw hitmarker", graphics_.dwriteFactory, fieldFormat_, surfaceColor, outlineColor, textColor, mutedTextColor, accentColor, false, [this](std::wstring_view value) {
@@ -7038,10 +7179,12 @@ namespace fusion::ui {
 			}
 		}
 
+	private:
 		void Arrange() {
 			if (!leftCard_ || !rightCard_) {
 				return;
 			}
+			dirtyManager_.SyncLayoutOrders(components_);
 			const float gap = 24.0f;
 			const float availableWidth = viewport_.right - viewport_.left - 48.0f;
 			const bool twoColumn = availableWidth >= 420.0f;
@@ -7068,14 +7211,6 @@ namespace fusion::ui {
 				ApplyArrangedBounds(rightCard_, rightCardBounds);
 				ArrangeCard(leftCard_, leftLayoutOrder_);
 				ArrangeCard(rightCard_, rightLayoutOrder_);
-			}
-
-			if (xyParentBadge_ && rightCard_ && rightCard_->Visible()) {
-				xyParentBadge_->SetLayoutManaged(false);
-				xyParentBadge_->parent = rightCard_;
-				const D2D1_RECT_F clip = rightCard_->ContentClipBounds();
-				xyParentBadge_->x = clip.left + 10.0f;
-				xyParentBadge_->y = clip.bottom - 24.0f;
 			}
 			else {
 				UpdateComponentVisibility(leftCard_, false);
@@ -7154,8 +7289,8 @@ namespace fusion::ui {
 		}
 
 		UIComponent* Pick(D2D1_POINT_2F point) {
-			if (comboBox_ && comboBox_->Visible() && comboBox_->HasOpenPopup() && comboBox_->HitTest(graphics_.d2dFactory.Get(), point)) {
-				return comboBox_;
+			if (auto* modal = ResolveModalComponent(point, false)) {
+				return modal;
 			}
 			return hitIndex_.QueryTopHit(point, graphics_.d2dFactory.Get());
 		}
@@ -7205,8 +7340,9 @@ namespace fusion::ui {
 		static constexpr unsigned kLayoutDirtySize = 1u << 1;
 		static constexpr unsigned kLayoutDirtyAll = kLayoutDirtyStructure | kLayoutDirtySize;
 		unsigned layoutDirtyFlags_ = kLayoutDirtyAll;
-		bool zOrderDirty_ = true;
-		bool dynamicDirty_ = true;
+		DirtyManager dirtyManager_{};
+		bool& zOrderDirty_ = dirtyManager_.ZOrderDirtyRef();
+		bool& dynamicDirty_ = dirtyManager_.DynamicDirtyRef();
 
 		ComPtr<IDWriteTextFormat> titleFormat_;
 		ComPtr<IDWriteTextFormat> buttonFormat_;
@@ -7215,17 +7351,19 @@ namespace fusion::ui {
 		ComPtr<IDWriteTextFormat> captionFormat_;
 
 		std::vector<std::unique_ptr<UIComponent>> components_;
-		std::vector<UIComponent*> sortedComponents_;
+		std::vector<UIComponent*>& sortedComponents_ = dirtyManager_.SortedComponentsRef();
 		std::vector<StaticSegment> staticSegments_;
 		std::unordered_map<UIComponent*, CardSurface*> componentClipOwners_;
-		std::vector<UIComponent*> leftLayoutOrder_;
-		std::vector<UIComponent*> rightLayoutOrder_;
+		std::vector<UIComponent*>& leftLayoutOrder_ = dirtyManager_.LeftLayoutOrderRef();
+		std::vector<UIComponent*>& rightLayoutOrder_ = dirtyManager_.RightLayoutOrderRef();
 		std::vector<UIComponent*> focusOrder_;
 		std::unique_ptr<LayoutBase> layout_;
 		std::unordered_map<UIComponent*, D2D1_RECT_F> lastLayoutBounds_;
 		std::unordered_map<CardSurface*, float> lastCardContentHeight_;
-		std::vector<UIComponent*> pendingHitIndexUpdates_;
+		std::vector<UIComponent*>& pendingHitIndexUpdates_ = dirtyManager_.PendingHitIndexUpdatesRef();
 		QuadtreeHitIndex hitIndex_{};
+		EventDispatcher eventDispatcher_{};
+		RenderEngine renderEngine_{};
 		bool hitIndexDirty_ = true;
 		UIComponent* hovered_ = nullptr;
 		UIComponent* focused_ = nullptr;
@@ -7248,6 +7386,19 @@ namespace fusion::ui {
 		TextBlock* xyParentBadge_ = nullptr;
 		int lastFrameCacheRebuildCount_ = 0;
 		int lastFrameRenderedComponentCount_ = 0;
+	};
+
+	class DefaultDemoUiHost final : public DemoUiHost {
+	public:
+		DefaultDemoUiHost(GraphicsContext graphics, HostCallbacks callbacks)
+			: DemoUiHost(std::move(graphics), std::move(callbacks)) {
+			InitializeScene();
+		}
+
+	protected:
+		void BuildScene() override {
+			BuildDefaultScene();
+		}
 	};
 
 }

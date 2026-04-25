@@ -1012,7 +1012,7 @@ private:
 		if (uiHost || !d2dFactory || !d2dDevice || !d2dContext || !dwriteFactory) {
 			return;
 		}
-		uiHost = std::make_unique<fusion::ui::DemoUiHost>(
+		uiHost = std::make_unique<fusion::ui::DefaultDemoUiHost>(
 			fusion::ui::GraphicsContext{ d2dFactory, d2dDevice, d2dContext, dwriteFactory },
 			static_cast<Derived*>(this)->CreateUiCallbacks());
 		utils::console("ui host created\n");
