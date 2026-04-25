@@ -3438,7 +3438,11 @@ namespace fusion::ui {
 				UpdateScrollbarVisibilityAnimations(visual);
 				SyncScrollOffsets(visual.layout, visual.content);
 				if (imeActive_ && imeWindow_) {
-					UpdateImeWindowPosition(imeWindow_);
+					HIMC imeContext = ImmGetContext(imeWindow_);
+					if (imeContext) {
+						UpdateImeWindowPosition(imeWindow_, imeContext, visual);
+						ImmReleaseContext(imeWindow_, imeContext);
+					}
 				}
 				if (!multiline_) {
 					const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
@@ -3848,7 +3852,10 @@ namespace fusion::ui {
 					}
 				}
 				if ((lParam & GCS_CURSORPOS) != 0) {
-					ImmGetCompositionStringW(context, GCS_CURSORPOS, &cursorPos, sizeof(cursorPos));
+					const LONG cursorResult = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
+					if (cursorResult >= 0) {
+						cursorPos = static_cast<LONG>(cursorResult & 0xFFFF);
+					}
 				}
 				UpdateImeWindowPosition(hwnd, context);
 				ImmReleaseContext(hwnd, context);
@@ -4518,6 +4525,13 @@ namespace fusion::ui {
 					return;
 				}
 				auto visual = ComputeVisualState();
+				UpdateImeWindowPosition(hwnd, context, visual);
+			}
+
+			void UpdateImeWindowPosition(HWND hwnd, HIMC context, const VisualState& visual) {
+				if (!hwnd || !context) {
+					return;
+				}
 				if (!visual.layout) {
 					return;
 				}
