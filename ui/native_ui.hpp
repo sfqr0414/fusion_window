@@ -2294,7 +2294,7 @@ namespace fusion::ui {
 			}
 
 			void TouchScrollReveal() const {
-				scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
 			void UpdateScrollBarAnimation(bool visible) {
@@ -5967,6 +5967,129 @@ namespace fusion::ui {
 			int mortonDepth_ = 1;
 		};
 
+	class SceneGraph {
+	public:
+		enum class Lane {
+			LeftCard,
+			RightCard,
+			Floating,
+		};
+
+		struct Node {
+			std::string id;
+			UIComponent* component = nullptr;
+			UIComponent* parent = nullptr;
+			Lane lane = Lane::Floating;
+			bool focusable = false;
+		};
+
+		void Clear() {
+			nodes_.clear();
+			idLookup_.clear();
+			leftLane_.clear();
+			rightLane_.clear();
+			floatingLane_.clear();
+			focusOrder_.clear();
+		}
+
+		void AddNode(std::string id, UIComponent* component, UIComponent* parent, Lane lane, bool focusable) {
+			if (!component) {
+				return;
+			}
+			idLookup_[id] = component;
+			nodes_[component] = Node{ std::move(id), component, parent, lane, focusable };
+			LaneOrderRef(lane).push_back(component);
+			if (focusable) {
+				focusOrder_.push_back(component);
+			}
+		}
+
+		bool MoveNode(UIComponent* component, Lane lane) {
+			auto it = nodes_.find(component);
+			if (it == nodes_.end() || !component) {
+				return false;
+			}
+			if (it->second.lane == lane) {
+				return true;
+			}
+			EraseFromLane(it->second.lane, component);
+			it->second.lane = lane;
+			LaneOrderRef(lane).push_back(component);
+			return true;
+		}
+
+		bool RemoveById(const std::string& id) {
+			auto found = idLookup_.find(id);
+			if (found == idLookup_.end()) {
+				return false;
+			}
+			return RemoveByComponent(found->second);
+		}
+
+		bool RemoveByComponent(UIComponent* component) {
+			auto it = nodes_.find(component);
+			if (it == nodes_.end()) {
+				return false;
+			}
+			EraseFromLane(it->second.lane, component);
+			EraseFromVector(focusOrder_, component);
+			idLookup_.erase(it->second.id);
+			nodes_.erase(it);
+			return true;
+		}
+
+		UIComponent* FindById(const std::string& id) const {
+			auto found = idLookup_.find(id);
+			return found == idLookup_.end() ? nullptr : found->second;
+		}
+
+		const std::vector<UIComponent*>& LaneOrder(Lane lane) const {
+			switch (lane) {
+			case Lane::LeftCard:
+				return leftLane_;
+			case Lane::RightCard:
+				return rightLane_;
+			case Lane::Floating:
+			default:
+				return floatingLane_;
+			}
+		}
+
+		const std::vector<UIComponent*>& FocusOrder() const {
+			return focusOrder_;
+		}
+
+	private:
+		static void EraseFromVector(std::vector<UIComponent*>& items, UIComponent* component) {
+			items.erase(std::remove(items.begin(), items.end(), component), items.end());
+		}
+
+		void EraseFromLane(Lane lane, UIComponent* component) {
+			EraseFromVector(LaneOrderRef(lane), component);
+		}
+
+		std::vector<UIComponent*>& LaneOrderRef(Lane lane) {
+			switch (lane) {
+			case Lane::LeftCard:
+				return leftLane_;
+			case Lane::RightCard:
+				return rightLane_;
+			case Lane::Floating:
+			default:
+				return floatingLane_;
+			}
+		}
+
+		std::unordered_map<UIComponent*, Node> nodes_;
+		std::unordered_map<std::string, UIComponent*> idLookup_;
+		std::vector<UIComponent*> leftLane_;
+		std::vector<UIComponent*> rightLane_;
+		std::vector<UIComponent*> floatingLane_;
+		std::vector<UIComponent*> focusOrder_;
+	};
+
+	class DemoUiHost;
+
 	class DirtyManager {
 	public:
 		bool NeedsRedraw(bool layoutDirty, bool hasDirtyComponents, bool needsRenderOrderRefresh) const {
@@ -6057,344 +6180,24 @@ namespace fusion::ui {
 			}
 			return best;
 		}
+
+		void HandleWin32Message(DemoUiHost& host, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) const;
+		bool HandleKeyDown(DemoUiHost& host, WPARAM key, const KeyModifiers& modifiers) const;
 	};
 
 	class RenderEngine {
 	public:
+		void Render(DemoUiHost& host, ID2D1DeviceContext* context);
+		bool NeedsRenderOrderRefresh(const DemoUiHost& host) const;
+
 		void InvalidateStaticCaches() {
+			staticSegments_.clear();
+			componentClipOwners_.clear();
 			cacheGeneration_++;
 		}
 
-		size_t CacheGeneration() const {
-			return cacheGeneration_;
-		}
-
 	private:
-		size_t cacheGeneration_ = 1;
-	};
-
-	class DemoUiHost {
-	public:
-		DemoUiHost(GraphicsContext graphics, HostCallbacks callbacks)
-			: graphics_(std::move(graphics)), callbacks_(std::move(callbacks)) {
-			animationSystem_.Initialize();
-			InitializeResources();
-		}
-
-		virtual ~DemoUiHost() = default;
-
-		void InitializeScene() {
-			BuildScene();
-			dirtyManager_.SyncLayoutOrders(components_);
-		}
-
-		CursorKind CurrentCursor() const {
-			return currentCursor_;
-		}
-
-		bool NeedsRedraw() const {
-			return dirtyManager_.NeedsRedraw(HasLayoutDirty(), HasDirtyComponents(), NeedsRenderOrderRefresh());
-		}
-
-		bool NeedsContinuousRedraw() const {
-			return NeedsRedraw() || animationSystem_.HasRunningAnimations() || HasPendingFrameTicks();
-		}
-
-		D2D1_RECT_F VisibleUiBounds() const {
-			return visibleUiBounds_;
-		}
-
-		void UpdateViewport(const D2D1_RECT_F& viewport, float dpiScale) {
-			if (viewport.left != viewport_.left || viewport.top != viewport_.top || viewport.right != viewport_.right || viewport.bottom != viewport_.bottom || dpiScale != dpiScale_) {
-				const D2D1_RECT_F previousViewport = viewport_;
-				viewport_ = viewport;
-				dpiScale_ = dpiScale;
-				MarkLayoutDirty(kLayoutDirtySize);
-				if (!hitIndex_.ContainsBounds(previousViewport) || !hitIndex_.ContainsBounds(viewport_)) {
-					hitIndexDirty_ = true;
-				}
-				zOrderDirty_ = true;
-				dynamicDirty_ = true;
-			}
-		}
-
-		void HandleWin32Message(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-			if (!graphics_.d2dFactory || components_.empty()) {
-				return;
-			}
-			D2D1_POINT_2F point = D2D1::Point2F();
-			const bool hasMousePoint = msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEWHEEL;
-			if (msg == WM_MOUSEWHEEL) {
-				POINT screenPoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-				ScreenToClient(hwnd, &screenPoint);
-				point = D2D1::Point2F(static_cast<float>(screenPoint.x) / dpiScale_, static_cast<float>(screenPoint.y) / dpiScale_);
-			}
-			else if (hasMousePoint) {
-				point = D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lParam)) / dpiScale_, static_cast<float>(GET_Y_LPARAM(lParam)) / dpiScale_);
-			}
-
-			switch (msg) {
-			case WM_MOUSEMOVE: {
-				if (!PointInViewport(point)) {
-					UpdateCardHoverState(point, nullptr);
-					ClearHover();
-					currentCursor_ = CursorKind::None;
-					dynamicDirty_ = true;
-					return;
-				}
-				UIComponent* target = captured_ ? captured_ : ResolvePointerTarget(point, true);
-				UpdateCardHoverState(point, target);
-				UpdateHovered(target == leftCard_ || target == rightCard_ ? nullptr : target);
-				if (CardScrollTarget(point)) {
-					currentCursor_ = CursorKind::Arrow;
-				}
-				else {
-					currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
-					if (target) {
-						target->MarkDirty();
-					}
-				}
-				if (captured_) {
-					const float previousScrollOffset = ScrollOffsetForCard(captured_);
-					captured_->OnPointerMove(point);
-					captured_->MarkDirty();
-					RefreshCardLayoutIfScrollChanged(captured_, previousScrollOffset);
-				}
-				dynamicDirty_ = true;
-				return;
-			}
-			case WM_LBUTTONDOWN: {
-				if (!PointInViewport(point)) {
-					UpdateFocused(nullptr);
-					currentCursor_ = CursorKind::None;
-					return;
-				}
-				if (auto* cardScrollTarget = CardScrollTarget(point)) {
-					UpdateFocused(nullptr);
-					captured_ = cardScrollTarget;
-					UpdateCardHoverState(point, cardScrollTarget);
-					currentCursor_ = CursorKind::Arrow;
-					const float previousScrollOffset = cardScrollTarget->ScrollOffset();
-					cardScrollTarget->OnPointerDown(point);
-					cardScrollTarget->MarkDirty();
-					RefreshCardLayoutIfScrollChanged(cardScrollTarget, previousScrollOffset);
-					dynamicDirty_ = true;
-					return;
-				}
-				UIComponent* target = ResolvePointerTarget(point, true);
-				UpdateCardHoverState(point, target);
-				currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
-				UpdateFocused(target && target->IsFocusable() ? target : nullptr);
-				captured_ = target;
-				if (target) {
-					target->OnPointerDown(point);
-					target->MarkDirty();
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			case WM_LBUTTONUP: {
-				if (captured_) {
-					const float previousScrollOffset = ScrollOffsetForCard(captured_);
-					captured_->OnPointerUp(point);
-					captured_->MarkDirty();
-					RefreshCardLayoutIfScrollChanged(captured_, previousScrollOffset);
-					captured_ = nullptr;
-					UIComponent* target = PointInViewport(point) ? ResolvePointerTarget(point, true) : nullptr;
-					UpdateCardHoverState(point, target);
-					UpdateHovered(target == leftCard_ || target == rightCard_ ? nullptr : target);
-					if (PointInViewport(point) && CardScrollTarget(point)) {
-						currentCursor_ = CursorKind::Arrow;
-					}
-					else {
-						currentCursor_ = (target && target != leftCard_ && target != rightCard_) ? target->CursorAt(point) : (PointInViewport(point) ? CursorKind::Arrow : CursorKind::None);
-						if (target) {
-							target->MarkDirty();
-						}
-					}
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			case WM_MOUSELEAVE: {
-				UpdateCardHoverState(point, nullptr);
-				ClearHover();
-				currentCursor_ = CursorKind::None;
-				dynamicDirty_ = true;
-				return;
-			}
-			case WM_MOUSEWHEEL: {
-				const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-				if (auto* modal = ResolveModalComponent(point, false)) {
-					if (modal->OnMouseWheel(delta, point)) {
-						modal->MarkDirty();
-						dynamicDirty_ = true;
-						return;
-					}
-				}
-
-				std::vector<UIComponent*> candidates;
-				hitIndex_.GatherCandidates(point, candidates);
-				std::vector<UIComponent*> ordered;
-				ordered.reserve(candidates.size());
-				for (auto* candidate : candidates) {
-					ordered.push_back(candidate);
-				}
-				std::ranges::sort(ordered, [](const UIComponent* lhs, const UIComponent* rhs) {
-					return lhs->ZIndex() > rhs->ZIndex();
-					});
-
-				for (auto* target : ordered) {
-					if (target && target->OnMouseWheel(delta, point)) {
-						target->MarkDirty();
-						dynamicDirty_ = true;
-						return;
-					}
-				}
-
-				if (auto* card = CardAtPoint(point)) {
-					const float previousScrollOffset = card->ScrollOffset();
-					if (card->OnMouseWheel(delta, point)) {
-						card->MarkDirty();
-						RefreshCardLayoutIfScrollChanged(card, previousScrollOffset);
-						dynamicDirty_ = true;
-					}
-				}
-				return;
-			}
-			case WM_CHAR: {
-				if (focused_) {
-					focused_->OnChar(static_cast<wchar_t>(wParam));
-					focused_->MarkDirty();
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			case WM_IME_STARTCOMPOSITION: {
-				if (focused_) {
-					focused_->OnImeStart(hwnd);
-					focused_->MarkDirty();
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			case WM_IME_COMPOSITION: {
-				if (focused_) {
-					focused_->OnImeComposition(hwnd, lParam);
-					focused_->MarkDirty();
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			case WM_IME_ENDCOMPOSITION: {
-				if (focused_) {
-					focused_->OnImeEnd(hwnd);
-					focused_->MarkDirty();
-					dynamicDirty_ = true;
-				}
-				return;
-			}
-			default:
-				break;
-			}
-		}
-
-		bool HandleKeyDown(WPARAM key, const KeyModifiers& modifiers) {
-			if (focusOrder_.empty()) {
-				return false;
-			}
-			if (key == VK_TAB) {
-				std::vector<UIComponent*> focusable;
-				for (auto* component : focusOrder_) {
-					if (component && component->CanFocus()) {
-						focusable.push_back(component);
-					}
-				}
-				if (focusable.empty()) {
-					return false;
-				}
-				auto it = std::ranges::find(focusable, focused_);
-				if (it == focusable.end()) {
-					UpdateFocused(focusable.front());
-				}
-				else {
-					++it;
-					if (it == focusable.end()) {
-						it = focusable.begin();
-					}
-					UpdateFocused(*it);
-				}
-				dynamicDirty_ = true;
-				return true;
-			}
-			if (focused_) {
-				focused_->OnKeyDown(key, modifiers);
-				focused_->MarkDirty();
-				dynamicDirty_ = true;
-				return true;
-			}
-			return false;
-		}
-
-		void UpdateAnimationProgress(float normalizedProgress) {
-			progressAnimation_.ObserveValue((std::clamp)(normalizedProgress, 0.0f, 1.0f));
-			if (progressBar_) {
-				progressBar_->MarkDirty();
-			}
-			dynamicDirty_ = true;
-		}
-
-		void Render(ID2D1DeviceContext* context = nullptr) {
-			auto* targetContext = context ? context : graphics_.d2dContext.Get();
-			if (!targetContext) {
-				return;
-			}
-			animationSystem_.Update();
-			if (HasLayoutDirty()) {
-				Arrange();
-			}
-			lastFrameCacheRebuildCount_ = 0;
-			lastFrameRenderedComponentCount_ = 0;
-			RefreshComponentClipOwners();
-			UpdateZOrderIfDirty();
-			UpdateStaticSegments(targetContext);
-			auto tasks = GenerateDrawTasks(sortedComponents_, staticSegments_, componentClipOwners_);
-			for (const auto& task : tasks) {
-				if (std::holds_alternative<DrawStaticSegment>(task)) {
-					const auto& staticTask = std::get<DrawStaticSegment>(task);
-					if (staticTask.commandList) {
-						targetContext->DrawImage(staticTask.commandList);
-					}
-					lastFrameRenderedComponentCount_ += static_cast<int>(staticTask.componentCount);
-					continue;
-				}
-				RenderDynamicTask(targetContext, std::get<DrawDynamicControl>(task));
-			}
-#ifndef NDEBUG
-			RenderCacheDiagnostics(targetContext);
-#endif
-			dynamicDirty_ = false;
-		}
-
-	private:
-		using TextBlock = detail::TextBlock;
-		using ExpandableNote = detail::ExpandableNote;
-		using ScrollArea = detail::ScrollArea;
 		using CardSurface = detail::ScrollArea;
-		using Button = detail::Button;
-		using ImageFrame = detail::ImageFrame;
-		using ImageButton = detail::ImageButton;
-		using Checkbox = detail::Checkbox;
-		using RadioButton = detail::RadioButton;
-		using Slider = detail::Slider;
-		using ProgressBar = detail::ProgressBar;
-		using TextInput = detail::TextInput;
-		using ListBox = detail::ListBox;
-		using ChipStrip = detail::ChipStrip;
-		using ComboBox = detail::ComboBox;
-		using ScrollBar = detail::ScrollBar;
-		using Knob = detail::Knob;
-		using ScrollOrientation = detail::ScrollOrientation;
 
 		struct RenderEntry {
 			UIComponent* component = nullptr;
@@ -6421,281 +6224,178 @@ namespace fusion::ui {
 			ComPtr<ID2D1CommandList> commandList;
 		};
 
-		UIComponent* ResolveModalComponent(D2D1_POINT_2F point, bool captureOutside) const {
-			return eventDispatcher_.ResolveModalComponent(components_, point, captureOutside);
-		}
-
-		UIComponent* ResolvePointerTarget(D2D1_POINT_2F point, bool captureOutsideModal) {
-			if (auto* modal = ResolveModalComponent(point, captureOutsideModal)) {
-				return modal;
-			}
-			return Pick(point);
-		}
-
-		CardSurface* CardScrollTarget(D2D1_POINT_2F point) const {
-			if (rightCard_ && rightCard_->Visible() && rightCard_->HitScrollBar(point)) {
-				return rightCard_;
-			}
-			if (leftCard_ && leftCard_->Visible() && leftCard_->HitScrollBar(point)) {
-				return leftCard_;
-			}
-			return nullptr;
-		}
-
-		CardSurface* CardAtPoint(D2D1_POINT_2F point) const {
-			if (rightCard_ && rightCard_->Visible() && UIComponent::PointInRect(rightCard_->Bounds(), point)) {
-				return rightCard_;
-			}
-			if (leftCard_ && leftCard_->Visible() && UIComponent::PointInRect(leftCard_->Bounds(), point)) {
-				return leftCard_;
-			}
-			return nullptr;
-		}
-
-		void UpdateCardHoverState(D2D1_POINT_2F point, UIComponent* target) {
-			auto updateCard = [&](CardSurface* card) {
-				if (!card || !card->Visible()) {
-					return;
-				}
-				if (captured_ == card) {
-					return;
-				}
-				if (target == card || UIComponent::PointInRect(card->Bounds(), point)) {
-					card->CursorAt(point);
-					card->MarkDirty();
-				}
-				else {
-					card->OnHover(false);
-				}
-				};
-			updateCard(leftCard_);
-			updateCard(rightCard_);
-		}
-
 		static Generator<DrawTask> GenerateDrawTasks(
 			std::vector<UIComponent*> sortedSnapshot,
 			std::vector<StaticSegment> staticSegmentsSnapshot,
-			std::unordered_map<UIComponent*, CardSurface*> clipOwnersSnapshot) {
-			auto clipOwnerFor = [&](UIComponent* component) -> CardSurface* {
-				auto found = clipOwnersSnapshot.find(component);
-				return found == clipOwnersSnapshot.end() ? nullptr : found->second;
-			};
+			std::unordered_map<UIComponent*, CardSurface*> clipOwnersSnapshot);
+		void RefreshComponentClipOwners(DemoUiHost& host);
+		void AssignClipOwners(const std::vector<UIComponent*>& items, CardSurface* card);
+		void UpdateZOrderIfDirty(DemoUiHost& host);
+		CardSurface* ClipOwnerForComponent(UIComponent* component) const;
+		bool RenderEntryWithClip(ID2D1DeviceContext* context, const RenderEntry& entry, DemoUiHost& host);
+		void RenderDynamicTask(ID2D1DeviceContext* context, const DrawDynamicControl& task, DemoUiHost& host);
+		bool SameSegmentEntries(const std::vector<RenderEntry>& lhs, const std::vector<RenderEntry>& rhs) const;
+		bool SegmentNeedsRebuild(const StaticSegment& segment) const;
+		void RebuildStaticSegment(ID2D1DeviceContext* context, StaticSegment& segment, DemoUiHost& host);
+		void UpdateStaticSegments(DemoUiHost& host, ID2D1DeviceContext* context);
 
-			size_t segmentIndex = 0;
-			for (size_t index = 0; index < sortedSnapshot.size();) {
-				auto* component = sortedSnapshot[index];
-				if (!component) {
-					++index;
-					continue;
-				}
-				if (component->IsDynamic()) {
-					co_yield DrawDynamicControl{ RenderEntry{ component, clipOwnerFor(component) } };
-					++index;
-					continue;
-				}
+		std::vector<StaticSegment> staticSegments_;
+		std::unordered_map<UIComponent*, CardSurface*> componentClipOwners_;
+		size_t cacheGeneration_ = 1;
+	};
 
-				const size_t segmentStart = index;
-				while (index < sortedSnapshot.size() && sortedSnapshot[index] && !sortedSnapshot[index]->IsDynamic()) {
-					++index;
-				}
-				const size_t segmentCount = index - segmentStart;
-				if (segmentIndex < staticSegmentsSnapshot.size() && staticSegmentsSnapshot[segmentIndex].commandList) {
-					co_yield DrawStaticSegment{ staticSegmentsSnapshot[segmentIndex].commandList.Get(), segmentCount };
-				}
-				else {
-					for (size_t itemIndex = segmentStart; itemIndex < index; ++itemIndex) {
-						auto* staticComponent = sortedSnapshot[itemIndex];
-						if (staticComponent) {
-							co_yield DrawDynamicControl{ RenderEntry{ staticComponent, clipOwnerFor(staticComponent) } };
-						}
-					}
-				}
-				++segmentIndex;
-			}
+	class DemoUiHost {
+	public:
+		DemoUiHost(GraphicsContext graphics, HostCallbacks callbacks)
+			: graphics_(std::move(graphics)), callbacks_(std::move(callbacks)) {
+			animationSystem_.Initialize();
+			InitializeResources();
 		}
 
-		CardSurface* ClipOwnerForComponent(UIComponent* component) const {
-			auto found = componentClipOwners_.find(component);
-			return found == componentClipOwners_.end() ? nullptr : found->second;
+		virtual ~DemoUiHost() = default;
+
+		void InitializeScene() {
+			BuildScene();
+			RebuildSceneGraph();
 		}
 
-		void RefreshComponentClipOwners() {
-			componentClipOwners_.clear();
-			AssignClipOwners(leftLayoutOrder_, leftCard_);
-			AssignClipOwners(rightLayoutOrder_, rightCard_);
-			for (const auto& component : components_) {
-				if (!component || !component->Visible()) {
-					continue;
-				}
-				auto* parent = component->Parent();
-				auto* parentCard = dynamic_cast<CardSurface*>(parent);
-				if (parentCard && parentCard->Visible()) {
-					componentClipOwners_[component.get()] = parentCard;
-				}
+		bool AddSceneComponent(std::string id, std::unique_ptr<UIComponent> component, SceneGraph::Lane lane, bool focusable) {
+			if (!component || sceneGraph_.FindById(id)) {
+				return false;
 			}
-		}
-
-		void AssignClipOwners(const std::vector<UIComponent*>& items, CardSurface* card) {
-			if (!card || !card->Visible()) {
-				return;
-			}
-			for (auto* item : items) {
-				if (!item || !item->Visible()) {
-					continue;
-				}
-				if (item->HasOpenPopup()) {
-					continue;
-				}
-				componentClipOwners_[item] = card;
-			}
-		}
-
-		bool NeedsRenderOrderRefresh() const {
-			if (zOrderDirty_) {
-				return true;
-			}
-			size_t visibleCount = 0;
-			for (const auto& component : components_) {
-				if (component && component->Visible()) {
-					++visibleCount;
-				}
-			}
-			if (visibleCount != sortedComponents_.size()) {
-				return true;
-			}
-			for (size_t index = 0; index < sortedComponents_.size(); ++index) {
-				auto* component = sortedComponents_[index];
-				if (!component || !component->Visible()) {
-					return true;
-				}
-				if (index > 0 && sortedComponents_[index - 1] && sortedComponents_[index - 1]->ZIndex() > component->ZIndex()) {
-					return true;
-				}
-			}
-			return false;
-		}
-
-		void UpdateZOrderIfDirty() {
-			if (!NeedsRenderOrderRefresh()) {
-				return;
-			}
-			sortedComponents_.clear();
-			sortedComponents_.reserve(components_.size());
-			for (const auto& component : components_) {
-				if (component && component->Visible()) {
-					sortedComponents_.push_back(component.get());
-				}
-			}
-			std::stable_sort(sortedComponents_.begin(), sortedComponents_.end(), [](const UIComponent* lhs, const UIComponent* rhs) {
-				return lhs->ZIndex() < rhs->ZIndex();
-			});
-			zOrderDirty_ = false;
+			UIComponent* raw = component.get();
+			raw->AttachAnimationSystem(&animationSystem_);
+			components_.push_back(std::move(component));
+			sceneGraph_.AddNode(std::move(id), raw, raw->Parent(), lane, focusable);
+			SyncOrdersFromSceneGraph();
+			MarkLayoutDirty(kLayoutDirtyStructure | kLayoutDirtySize);
 			hitIndexDirty_ = true;
-			if (!HasLayoutDirty()) {
-				RebuildHitIndex();
-			}
-		}
-
-		bool RenderEntryWithClip(ID2D1DeviceContext* context, const RenderEntry& entry) {
-			if (!context || !entry.component || !entry.component->Visible()) {
-				return false;
-			}
-			const bool useClip = entry.clipOwner && entry.clipOwner->Visible();
-			if (useClip) {
-				context->PushAxisAlignedClip(entry.clipOwner->ContentClipBounds(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-			}
-			const bool rebuilt = entry.component->RenderCached(context);
-			if (useClip) {
-				context->PopAxisAlignedClip();
-			}
-			return rebuilt;
-		}
-
-		void RenderDynamicTask(ID2D1DeviceContext* context, const DrawDynamicControl& task) {
-			if (RenderEntryWithClip(context, task.entry)) {
-				++lastFrameCacheRebuildCount_;
-			}
-			++lastFrameRenderedComponentCount_;
-		}
-
-		bool SameSegmentEntries(const std::vector<RenderEntry>& lhs, const std::vector<RenderEntry>& rhs) const {
-			if (lhs.size() != rhs.size()) {
-				return false;
-			}
-			for (size_t index = 0; index < lhs.size(); ++index) {
-				if (!(lhs[index] == rhs[index])) {
-					return false;
-				}
-			}
+			zOrderDirty_ = true;
+			dynamicDirty_ = true;
 			return true;
 		}
 
-		bool SegmentNeedsRebuild(const StaticSegment& segment) const {
-			if (!segment.commandList) {
-				return true;
+		bool MoveSceneComponent(UIComponent* component, SceneGraph::Lane lane) {
+			if (!sceneGraph_.MoveNode(component, lane)) {
+				return false;
 			}
-			for (const auto& entry : segment.entries) {
-				if (!entry.component || !entry.component->Visible() || entry.component->NeedsCacheRefresh() || entry.component->NeedsRedraw()) {
-					return true;
-				}
-			}
-			return false;
+			SyncOrdersFromSceneGraph();
+			MarkLayoutDirty(kLayoutDirtyStructure | kLayoutDirtySize);
+			zOrderDirty_ = true;
+			dynamicDirty_ = true;
+			return true;
 		}
 
-		void RebuildStaticSegment(ID2D1DeviceContext* context, StaticSegment& segment) {
-			if (!context) {
+		bool RemoveSceneComponentById(const std::string& id) {
+			UIComponent* target = sceneGraph_.FindById(id);
+			if (!target) {
+				return false;
+			}
+			auto it = std::remove_if(components_.begin(), components_.end(), [target](const std::unique_ptr<UIComponent>& component) {
+				return component.get() == target;
+			});
+			if (it == components_.end()) {
+				return false;
+			}
+			components_.erase(it, components_.end());
+			sceneGraph_.RemoveById(id);
+			SyncOrdersFromSceneGraph();
+			if (hovered_ == target) hovered_ = nullptr;
+			if (focused_ == target) focused_ = nullptr;
+			if (captured_ == target) captured_ = nullptr;
+			MarkLayoutDirty(kLayoutDirtyStructure | kLayoutDirtySize);
+			hitIndexDirty_ = true;
+			zOrderDirty_ = true;
+			dynamicDirty_ = true;
+			return true;
+		}
+
+		CursorKind CurrentCursor() const {
+			return currentCursor_;
+		}
+
+		bool NeedsRedraw() const {
+			return dirtyManager_.NeedsRedraw(HasLayoutDirty(), HasDirtyComponents(), renderEngine_.NeedsRenderOrderRefresh(*this));
+		}
+
+		bool NeedsContinuousRedraw() const {
+			return NeedsRedraw() || animationSystem_.HasRunningAnimations() || HasPendingFrameTicks();
+		}
+
+		D2D1_RECT_F VisibleUiBounds() const {
+			return visibleUiBounds_;
+		}
+
+		void UpdateViewport(const D2D1_RECT_F& viewport, float dpiScale) {
+			if (viewport.left != viewport_.left || viewport.top != viewport_.top || viewport.right != viewport_.right || viewport.bottom != viewport_.bottom || dpiScale != dpiScale_) {
+				const D2D1_RECT_F previousViewport = viewport_;
+				viewport_ = viewport;
+				dpiScale_ = dpiScale;
+				MarkLayoutDirty(kLayoutDirtySize);
+				if (!hitIndex_.ContainsBounds(previousViewport) || !hitIndex_.ContainsBounds(viewport_)) {
+					hitIndexDirty_ = true;
+				}
+				zOrderDirty_ = true;
+				dynamicDirty_ = true;
+			}
+		}
+
+		void HandleWin32Message(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+			eventDispatcher_.HandleWin32Message(*this, hwnd, msg, wParam, lParam);
+		}
+
+		bool HandleKeyDown(WPARAM key, const KeyModifiers& modifiers) {
+			return eventDispatcher_.HandleKeyDown(*this, key, modifiers);
+		}
+
+		void UpdateAnimationProgress(float normalizedProgress) {
+			progressAnimation_.ObserveValue((std::clamp)(normalizedProgress, 0.0f, 1.0f));
+			if (progressBar_) {
+				progressBar_->MarkDirty();
+			}
+			dynamicDirty_ = true;
+		}
+
+		void Render(ID2D1DeviceContext* context = nullptr) {
+			auto* targetContext = context ? context : graphics_.d2dContext.Get();
+			if (!targetContext) {
 				return;
 			}
-			ComPtr<ID2D1Image> previousTarget;
-			context->GetTarget(&previousTarget);
-			segment.commandList.Reset();
-			context->CreateCommandList(&segment.commandList);
-			if (!segment.commandList) {
-				return;
+			animationSystem_.Update();
+			if (HasLayoutDirty()) {
+				Arrange();
 			}
-			context->SetTarget(segment.commandList.Get());
-			for (const auto& entry : segment.entries) {
-				if (RenderEntryWithClip(context, entry)) {
-					++lastFrameCacheRebuildCount_;
-				}
-			}
-			context->SetTarget(previousTarget.Get());
-			segment.commandList->Close();
+			renderEngine_.Render(*this, targetContext);
+#ifndef NDEBUG
+			RenderCacheDiagnostics(targetContext);
+#endif
+			dynamicDirty_ = false;
 		}
 
-		void UpdateStaticSegments(ID2D1DeviceContext* context) {
-			std::vector<StaticSegment> updatedSegments;
-			updatedSegments.reserve(staticSegments_.size());
-			size_t previousSegmentIndex = 0;
-			for (size_t index = 0; index < sortedComponents_.size();) {
-				auto* component = sortedComponents_[index];
-				if (!component) {
-					++index;
-					continue;
-				}
-				if (component->IsDynamic()) {
-					++index;
-					continue;
-				}
+	private:
+		using TextBlock = detail::TextBlock;
+		using ExpandableNote = detail::ExpandableNote;
+		using ScrollArea = detail::ScrollArea;
+		using CardSurface = detail::ScrollArea;
+		using Button = detail::Button;
+		using ImageFrame = detail::ImageFrame;
+		using ImageButton = detail::ImageButton;
+		using Checkbox = detail::Checkbox;
+		using RadioButton = detail::RadioButton;
+		using Slider = detail::Slider;
+		using ProgressBar = detail::ProgressBar;
+		using TextInput = detail::TextInput;
+		using ListBox = detail::ListBox;
+		using ChipStrip = detail::ChipStrip;
+		using ComboBox = detail::ComboBox;
+		using ScrollBar = detail::ScrollBar;
+		using Knob = detail::Knob;
+		using ScrollOrientation = detail::ScrollOrientation;
 
-				StaticSegment segment;
-				while (index < sortedComponents_.size() && sortedComponents_[index] && !sortedComponents_[index]->IsDynamic()) {
-					auto* staticComponent = sortedComponents_[index];
-					segment.entries.push_back(RenderEntry{ staticComponent, ClipOwnerForComponent(staticComponent) });
-					++index;
-				}
-
-				if (previousSegmentIndex < staticSegments_.size() && SameSegmentEntries(staticSegments_[previousSegmentIndex].entries, segment.entries)) {
-					segment.commandList = staticSegments_[previousSegmentIndex].commandList;
-				}
-				if (SegmentNeedsRebuild(segment)) {
-					RebuildStaticSegment(context, segment);
-				}
-				updatedSegments.push_back(std::move(segment));
-				++previousSegmentIndex;
-			}
-			staticSegments_ = std::move(updatedSegments);
-		}
+		void RebuildSceneGraph();
+		void SyncOrdersFromSceneGraph();
+		bool ExistsInComponents(UIComponent* candidate) const;
+		static std::string MakeSceneNodeId(size_t index);
 
 		void RenderCacheDiagnostics(ID2D1DeviceContext* context) {
 #ifndef NDEBUG
@@ -7184,7 +6884,7 @@ namespace fusion::ui {
 			if (!leftCard_ || !rightCard_) {
 				return;
 			}
-			dirtyManager_.SyncLayoutOrders(components_);
+			SyncOrdersFromSceneGraph();
 			const float gap = 24.0f;
 			const float availableWidth = viewport_.right - viewport_.left - 48.0f;
 			const bool twoColumn = availableWidth >= 420.0f;
@@ -7289,7 +6989,7 @@ namespace fusion::ui {
 		}
 
 		UIComponent* Pick(D2D1_POINT_2F point) {
-			if (auto* modal = ResolveModalComponent(point, false)) {
+			if (auto* modal = eventDispatcher_.ResolveModalComponent(components_, point, false)) {
 				return modal;
 			}
 			return hitIndex_.QueryTopHit(point, graphics_.d2dFactory.Get());
@@ -7331,6 +7031,9 @@ namespace fusion::ui {
 			}
 		}
 
+		friend class EventDispatcher;
+		friend class RenderEngine;
+
 		GraphicsContext graphics_;
 		HostCallbacks callbacks_;
 		D2D1_RECT_F viewport_{ D2D1::RectF() };
@@ -7352,8 +7055,7 @@ namespace fusion::ui {
 
 		std::vector<std::unique_ptr<UIComponent>> components_;
 		std::vector<UIComponent*>& sortedComponents_ = dirtyManager_.SortedComponentsRef();
-		std::vector<StaticSegment> staticSegments_;
-		std::unordered_map<UIComponent*, CardSurface*> componentClipOwners_;
+		SceneGraph sceneGraph_{};
 		std::vector<UIComponent*>& leftLayoutOrder_ = dirtyManager_.LeftLayoutOrderRef();
 		std::vector<UIComponent*>& rightLayoutOrder_ = dirtyManager_.RightLayoutOrderRef();
 		std::vector<UIComponent*> focusOrder_;
@@ -7387,6 +7089,557 @@ namespace fusion::ui {
 		int lastFrameCacheRebuildCount_ = 0;
 		int lastFrameRenderedComponentCount_ = 0;
 	};
+
+	inline std::string DemoUiHost::MakeSceneNodeId(size_t index) {
+		return std::string("component_") + std::to_string(index);
+	}
+
+	inline bool DemoUiHost::ExistsInComponents(UIComponent* candidate) const {
+		for (const auto& component : components_) {
+			if (component.get() == candidate) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline void DemoUiHost::SyncOrdersFromSceneGraph() {
+		leftLayoutOrder_ = sceneGraph_.LaneOrder(SceneGraph::Lane::LeftCard);
+		rightLayoutOrder_ = sceneGraph_.LaneOrder(SceneGraph::Lane::RightCard);
+		focusOrder_ = sceneGraph_.FocusOrder();
+		dirtyManager_.SyncLayoutOrders(components_);
+
+		std::vector<UIComponent*> filteredFocus;
+		filteredFocus.reserve(focusOrder_.size());
+		for (auto* component : focusOrder_) {
+			if (component && ExistsInComponents(component)) {
+				filteredFocus.push_back(component);
+			}
+		}
+		focusOrder_.swap(filteredFocus);
+	}
+
+	inline void DemoUiHost::RebuildSceneGraph() {
+		auto contains = [](const std::vector<UIComponent*>& items, UIComponent* target) {
+			return std::find(items.begin(), items.end(), target) != items.end();
+		};
+
+		sceneGraph_.Clear();
+		size_t index = 0;
+		for (const auto& component : components_) {
+			if (!component) {
+				continue;
+			}
+			UIComponent* raw = component.get();
+			SceneGraph::Lane lane = SceneGraph::Lane::Floating;
+			if (contains(leftLayoutOrder_, raw)) {
+				lane = SceneGraph::Lane::LeftCard;
+			}
+			else if (contains(rightLayoutOrder_, raw)) {
+				lane = SceneGraph::Lane::RightCard;
+			}
+			const bool focusable = contains(focusOrder_, raw);
+			sceneGraph_.AddNode(MakeSceneNodeId(index++), raw, raw->Parent(), lane, focusable);
+		}
+		SyncOrdersFromSceneGraph();
+	}
+
+	inline void EventDispatcher::HandleWin32Message(DemoUiHost& host, HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) const {
+		if (!host.graphics_.d2dFactory || host.components_.empty()) {
+			return;
+		}
+
+		auto resolvePointerTarget = [&](D2D1_POINT_2F point, bool captureOutsideModal) -> UIComponent* {
+			if (auto* modal = ResolveModalComponent(host.components_, point, captureOutsideModal)) {
+				return modal;
+			}
+			return host.Pick(point);
+		};
+
+		auto cardScrollTarget = [&](D2D1_POINT_2F point) -> DemoUiHost::CardSurface* {
+			if (host.rightCard_ && host.rightCard_->Visible() && host.rightCard_->HitScrollBar(point)) {
+				return host.rightCard_;
+			}
+			if (host.leftCard_ && host.leftCard_->Visible() && host.leftCard_->HitScrollBar(point)) {
+				return host.leftCard_;
+			}
+			return nullptr;
+		};
+
+		auto cardAtPoint = [&](D2D1_POINT_2F point) -> DemoUiHost::CardSurface* {
+			if (host.rightCard_ && host.rightCard_->Visible() && UIComponent::PointInRect(host.rightCard_->Bounds(), point)) {
+				return host.rightCard_;
+			}
+			if (host.leftCard_ && host.leftCard_->Visible() && UIComponent::PointInRect(host.leftCard_->Bounds(), point)) {
+				return host.leftCard_;
+			}
+			return nullptr;
+		};
+
+		auto updateCardHoverState = [&](D2D1_POINT_2F point, UIComponent* target) {
+			auto updateOneCard = [&](DemoUiHost::CardSurface* card) {
+				if (!card || !card->Visible() || host.captured_ == card) {
+					return;
+				}
+				if (target == card || UIComponent::PointInRect(card->Bounds(), point)) {
+					card->CursorAt(point);
+					card->MarkDirty();
+				}
+				else {
+					card->OnHover(false);
+				}
+			};
+			updateOneCard(host.leftCard_);
+			updateOneCard(host.rightCard_);
+		};
+
+		D2D1_POINT_2F point = D2D1::Point2F();
+		const bool hasMousePoint = msg == WM_MOUSEMOVE || msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_MOUSEWHEEL;
+		if (msg == WM_MOUSEWHEEL) {
+			POINT screenPoint{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+			ScreenToClient(hwnd, &screenPoint);
+			point = D2D1::Point2F(static_cast<float>(screenPoint.x) / host.dpiScale_, static_cast<float>(screenPoint.y) / host.dpiScale_);
+		}
+		else if (hasMousePoint) {
+			point = D2D1::Point2F(static_cast<float>(GET_X_LPARAM(lParam)) / host.dpiScale_, static_cast<float>(GET_Y_LPARAM(lParam)) / host.dpiScale_);
+		}
+
+		switch (msg) {
+		case WM_MOUSEMOVE: {
+			if (!host.PointInViewport(point)) {
+				updateCardHoverState(point, nullptr);
+				host.ClearHover();
+				host.currentCursor_ = CursorKind::None;
+				host.dynamicDirty_ = true;
+				return;
+			}
+			UIComponent* target = host.captured_ ? host.captured_ : resolvePointerTarget(point, true);
+			updateCardHoverState(point, target);
+			host.UpdateHovered(target == host.leftCard_ || target == host.rightCard_ ? nullptr : target);
+			if (cardScrollTarget(point)) {
+				host.currentCursor_ = CursorKind::Arrow;
+			}
+			else {
+				host.currentCursor_ = (target && target != host.leftCard_ && target != host.rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
+				if (target) {
+					target->MarkDirty();
+				}
+			}
+			if (host.captured_) {
+				const float previousScrollOffset = host.ScrollOffsetForCard(host.captured_);
+				host.captured_->OnPointerMove(point);
+				host.captured_->MarkDirty();
+				host.RefreshCardLayoutIfScrollChanged(host.captured_, previousScrollOffset);
+			}
+			host.dynamicDirty_ = true;
+			return;
+		}
+		case WM_LBUTTONDOWN: {
+			if (!host.PointInViewport(point)) {
+				host.UpdateFocused(nullptr);
+				host.currentCursor_ = CursorKind::None;
+				return;
+			}
+			if (auto* cardTarget = cardScrollTarget(point)) {
+				host.UpdateFocused(nullptr);
+				host.captured_ = cardTarget;
+				updateCardHoverState(point, cardTarget);
+				host.currentCursor_ = CursorKind::Arrow;
+				const float previousScrollOffset = cardTarget->ScrollOffset();
+				cardTarget->OnPointerDown(point);
+				cardTarget->MarkDirty();
+				host.RefreshCardLayoutIfScrollChanged(cardTarget, previousScrollOffset);
+				host.dynamicDirty_ = true;
+				return;
+			}
+			UIComponent* target = resolvePointerTarget(point, true);
+			updateCardHoverState(point, target);
+			host.currentCursor_ = (target && target != host.leftCard_ && target != host.rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
+			host.UpdateFocused(target && target->IsFocusable() ? target : nullptr);
+			host.captured_ = target;
+			if (target) {
+				target->OnPointerDown(point);
+				target->MarkDirty();
+				host.dynamicDirty_ = true;
+			}
+			return;
+		}
+		case WM_LBUTTONUP: {
+			if (host.captured_) {
+				const float previousScrollOffset = host.ScrollOffsetForCard(host.captured_);
+				host.captured_->OnPointerUp(point);
+				host.captured_->MarkDirty();
+				host.RefreshCardLayoutIfScrollChanged(host.captured_, previousScrollOffset);
+				host.captured_ = nullptr;
+				UIComponent* target = host.PointInViewport(point) ? resolvePointerTarget(point, true) : nullptr;
+				updateCardHoverState(point, target);
+				host.UpdateHovered(target == host.leftCard_ || target == host.rightCard_ ? nullptr : target);
+				if (host.PointInViewport(point) && cardScrollTarget(point)) {
+					host.currentCursor_ = CursorKind::Arrow;
+				}
+				else {
+					host.currentCursor_ = (target && target != host.leftCard_ && target != host.rightCard_) ? target->CursorAt(point) : (host.PointInViewport(point) ? CursorKind::Arrow : CursorKind::None);
+					if (target) {
+						target->MarkDirty();
+					}
+				}
+				host.dynamicDirty_ = true;
+			}
+			return;
+		}
+		case WM_MOUSELEAVE: {
+			updateCardHoverState(point, nullptr);
+			host.ClearHover();
+			host.currentCursor_ = CursorKind::None;
+			host.dynamicDirty_ = true;
+			return;
+		}
+		case WM_MOUSEWHEEL: {
+			const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+			if (auto* modal = ResolveModalComponent(host.components_, point, false)) {
+				if (modal->OnMouseWheel(delta, point)) {
+					modal->MarkDirty();
+					host.dynamicDirty_ = true;
+					return;
+				}
+			}
+
+			std::vector<UIComponent*> candidates;
+			host.hitIndex_.GatherCandidates(point, candidates);
+			std::ranges::sort(candidates, [](const UIComponent* lhs, const UIComponent* rhs) {
+				return lhs && rhs ? lhs->ZIndex() > rhs->ZIndex() : lhs != nullptr;
+			});
+
+			for (auto* target : candidates) {
+				if (target && target->OnMouseWheel(delta, point)) {
+					target->MarkDirty();
+					host.dynamicDirty_ = true;
+					return;
+				}
+			}
+
+			if (auto* card = cardAtPoint(point)) {
+				const float previousScrollOffset = card->ScrollOffset();
+				if (card->OnMouseWheel(delta, point)) {
+					card->MarkDirty();
+					host.RefreshCardLayoutIfScrollChanged(card, previousScrollOffset);
+					host.dynamicDirty_ = true;
+				}
+			}
+			return;
+		}
+		case WM_CHAR:
+			if (host.focused_) {
+				host.focused_->OnChar(static_cast<wchar_t>(wParam));
+				host.focused_->MarkDirty();
+				host.dynamicDirty_ = true;
+			}
+			return;
+		case WM_IME_STARTCOMPOSITION:
+			if (host.focused_) {
+				host.focused_->OnImeStart(hwnd);
+				host.focused_->MarkDirty();
+				host.dynamicDirty_ = true;
+			}
+			return;
+		case WM_IME_COMPOSITION:
+			if (host.focused_) {
+				host.focused_->OnImeComposition(hwnd, lParam);
+				host.focused_->MarkDirty();
+				host.dynamicDirty_ = true;
+			}
+			return;
+		case WM_IME_ENDCOMPOSITION:
+			if (host.focused_) {
+				host.focused_->OnImeEnd(hwnd);
+				host.focused_->MarkDirty();
+				host.dynamicDirty_ = true;
+			}
+			return;
+		default:
+			return;
+		}
+	}
+
+	inline bool EventDispatcher::HandleKeyDown(DemoUiHost& host, WPARAM key, const KeyModifiers& modifiers) const {
+		if (host.focusOrder_.empty()) {
+			return false;
+		}
+		if (key == VK_TAB) {
+			std::vector<UIComponent*> focusable;
+			for (auto* component : host.focusOrder_) {
+				if (component && component->CanFocus()) {
+					focusable.push_back(component);
+				}
+			}
+			if (focusable.empty()) {
+				return false;
+			}
+			auto it = std::ranges::find(focusable, host.focused_);
+			if (it == focusable.end()) {
+				host.UpdateFocused(focusable.front());
+			}
+			else {
+				++it;
+				if (it == focusable.end()) {
+					it = focusable.begin();
+				}
+				host.UpdateFocused(*it);
+			}
+			host.dynamicDirty_ = true;
+			return true;
+		}
+		if (host.focused_) {
+			host.focused_->OnKeyDown(key, modifiers);
+			host.focused_->MarkDirty();
+			host.dynamicDirty_ = true;
+			return true;
+		}
+		return false;
+	}
+
+	inline Generator<RenderEngine::DrawTask> RenderEngine::GenerateDrawTasks(
+		std::vector<UIComponent*> sortedSnapshot,
+		std::vector<StaticSegment> staticSegmentsSnapshot,
+		std::unordered_map<UIComponent*, CardSurface*> clipOwnersSnapshot) {
+		auto clipOwnerFor = [&](UIComponent* component) -> CardSurface* {
+			auto found = clipOwnersSnapshot.find(component);
+			return found == clipOwnersSnapshot.end() ? nullptr : found->second;
+		};
+
+		size_t segmentIndex = 0;
+		for (size_t index = 0; index < sortedSnapshot.size();) {
+			auto* component = sortedSnapshot[index];
+			if (!component) {
+				++index;
+				continue;
+			}
+			if (component->IsDynamic()) {
+				co_yield DrawDynamicControl{ RenderEntry{ component, clipOwnerFor(component) } };
+				++index;
+				continue;
+			}
+
+			const size_t segmentStart = index;
+			while (index < sortedSnapshot.size() && sortedSnapshot[index] && !sortedSnapshot[index]->IsDynamic()) {
+				++index;
+			}
+			const size_t segmentCount = index - segmentStart;
+			if (segmentIndex < staticSegmentsSnapshot.size() && staticSegmentsSnapshot[segmentIndex].commandList) {
+				co_yield DrawStaticSegment{ staticSegmentsSnapshot[segmentIndex].commandList.Get(), segmentCount };
+			}
+			else {
+				for (size_t itemIndex = segmentStart; itemIndex < index; ++itemIndex) {
+					auto* staticComponent = sortedSnapshot[itemIndex];
+					if (staticComponent) {
+						co_yield DrawDynamicControl{ RenderEntry{ staticComponent, clipOwnerFor(staticComponent) } };
+					}
+				}
+			}
+			++segmentIndex;
+		}
+	}
+
+	inline void RenderEngine::RefreshComponentClipOwners(DemoUiHost& host) {
+		componentClipOwners_.clear();
+		AssignClipOwners(host.leftLayoutOrder_, host.leftCard_);
+		AssignClipOwners(host.rightLayoutOrder_, host.rightCard_);
+		for (const auto& component : host.components_) {
+			if (!component || !component->Visible()) {
+				continue;
+			}
+			auto* parent = component->Parent();
+			auto* parentCard = dynamic_cast<CardSurface*>(parent);
+			if (parentCard && parentCard->Visible()) {
+				componentClipOwners_[component.get()] = parentCard;
+			}
+		}
+	}
+
+	inline void RenderEngine::AssignClipOwners(const std::vector<UIComponent*>& items, CardSurface* card) {
+		if (!card || !card->Visible()) {
+			return;
+		}
+		for (auto* item : items) {
+			if (!item || !item->Visible() || item->HasOpenPopup()) {
+				continue;
+			}
+			componentClipOwners_[item] = card;
+		}
+	}
+
+	inline bool RenderEngine::NeedsRenderOrderRefresh(const DemoUiHost& host) const {
+		if (host.zOrderDirty_) {
+			return true;
+		}
+		size_t visibleCount = 0;
+		for (const auto& component : host.components_) {
+			if (component && component->Visible()) {
+				++visibleCount;
+			}
+		}
+		if (visibleCount != host.sortedComponents_.size()) {
+			return true;
+		}
+		for (size_t index = 0; index < host.sortedComponents_.size(); ++index) {
+			auto* component = host.sortedComponents_[index];
+			if (!component || !component->Visible()) {
+				return true;
+			}
+			if (index > 0 && host.sortedComponents_[index - 1] && host.sortedComponents_[index - 1]->ZIndex() > component->ZIndex()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline void RenderEngine::UpdateZOrderIfDirty(DemoUiHost& host) {
+		if (!NeedsRenderOrderRefresh(host)) {
+			return;
+		}
+		host.sortedComponents_.clear();
+		host.sortedComponents_.reserve(host.components_.size());
+		for (const auto& component : host.components_) {
+			if (component && component->Visible()) {
+				host.sortedComponents_.push_back(component.get());
+			}
+		}
+		std::stable_sort(host.sortedComponents_.begin(), host.sortedComponents_.end(), [](const UIComponent* lhs, const UIComponent* rhs) {
+			return lhs->ZIndex() < rhs->ZIndex();
+		});
+		host.zOrderDirty_ = false;
+		host.hitIndexDirty_ = true;
+		if (!host.HasLayoutDirty()) {
+			host.RebuildHitIndex();
+		}
+	}
+
+	inline RenderEngine::CardSurface* RenderEngine::ClipOwnerForComponent(UIComponent* component) const {
+		auto found = componentClipOwners_.find(component);
+		return found == componentClipOwners_.end() ? nullptr : found->second;
+	}
+
+	inline bool RenderEngine::RenderEntryWithClip(ID2D1DeviceContext* context, const RenderEntry& entry, DemoUiHost& host) {
+		if (!context || !entry.component || !entry.component->Visible()) {
+			return false;
+		}
+		const bool useClip = entry.clipOwner && entry.clipOwner->Visible();
+		if (useClip) {
+			context->PushAxisAlignedClip(entry.clipOwner->ContentClipBounds(), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+		}
+		const bool rebuilt = entry.component->RenderCached(context);
+		if (useClip) {
+			context->PopAxisAlignedClip();
+		}
+		(void)host;
+		return rebuilt;
+	}
+
+	inline void RenderEngine::RenderDynamicTask(ID2D1DeviceContext* context, const DrawDynamicControl& task, DemoUiHost& host) {
+		if (RenderEntryWithClip(context, task.entry, host)) {
+			++host.lastFrameCacheRebuildCount_;
+		}
+		++host.lastFrameRenderedComponentCount_;
+	}
+
+	inline bool RenderEngine::SameSegmentEntries(const std::vector<RenderEntry>& lhs, const std::vector<RenderEntry>& rhs) const {
+		if (lhs.size() != rhs.size()) {
+			return false;
+		}
+		for (size_t index = 0; index < lhs.size(); ++index) {
+			if (!(lhs[index] == rhs[index])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	inline bool RenderEngine::SegmentNeedsRebuild(const StaticSegment& segment) const {
+		if (!segment.commandList) {
+			return true;
+		}
+		for (const auto& entry : segment.entries) {
+			if (!entry.component || !entry.component->Visible() || entry.component->NeedsCacheRefresh() || entry.component->NeedsRedraw()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	inline void RenderEngine::RebuildStaticSegment(ID2D1DeviceContext* context, StaticSegment& segment, DemoUiHost& host) {
+		if (!context) {
+			return;
+		}
+		ComPtr<ID2D1Image> previousTarget;
+		context->GetTarget(&previousTarget);
+		segment.commandList.Reset();
+		context->CreateCommandList(&segment.commandList);
+		if (!segment.commandList) {
+			return;
+		}
+		context->SetTarget(segment.commandList.Get());
+		for (const auto& entry : segment.entries) {
+			if (RenderEntryWithClip(context, entry, host)) {
+				++host.lastFrameCacheRebuildCount_;
+			}
+		}
+		context->SetTarget(previousTarget.Get());
+		segment.commandList->Close();
+	}
+
+	inline void RenderEngine::UpdateStaticSegments(DemoUiHost& host, ID2D1DeviceContext* context) {
+		std::vector<StaticSegment> updatedSegments;
+		updatedSegments.reserve(staticSegments_.size());
+		size_t previousSegmentIndex = 0;
+		for (size_t index = 0; index < host.sortedComponents_.size();) {
+			auto* component = host.sortedComponents_[index];
+			if (!component) {
+				++index;
+				continue;
+			}
+			if (component->IsDynamic()) {
+				++index;
+				continue;
+			}
+
+			StaticSegment segment;
+			while (index < host.sortedComponents_.size() && host.sortedComponents_[index] && !host.sortedComponents_[index]->IsDynamic()) {
+				auto* staticComponent = host.sortedComponents_[index];
+				segment.entries.push_back(RenderEntry{ staticComponent, ClipOwnerForComponent(staticComponent) });
+				++index;
+			}
+
+			if (previousSegmentIndex < staticSegments_.size() && SameSegmentEntries(staticSegments_[previousSegmentIndex].entries, segment.entries)) {
+				segment.commandList = staticSegments_[previousSegmentIndex].commandList;
+			}
+			if (SegmentNeedsRebuild(segment)) {
+				RebuildStaticSegment(context, segment, host);
+			}
+			updatedSegments.push_back(std::move(segment));
+			++previousSegmentIndex;
+		}
+		staticSegments_ = std::move(updatedSegments);
+	}
+
+	inline void RenderEngine::Render(DemoUiHost& host, ID2D1DeviceContext* context) {
+		host.lastFrameCacheRebuildCount_ = 0;
+		host.lastFrameRenderedComponentCount_ = 0;
+		RefreshComponentClipOwners(host);
+		UpdateZOrderIfDirty(host);
+		UpdateStaticSegments(host, context);
+		auto tasks = GenerateDrawTasks(host.sortedComponents_, staticSegments_, componentClipOwners_);
+		for (const auto& task : tasks) {
+			if (std::holds_alternative<DrawStaticSegment>(task)) {
+				const auto& staticTask = std::get<DrawStaticSegment>(task);
+				if (staticTask.commandList) {
+					context->DrawImage(staticTask.commandList);
+				}
+				host.lastFrameRenderedComponentCount_ += static_cast<int>(staticTask.componentCount);
+				continue;
+			}
+			RenderDynamicTask(context, std::get<DrawDynamicControl>(task), host);
+		}
+	}
 
 	class DefaultDemoUiHost final : public DemoUiHost {
 	public:
