@@ -14,6 +14,8 @@ public struct RECT { public int Left; public int Top; public int Right; public i
 
 public static class Native {
     public const int SW_RESTORE = 9;
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+    public const uint WM_INPUTLANGCHANGEREQUEST = 0x0050;
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
@@ -37,10 +39,15 @@ public static class Native {
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT point);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll", SetLastError = true)] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll", SetLastError = true)] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool IsIconic(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll", SetLastError = true)] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool PostMessageW(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern short VkKeyScanW(char ch);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr LoadKeyboardLayoutW(string pwszKLID, uint Flags);
+    [DllImport("user32.dll")] public static extern IntPtr ActivateKeyboardLayout(IntPtr hkl, uint Flags);
     
     [DllImport("user32.dll")] public static extern IntPtr GetTopWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
@@ -193,8 +200,8 @@ function Get-ClientBoundsInWindow {
     }
 }
 
-function Save-Capture([string]$name, [switch]$useCopyFromScreen) {
-    $rect = Get-Rect
+function Save-Capture([string]$name, [switch]$useCopyFromScreen, [switch]$fullScreen) {
+    $rect = if ($fullScreen) { [System.Windows.Forms.Screen]::PrimaryScreen.Bounds } else { Get-Rect }
     $width = $rect.Right - $rect.Left
     $height = $rect.Bottom - $rect.Top
 
@@ -362,6 +369,55 @@ function Send-KeyDown([int]$virtualKey) {
     [Native]::SendMessageW($hwnd, [Native]::WM_KEYDOWN, [IntPtr]$virtualKey, [IntPtr]::Zero) | Out-Null
 }
 
+function Send-PhysicalKeyDown([int]$virtualKey) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    [Native]::keybd_event([byte]$virtualKey, 0, 0, [UIntPtr]::Zero)
+}
+
+function Send-PhysicalKeyUp([int]$virtualKey) {
+    [Native]::keybd_event([byte]$virtualKey, 0, [Native]::KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+}
+
+function Send-PhysicalKeyPress([int]$virtualKey, [int]$delayMs = 40) {
+    Send-PhysicalKeyDown $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-PhysicalKeyUp $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+}
+
+function Send-PhysicalKeyChord([int]$modifierVirtualKey, [int]$virtualKey, [int]$delayMs = 45) {
+    Send-PhysicalKeyDown $modifierVirtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-PhysicalKeyDown $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-PhysicalKeyUp $virtualKey
+    Start-Sleep -Milliseconds $delayMs
+    Send-PhysicalKeyUp $modifierVirtualKey
+    Start-Sleep -Milliseconds $delayMs
+}
+
+function Send-PhysicalText([string]$text, [int]$delayMs = 70) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    foreach ($ch in $text.ToCharArray()) {
+        $vkInfo = [Native]::VkKeyScanW($ch)
+        if ($vkInfo -lt 0) {
+            continue
+        }
+        $virtualKey = $vkInfo -band 0xFF
+        $shiftState = ($vkInfo -shr 8) -band 0xFF
+        if (($shiftState -band 1) -ne 0) { Send-PhysicalKeyDown ([Native]::VK_SHIFT) }
+        if (($shiftState -band 2) -ne 0) { Send-PhysicalKeyDown ([Native]::VK_CONTROL) }
+        if (($shiftState -band 4) -ne 0) { Send-PhysicalKeyDown ([Native]::VK_MENU) }
+        Send-PhysicalKeyDown $virtualKey
+        Start-Sleep -Milliseconds $delayMs
+        Send-PhysicalKeyUp $virtualKey
+        if (($shiftState -band 4) -ne 0) { Send-PhysicalKeyUp ([Native]::VK_MENU) }
+        if (($shiftState -band 2) -ne 0) { Send-PhysicalKeyUp ([Native]::VK_CONTROL) }
+        if (($shiftState -band 1) -ne 0) { Send-PhysicalKeyUp ([Native]::VK_SHIFT) }
+        Start-Sleep -Milliseconds $delayMs
+    }
+}
+
 function Send-KeyUp([int]$virtualKey) {
     [Native]::SendMessageW($hwnd, [Native]::WM_KEYUP, [IntPtr]$virtualKey, [IntPtr]::Zero) | Out-Null
 }
@@ -384,12 +440,42 @@ function Send-KeyChord([int]$modifierVirtualKey, [int]$virtualKey, [int]$delayMs
     Start-Sleep -Milliseconds $delayMs
 }
 
+function Send-KeyText([string]$text, [int]$delayMs = 55) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    foreach ($ch in $text.ToCharArray()) {
+        $vkInfo = [Native]::VkKeyScanW($ch)
+        if ($vkInfo -lt 0) {
+            continue
+        }
+        $virtualKey = $vkInfo -band 0xFF
+        $shiftState = ($vkInfo -shr 8) -band 0xFF
+        if (($shiftState -band 1) -ne 0) { Send-KeyDown ([Native]::VK_SHIFT) }
+        if (($shiftState -band 2) -ne 0) { Send-KeyDown ([Native]::VK_CONTROL) }
+        if (($shiftState -band 4) -ne 0) { Send-KeyDown ([Native]::VK_MENU) }
+        Send-KeyPress $virtualKey $delayMs
+        if (($shiftState -band 4) -ne 0) { Send-KeyUp ([Native]::VK_MENU) }
+        if (($shiftState -band 2) -ne 0) { Send-KeyUp ([Native]::VK_CONTROL) }
+        if (($shiftState -band 1) -ne 0) { Send-KeyUp ([Native]::VK_SHIFT) }
+        Start-Sleep -Milliseconds $delayMs
+    }
+}
+
 function Send-Text([string]$text, [int]$delayMs = 22) {
     [Native]::SetForegroundWindow($hwnd) | Out-Null
     foreach ($ch in $text.ToCharArray()) {
         [Native]::SendMessageW($hwnd, [Native]::WM_CHAR, [IntPtr][int][char]$ch, [IntPtr]::Zero) | Out-Null
         Start-Sleep -Milliseconds $delayMs
     }
+}
+
+function Ensure-ChineseIme([int]$delayMs = 180) {
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+    $hkl = [Native]::LoadKeyboardLayoutW('00000804', 1)
+    if ($hkl -ne [IntPtr]::Zero) {
+        [Native]::ActivateKeyboardLayout($hkl, 0) | Out-Null
+        [Native]::PostMessageW($hwnd, [Native]::WM_INPUTLANGCHANGEREQUEST, [IntPtr]::Zero, $hkl) | Out-Null
+    }
+    Start-Sleep -Milliseconds $delayMs
 }
 
 function Send-Enter([int]$delayMs = 40) {
@@ -769,13 +855,19 @@ Send-Text 'short text'
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_01c_single_collapsed.png'
 
-Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
-Start-Sleep -Milliseconds 130
+$singleImePoint = Get-ScreenPoint ($controlLeft + (Scale-Logical 16)) $singleInputY
+Click-ScreenLeft $singleImePoint.X $singleImePoint.Y 160
 Save-Capture 'native_ui_01ad_single_ime_before.png' -useCopyFromScreen
-Send-KeyChord ([Native]::VK_CONTROL) 0x20 40
-Send-Text 'nihao'
+Add-Content -Path (Join-Path $LogDir 'ime_trace.txt') -Value '=== IME STEP BEGIN ==='
+Ensure-ChineseIme
+Click-ScreenLeft $singleImePoint.X $singleImePoint.Y 180
+Start-Sleep -Milliseconds 120
+Send-PhysicalKeyChord ([Native]::VK_CONTROL) 0x20 40
+Start-Sleep -Milliseconds 120
+Send-PhysicalText 'nihao' 80
 Start-Sleep -Milliseconds 220
-Save-Capture 'native_ui_01ae_single_ime_candidate.png' -useCopyFromScreen
+Save-Capture 'native_ui_01ae_single_ime_candidate.png' -useCopyFromScreen -fullScreen
+Add-Content -Path (Join-Path $LogDir 'ime_trace.txt') -Value '=== IME STEP END ==='
 Send-KeyPress 0x1B 35
 Click-Client $noteX $noteVisibleY
 Start-Sleep -Milliseconds 140
@@ -831,14 +923,6 @@ $multiArrowUpText = Read-ClipboardText
 $multiArrowUpOk = $multiArrowUpText -match '^\^Header-only migration complete\.'
 
 Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
-Start-Sleep -Milliseconds 120
-for ($i = 0; $i -lt $multiLines.Count; $i++) {
-    Send-Text $multiLines[$i]
-    if ($i -lt ($multiLines.Count - 1)) {
-        Send-Enter
-    }
-}
-Start-Sleep -Milliseconds 180
 
 $null = Write-ClipboardText '__pending__'
 Send-KeyPress ([Native]::VK_HOME)
@@ -861,14 +945,25 @@ for ($line = 1; $line -le 64; $line++) {
     $chineseLines += (([char]0x7B2C).ToString() + $line + ([char]0x884C) + ([char]0xFF1A) + $cnSentence + $cnSentence)
 }
 
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
-Start-Sleep -Milliseconds 120
 for ($i = 0; $i -lt $chineseLines.Count; $i++) {
-    Send-Text $chineseLines[$i]
-    if ($i -lt ($chineseLines.Count - 1)) {
+    if ($i -lt 6) {
+        Send-Text $chineseLines[$i]
         Send-Enter
     }
+    elseif ($i -eq 7) {
+        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+        Start-Sleep -Milliseconds 120
+        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+        Start-Sleep -Milliseconds 120
+    }
+    elseif ($i -gt 7 -and ($i % 16) -eq 0) {
+        Send-KeyPress ([Native]::VK_END)
+        Send-Enter
+        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'V')
+        Start-Sleep -Milliseconds 80
+    }
 }
+
 Start-Sleep -Milliseconds 200
 Save-Capture 'native_ui_02ad_multi_chinese_bulk.png'
 $multiChineseBulkScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_02ad_multi_chinese_bulk.png'))

@@ -9,6 +9,8 @@
 #include <thread>
 #include <chrono>
 #include <functional>
+#include <fstream>
+#include <mutex>
 #include <syncstream>
 #include <source_location>
 #include <type_traits>
@@ -344,6 +346,7 @@ namespace std {
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <imm.h>
+#include <textstor.h>
 #include <uxtheme.h> 
 #include <vssym32.h>
 #include <avrt.h> 
@@ -365,8 +368,6 @@ namespace std {
 #include <wrl.h>
 #include <uianimation.h> 
 
-#include "ui/native_ui.hpp"
-
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -387,6 +388,13 @@ using namespace Microsoft::WRL;
 #ifndef WS_EX_NOREDIRECTIONBITMAP
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
 #endif
+
+constexpr UINT WM_APP_SET_TEXTINPUT_IME = WM_APP + 0x4A;
+constexpr UINT WM_APP_SYNC_TEXTINPUT_CARET = WM_APP + 0x4B;
+constexpr UINT WM_APP_SYNC_TEXTSTORE_STATE = WM_APP + 0x4C;
+constexpr UINT WM_UPDATE_PROGRESS = WM_USER + 100;
+
+#include "ui/native_ui.hpp"
 
 // =========================================================
 // 【架构开关】：ImGui 桥接
@@ -422,9 +430,444 @@ std::atomic<int> g_UiVisualBottom{ 0 };
 std::atomic<bool> g_InjectedCtrlDown{ false };
 std::atomic<bool> g_InjectedShiftDown{ false };
 std::atomic<bool> g_InjectedAltDown{ false };
-constexpr UINT WM_APP_SET_TEXTINPUT_IME = WM_APP + 0x4A;
+
 HIMC g_MainWindowImeContext = nullptr;
-bool g_MainWindowImeContextOwned = false;
+bool g_TextInputImeFocused = false;
+bool g_SystemCaretCreated = false;
+int g_SystemCaretHeight = 0;
+
+void AppendImeTrace(const std::string& message) {
+	static std::mutex s_mutex;
+	std::lock_guard<std::mutex> lock(s_mutex);
+	std::ofstream out("d:\\Repo\\fusion_window\\artifacts\\log\\ime_trace.txt", std::ios::app);
+	if (!out) {
+		return;
+	}
+	out << utils::timestamp_prefix() << message << '\n';
+}
+
+void NotifyTsfLayoutChange();
+void SyncImm32CandidatePosition(HWND hwnd);
+
+void DestroySystemImeCaret() {
+	if (g_SystemCaretCreated) {
+		DestroyCaret();
+		g_SystemCaretCreated = false;
+		g_SystemCaretHeight = 0;
+	}
+}
+
+void SyncSystemImeCaretFromSharedState(HWND hwnd) {
+	if (!hwnd || !g_TextInputImeFocused) {
+		return;
+	}
+	if (!fusion::ui::g_ImeCaretValid.load(std::memory_order_acquire)) {
+		return;
+	}
+	const int caretX = fusion::ui::g_ImeCaretClientX.load(std::memory_order_relaxed);
+	const int caretY = fusion::ui::g_ImeCaretClientY.load(std::memory_order_relaxed);
+	const int caretH = (std::max)(1, fusion::ui::g_ImeCaretLineHeight.load(std::memory_order_relaxed));
+	if (!g_SystemCaretCreated || g_SystemCaretHeight != caretH) {
+		DestroySystemImeCaret();
+		if (CreateCaret(hwnd, nullptr, 1, caretH)) {
+			ShowCaret(hwnd);
+			HideCaret(hwnd);
+			g_SystemCaretCreated = true;
+			g_SystemCaretHeight = caretH;
+		}
+	}
+	if (g_SystemCaretCreated) {
+		SetCaretPos(caretX, caretY);
+	}
+	SyncImm32CandidatePosition(hwnd);
+	NotifyTsfLayoutChange();
+}
+
+// 同步 IMM32 候选窗位置（兼容层）
+void SyncImm32CandidatePosition(HWND hwnd) {
+	if (!hwnd || !g_TextInputImeFocused) return;
+	if (!fusion::ui::g_ImeCaretValid.load(std::memory_order_acquire)) return;
+	HIMC himc = ImmGetContext(hwnd);
+	if (!himc) return;
+	const int cx = fusion::ui::g_ImeCaretClientX.load(std::memory_order_relaxed);
+	const int cy = fusion::ui::g_ImeCaretClientY.load(std::memory_order_relaxed);
+	const int h  = (std::max)(1, fusion::ui::g_ImeCaretLineHeight.load(std::memory_order_relaxed));
+	CANDIDATEFORM cf{};
+	cf.dwIndex          = 0;
+	cf.dwStyle          = CFS_CANDIDATEPOS;
+	cf.ptCurrentPos.x   = cx;
+	cf.ptCurrentPos.y   = cy + h;
+	ImmSetCandidateWindow(himc, &cf);
+	// 同时同步组合文字窗口位置
+	COMPOSITIONFORM cmpf{};
+	cmpf.dwStyle          = CFS_POINT;
+	cmpf.ptCurrentPos.x   = cx;
+	cmpf.ptCurrentPos.y   = cy;
+	ImmSetCompositionWindow(himc, &cmpf);
+	ImmReleaseContext(hwnd, himc);
+}
+
+// =========================================================
+// TSF: ITextStoreACP 最小完整实现
+// 让微软拼音等 TSF 输入法能通过 GetTextExt 获取光标物理屏幕坐标
+// 对应标准 EDIT 控件内部的 ITextStoreACP 实现
+// =========================================================
+ITfThreadMgr*   g_TfThreadMgr   = nullptr;
+TfClientId      g_TfClientId    = TF_CLIENTID_NULL;
+ITfDocumentMgr* g_TfDocMgr      = nullptr;
+ITfContext*     g_TfCtx         = nullptr;
+TfEditCookie    g_TfEditCookie  = 0;
+HWND            g_TsfAssociatedHwnd = nullptr;
+DWORD g_TfCompositionCookie = 0;
+
+class SimpleTextStore final : public ITextStoreACP, public ITfContextOwnerCompositionSink {
+	HWND  hwnd_;
+	ULONG ref_{ 1 };
+	ComPtr<ITextStoreACPSink> sink_;
+	DWORD sinkMask_ = 0;
+	bool  locked_   = false;
+	DWORD pendingLockFlags_ = 0;
+
+	void PostTextStoreSync() const {
+		if (hwnd_) {
+			PostMessageW(hwnd_, WM_APP_SYNC_TEXTSTORE_STATE, 0, 0);
+		}
+	}
+
+	void NotifySelectionChange() {
+		if (sink_ && (sinkMask_ & TS_AS_SEL_CHANGE)) {
+			sink_->OnSelectionChange();
+		}
+	}
+
+	void NotifyTextChange(const fusion::ui::SharedTextStoreChange& change) {
+		if (sink_ && (sinkMask_ & TS_AS_TEXT_CHANGE)) {
+			TS_TEXTCHANGE textChange{};
+			textChange.acpStart = change.start;
+			textChange.acpOldEnd = change.oldEnd;
+			textChange.acpNewEnd = change.newEnd;
+			sink_->OnTextChange(0, &textChange);
+		}
+	}
+
+	static std::wstring_view MakeReplacementView(const WCHAR* text, ULONG length) {
+		return (text && length > 0) ? std::wstring_view(text, length) : std::wstring_view();
+	}
+public:
+	explicit SimpleTextStore(HWND h) : hwnd_(h) {}
+
+	// IUnknown
+	ULONG STDMETHODCALLTYPE AddRef()  override { return ++ref_; }
+	ULONG STDMETHODCALLTYPE Release() override { ULONG r = --ref_; if (!r) delete this; return r; }
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+		if (!ppv) return E_INVALIDARG;
+		if (IsEqualIID(riid, IID_IUnknown) || IsEqualIID(riid, IID_ITextStoreACP)) {
+			*ppv = static_cast<ITextStoreACP*>(this);
+			AddRef();
+			return S_OK;
+		}
+		if (IsEqualIID(riid, IID_ITfContextOwnerCompositionSink)) {
+			*ppv = static_cast<ITfContextOwnerCompositionSink*>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr; return E_NOINTERFACE;
+	}
+
+	// TSF 订阅通知
+	HRESULT STDMETHODCALLTYPE AdviseSink(REFIID riid, IUnknown* punk, DWORD dwMask) override {
+		if (!IsEqualIID(riid, IID_ITextStoreACPSink)) return E_INVALIDARG;
+		ComPtr<ITextStoreACPSink> s;
+		if (FAILED(punk->QueryInterface(IID_PPV_ARGS(&s)))) return E_UNEXPECTED;
+		sink_ = s; sinkMask_ = dwMask;
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE UnadviseSink(IUnknown*) override {
+		sink_.Reset(); sinkMask_ = 0; return S_OK;
+	}
+
+	// 同步锁：立即回调 OnLockGranted，规避异步复杂性
+	HRESULT STDMETHODCALLTYPE RequestLock(DWORD dwLockFlags, HRESULT* phrSession) override {
+		if (!phrSession) return E_INVALIDARG;
+		AppendImeTrace(std::format("RequestLock flags=0x{:X} locked={} sink={}", dwLockFlags, locked_ ? 1 : 0, sink_ ? 1 : 0));
+		if (!sink_) {
+			*phrSession = E_FAIL;
+			return S_OK;
+		}
+		if (locked_) {
+			pendingLockFlags_ |= dwLockFlags;
+			if ((pendingLockFlags_ & TS_LF_READWRITE) != 0) {
+				pendingLockFlags_ &= ~TS_LF_READ;
+			}
+			*phrSession = TS_S_ASYNC;
+			return S_OK;
+		}
+		DWORD lockFlags = dwLockFlags;
+		do {
+			locked_ = true;
+			pendingLockFlags_ = 0;
+			*phrSession = sink_->OnLockGranted(lockFlags);
+			locked_ = false;
+			lockFlags = pendingLockFlags_;
+		} while (lockFlags != 0);
+		return S_OK;
+	}
+
+	// 文档状态：只读、无隐藏文本
+	HRESULT STDMETHODCALLTYPE GetStatus(TS_STATUS* p) override {
+		if (!p) return E_INVALIDARG;
+		p->dwDynamicFlags = 0;
+		p->dwStaticFlags  = TS_SS_NOHIDDENTEXT;
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE QueryInsert(LONG s, LONG e, ULONG, LONG* rs, LONG* re) override {
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		const LONG start = fusion::ui::ClampTextStoreAcp((std::min)(s, e), snapshot.text.size());
+		const LONG end = fusion::ui::ClampTextStoreAcp((std::max)(s, e), snapshot.text.size());
+		if (rs) *rs = start;
+		if (re) *re = end;
+		return S_OK;
+	}
+
+	// 当前选区：报告真实焦点输入框的共享文档选区
+	HRESULT STDMETHODCALLTYPE GetSelection(ULONG, ULONG cnt, TS_SELECTION_ACP* pSel, ULONG* pFetched) override {
+		if (!pSel || !pFetched) return E_INVALIDARG;
+		if (!locked_) return TS_E_NOLOCK;
+		if (cnt == 0) { *pFetched = 0; return S_OK; }
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		pSel[0].acpStart = (std::min)(snapshot.selectionAnchor, snapshot.selectionCaret);
+		pSel[0].acpEnd = (std::max)(snapshot.selectionAnchor, snapshot.selectionCaret);
+		pSel[0].style.ase = snapshot.selectionCaret < snapshot.selectionAnchor ? TS_AE_START : TS_AE_END;
+		pSel[0].style.fInterimChar = FALSE;
+		*pFetched = 1;
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE SetSelection(ULONG count, const TS_SELECTION_ACP* selection) override {
+		if (!locked_) return TS_E_NOLOCK;
+		if (count == 0 || !selection) return E_INVALIDARG;
+		const LONG anchor = selection[0].style.ase == TS_AE_START ? selection[0].acpEnd : selection[0].acpStart;
+		const LONG caret = selection[0].style.ase == TS_AE_START ? selection[0].acpStart : selection[0].acpEnd;
+		fusion::ui::SetSharedTextStoreSelection(anchor, caret);
+		PostTextStoreSync();
+		NotifySelectionChange();
+		NotifyLayoutChange();
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE GetText(LONG acpStart, LONG acpEnd, WCHAR* plainText, ULONG plainTextCapacity, ULONG* plainTextCopied,
+			TS_RUNINFO* runInfo, ULONG runInfoCapacity, ULONG* runInfoCopied, LONG* nextAcp) override {
+		if (!locked_) return TS_E_NOLOCK;
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		const LONG start = fusion::ui::ClampTextStoreAcp(acpStart, snapshot.text.size());
+		const LONG end = acpEnd < 0 ? static_cast<LONG>(snapshot.text.size()) : fusion::ui::ClampTextStoreAcp(acpEnd, snapshot.text.size());
+		const LONG orderedStart = (std::min)(start, end);
+		const LONG orderedEnd = (std::max)(start, end);
+		const ULONG available = static_cast<ULONG>(orderedEnd - orderedStart);
+		const ULONG copied = plainText && plainTextCapacity > 0 ? (std::min)(available, plainTextCapacity) : 0;
+		if (copied > 0) {
+			wmemcpy(plainText, snapshot.text.data() + orderedStart, copied);
+		}
+		if (plainTextCopied) *plainTextCopied = copied;
+		if (runInfoCopied) *runInfoCopied = 0;
+		if (runInfo && runInfoCapacity > 0 && available > 0) {
+			runInfo[0].type = TS_RT_PLAIN;
+			runInfo[0].uCount = available;
+			if (runInfoCopied) *runInfoCopied = 1;
+		}
+		if (nextAcp) *nextAcp = orderedEnd;
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE SetText(DWORD, LONG start, LONG end, const WCHAR* text, ULONG length, TS_TEXTCHANGE* p) override {
+		if (!locked_) return TS_E_NOLOCK;
+		const auto change = fusion::ui::ReplaceSharedTextStoreRange(start, end, MakeReplacementView(text, length));
+		if (p) {
+			p->acpStart = change.start;
+			p->acpOldEnd = change.oldEnd;
+			p->acpNewEnd = change.newEnd;
+		}
+		if (fusion::ui::g_TextStoreCompositionActive.load(std::memory_order_relaxed)) {
+			fusion::ui::g_TextStoreCompositionEnd.store(change.newEnd, std::memory_order_relaxed);
+		}
+		PostTextStoreSync();
+		NotifyTextChange(change);
+		NotifySelectionChange();
+		NotifyLayoutChange();
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE GetFormattedText(LONG, LONG, IDataObject**) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE GetEmbedded(LONG, REFGUID, REFIID, IUnknown**) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE QueryInsertEmbedded(const GUID*, const FORMATETC*, BOOL* p) override {
+		if (p) *p = FALSE; return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE InsertEmbedded(DWORD, LONG, LONG, IDataObject*, TS_TEXTCHANGE*) override { return E_NOTIMPL; }
+	HRESULT STDMETHODCALLTYPE InsertTextAtSelection(DWORD flags, const WCHAR* text, ULONG length, LONG* ps, LONG* pe, TS_TEXTCHANGE* p) override {
+		if (!locked_) return TS_E_NOLOCK;
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		const LONG start = (std::min)(snapshot.selectionAnchor, snapshot.selectionCaret);
+		const LONG end = (std::max)(snapshot.selectionAnchor, snapshot.selectionCaret);
+		if (ps) *ps = start;
+		if (pe) *pe = start + static_cast<LONG>(length);
+		if ((flags & TS_IAS_QUERYONLY) != 0) {
+			if (p) {
+				p->acpStart = start;
+				p->acpOldEnd = end;
+				p->acpNewEnd = start + static_cast<LONG>(length);
+			}
+			return S_OK;
+		}
+		const auto change = fusion::ui::ReplaceSharedTextStoreRange(start, end, MakeReplacementView(text, length));
+		if (ps) *ps = change.start;
+		if (pe) *pe = change.newEnd;
+		if (p) {
+			p->acpStart = change.start;
+			p->acpOldEnd = change.oldEnd;
+			p->acpNewEnd = change.newEnd;
+		}
+		if (fusion::ui::g_TextStoreCompositionActive.load(std::memory_order_relaxed)) {
+			fusion::ui::g_TextStoreCompositionEnd.store(change.newEnd, std::memory_order_relaxed);
+		}
+		PostTextStoreSync();
+		NotifyTextChange(change);
+		NotifySelectionChange();
+		NotifyLayoutChange();
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE InsertEmbeddedAtSelection(DWORD, IDataObject*, LONG*, LONG*, TS_TEXTCHANGE*) override { return E_NOTIMPL; }
+
+	// 属性：不支持任何属性
+	HRESULT STDMETHODCALLTYPE RequestSupportedAttrs(DWORD, ULONG, const TS_ATTRID*) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE RequestAttrsAtPosition(LONG, ULONG, const TS_ATTRID*, DWORD) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE RequestAttrsTransitioningAtPosition(LONG, ULONG, const TS_ATTRID*, DWORD) override { return S_OK; }
+	HRESULT STDMETHODCALLTYPE FindNextAttrTransition(LONG, LONG, ULONG, const TS_ATTRID*, DWORD,
+			LONG* pn, BOOL* pf, LONG* po) override {
+		if (pn) *pn = 0; if (pf) *pf = FALSE; if (po) *po = 0; return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE RetrieveRequestedAttrs(ULONG, TS_ATTRVAL*, ULONG* p) override {
+		if (p) *p = 0; return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE GetEndACP(LONG* p) override {
+		if (!p) return E_INVALIDARG;
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		*p = static_cast<LONG>(snapshot.text.size());
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE GetActiveView(TsViewCookie* p) override { if (p) *p = 1; return S_OK; }
+	HRESULT STDMETHODCALLTYPE GetACPFromPoint(TsViewCookie, const POINT*, DWORD, LONG* p) override {
+		if (!p) return E_INVALIDARG;
+		auto snapshot = fusion::ui::SnapshotSharedTextStore();
+		*p = snapshot.selectionCaret;
+		return S_OK;
+	}
+
+	// ★ 核心：返回光标物理屏幕坐标 → TSF 据此定位候选窗
+	HRESULT STDMETHODCALLTYPE GetTextExt(TsViewCookie, LONG, LONG, RECT* prc, BOOL* pfClipped) override {
+		if (!prc || !pfClipped) return E_INVALIDARG;
+		if (!locked_) return TS_E_NOLOCK;
+		*pfClipped = FALSE;
+		if (fusion::ui::g_ImeCaretValid.load(std::memory_order_acquire)) {
+			LONG x = fusion::ui::g_ImeCaretScreenX.load(std::memory_order_relaxed);
+			LONG y = fusion::ui::g_ImeCaretScreenY.load(std::memory_order_relaxed);
+			LONG h = (std::max)(1L, (LONG)fusion::ui::g_ImeCaretLineHeight.load(std::memory_order_relaxed));
+			prc->left = x; prc->top = y; prc->right = x + 2; prc->bottom = y + h;
+			AppendImeTrace(std::format("GetTextExt caret-valid rect=({},{}-{},{} )", prc->left, prc->top, prc->right, prc->bottom));
+			return S_OK;
+		}
+		AppendImeTrace("GetTextExt no-layout");
+		SetRectEmpty(prc);
+		return TS_E_NOLAYOUT;
+	}
+	HRESULT STDMETHODCALLTYPE GetScreenExt(TsViewCookie, RECT* prc) override {
+		if (!prc) return E_INVALIDARG; GetWindowRect(hwnd_, prc); return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE GetWnd(TsViewCookie, HWND* p) override {
+		if (!p) return E_INVALIDARG; *p = hwnd_; return S_OK;
+	}
+
+	// 通知 TSF 布局已改变（光标移动后调用）
+	void NotifyLayoutChange() {
+		if (sink_ && (sinkMask_ & TS_AS_LAYOUT_CHANGE)) {
+			sink_->OnLayoutChange(TS_LC_CHANGE, 1);
+		}
+	}
+
+	HRESULT STDMETHODCALLTYPE OnStartComposition(ITfCompositionView*, BOOL* pfOk) override {
+		if (pfOk) *pfOk = TRUE;
+		fusion::ui::g_TextStoreCompositionActive.store(true, std::memory_order_relaxed);
+		auto snap = fusion::ui::SnapshotSharedTextStore();
+		fusion::ui::g_TextStoreCompositionStart.store(snap.selectionCaret, std::memory_order_relaxed);
+		fusion::ui::g_TextStoreCompositionEnd.store(snap.selectionCaret, std::memory_order_relaxed);
+		PostTextStoreSync();
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE OnUpdateComposition(ITfCompositionView*, ITfRange*) override {
+		PostTextStoreSync();
+		return S_OK;
+	}
+
+	HRESULT STDMETHODCALLTYPE OnEndComposition(ITfCompositionView*) override {
+		fusion::ui::g_TextStoreCompositionActive.store(false, std::memory_order_relaxed);
+		PostTextStoreSync();
+		return S_OK;
+	}
+};
+SimpleTextStore* g_TextStore = nullptr;
+
+void NotifyTsfLayoutChange() {
+	if (g_TextStore) g_TextStore->NotifyLayoutChange();
+}
+
+void InitTsf(HWND hwnd) {
+	// SDK 26100 无 msctf.lib，使用 CoCreateInstance
+	if (FAILED(CoCreateInstance(CLSID_TF_ThreadMgr, nullptr, CLSCTX_INPROC_SERVER,
+		IID_PPV_ARGS(&g_TfThreadMgr))) || !g_TfThreadMgr) return;
+	if (FAILED(g_TfThreadMgr->Activate(&g_TfClientId))) return;
+	if (FAILED(g_TfThreadMgr->CreateDocumentMgr(&g_TfDocMgr)) || !g_TfDocMgr) return;
+	// 传入 ITextStoreACP 作为 punk，让 TSF 通过完整协议查询光标矩形
+	g_TextStore = new SimpleTextStore(hwnd);
+	if (FAILED(g_TfDocMgr->CreateContext(g_TfClientId, 0,
+		static_cast<ITextStoreACP*>(g_TextStore),
+		&g_TfCtx, &g_TfEditCookie)) || !g_TfCtx) {
+		g_TextStore->Release(); g_TextStore = nullptr;
+		return;
+	}
+	g_TfDocMgr->Push(g_TfCtx);
+
+	ComPtr<ITfSource> source;
+	if (SUCCEEDED(g_TfCtx->QueryInterface(IID_PPV_ARGS(&source)))) {
+		source->AdviseSink(IID_ITfContextOwnerCompositionSink, static_cast<ITfContextOwnerCompositionSink*>(g_TextStore), &g_TfCompositionCookie);
+	}
+
+	ITfDocumentMgr* prev = nullptr;
+	if (SUCCEEDED(g_TfThreadMgr->AssociateFocus(hwnd, g_TfDocMgr, &prev)))
+		g_TsfAssociatedHwnd = hwnd;
+	if (prev) prev->Release();
+}
+
+void UninitTsf() {
+	if (g_TfCtx && g_TfCompositionCookie) {
+		ComPtr<ITfSource> source;
+		if (SUCCEEDED(g_TfCtx->QueryInterface(IID_PPV_ARGS(&source)))) {
+			source->UnadviseSink(g_TfCompositionCookie);
+		}
+		g_TfCompositionCookie = 0;
+	}
+
+	if (g_TfThreadMgr && g_TsfAssociatedHwnd) {
+		ITfDocumentMgr* prev = nullptr;
+		g_TfThreadMgr->AssociateFocus(g_TsfAssociatedHwnd, nullptr, &prev);
+		if (prev) prev->Release();
+		g_TsfAssociatedHwnd = nullptr;
+	}
+	if (g_TextStore) { g_TextStore->Release(); g_TextStore = nullptr; }
+	if (g_TfCtx)    { g_TfCtx->Release();    g_TfCtx = nullptr; }
+	if (g_TfDocMgr) { g_TfDocMgr->Release(); g_TfDocMgr = nullptr; }
+	if (g_TfThreadMgr) { g_TfThreadMgr->Deactivate(); g_TfThreadMgr->Release(); g_TfThreadMgr = nullptr; }
+	g_TfClientId    = TF_CLIENTID_NULL;
+	g_TfEditCookie  = 0;
+}
 
 RECT GetCaptionButtonBounds(HWND hwnd) {
 	RECT rc{ 0, 0, 0, 0 };
@@ -824,7 +1267,6 @@ void StartProgressPingPongAnimation() {
 	PlayAnimation(g_AnimProgressVar, (currentValue < 50.0) ? 100.0 : 0.0, 2.0);
 }
 
-#define WM_UPDATE_PROGRESS (WM_USER + 100)
 class CAnimationEventHandler : public IUIAnimationTimerEventHandler {
 	ULONG m_refCount = 1;
 public:
@@ -856,7 +1298,10 @@ public:
 };
 
 void InitUIAnimation() {
-	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	const HRESULT coinitHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+	if (FAILED(coinitHr) && coinitHr != RPC_E_CHANGED_MODE) {
+		return;
+	}
 	CoCreateInstance(CLSID_UIAnimationManager, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_AnimManager));
 	CoCreateInstance(CLSID_UIAnimationTimer, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_AnimTimer));
 	CoCreateInstance(CLSID_UIAnimationTransitionLibrary, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&g_AnimLibrary));
@@ -867,6 +1312,8 @@ void InitUIAnimation() {
 	g_AnimTimer->SetTimerUpdateHandler(updateHandler.Get(), UI_ANIMATION_IDLE_BEHAVIOR_DISABLE);
 	ComPtr<CAnimationEventHandler> pEventHandler = new CAnimationEventHandler();
 	g_AnimTimer->SetTimerEventHandler(pEventHandler.Get());
+	// 初始化 TSF，让微软拼音等输入法可以查询光标屏幕位置
+	InitTsf(g_hCanvas);
 }
 
 DWORD_PTR GetPCoreMask() {
@@ -890,7 +1337,7 @@ DWORD_PTR GetPCoreMask() {
 }
 
 // =========================================================
-// 6. ImGui Pimpl 桥接层 (你要求原样保留的完整版)
+// 6. ImGui Pimpl 桥接层
 // =========================================================
 class ImGuiBridge {
 public:
@@ -1691,14 +2138,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		//SetWindowLongPtr(hwnd, GWL_EXSTYLE, GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_TRANSPARENT);
 		ExtendFrameIntoClient(hwnd);
 		PushTitleBarInfoToGPU(hwnd); // [新增]
-		g_MainWindowImeContext = ImmAssociateContext(hwnd, NULL);
-		if (!g_MainWindowImeContext) {
-			g_MainWindowImeContext = ImmCreateContext();
-			g_MainWindowImeContextOwned = g_MainWindowImeContext != nullptr;
-		}
-		else {
-			g_MainWindowImeContextOwned = false;
-		}
+		g_MainWindowImeContext = nullptr;
 		PAINTSTRUCT ps;
 		HDC hdc = BeginPaint(hwnd, &ps);
 
@@ -1708,16 +2148,47 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	}
 	case WM_APP_SET_TEXTINPUT_IME: {
 		const bool focusedTextInput = wParam != 0;
+		g_TextInputImeFocused = focusedTextInput;
+		AppendImeTrace(std::format("WM_APP_SET_TEXTINPUT_IME focused={}", focusedTextInput ? 1 : 0));
 		if (focusedTextInput) {
-			if (g_MainWindowImeContext) {
-				ImmAssociateContext(hwnd, g_MainWindowImeContext);
-			}
+			ImmAssociateContextEx(hwnd, nullptr, IACE_DEFAULT);
+			SyncSystemImeCaretFromSharedState(hwnd);
+			// TSF: 通知微软拼音等TSF输入法我们的文档获得焦点
+			if (g_TfThreadMgr && g_TfDocMgr) g_TfThreadMgr->SetFocus(g_TfDocMgr);
 		}
 		else {
-			ImmAssociateContext(hwnd, NULL);
+			if (HIMC himc = ImmGetContext(hwnd)) {
+				ImmNotifyIME(himc, NI_CLOSECANDIDATE, 0, 0);
+				ImmReleaseContext(hwnd, himc);
+			}
+			DestroySystemImeCaret();
+			// TSF: 放弃TSF焦点
+			if (g_TfThreadMgr) g_TfThreadMgr->SetFocus(nullptr);
 		}
 		return 0;
 	}
+	case WM_APP_SYNC_TEXTINPUT_CARET:
+		SyncSystemImeCaretFromSharedState(hwnd);
+		return 0;
+	case WM_SETFOCUS:
+		if (g_TextInputImeFocused && g_TfThreadMgr && g_TfDocMgr) {
+			g_TfThreadMgr->SetFocus(g_TfDocMgr);
+			SyncSystemImeCaretFromSharedState(hwnd);
+		}
+		return 0;
+	case WM_KILLFOCUS:
+		DestroySystemImeCaret();
+		if (g_TfThreadMgr) {
+			g_TfThreadMgr->SetFocus(nullptr);
+		}
+		return 0;
+	case WM_IME_SETCONTEXT:
+		// 保留系统 IME 组合窗和候选窗 UI，避免自绘输入框把微软拼音候选列表抑制掉。
+		AppendImeTrace(std::format("WM_IME_SETCONTEXT wp={} lp=0x{:X}", static_cast<unsigned long long>(wParam), static_cast<unsigned long long>(lParam)));
+		lParam &= ~ISC_SHOWUICOMPOSITIONWINDOW;
+		lParam |= ISC_SHOWUIALLCANDIDATEWINDOW;
+		//lParam |= ISC_SHOWUICOMPOSITIONWINDOW | ISC_SHOWUIALLCANDIDATEWINDOW;
+		return DefWindowProc(hwnd, msg, wParam, lParam);
 	case WM_ERASEBKGND: {
 		return 1;
 	}
@@ -1925,10 +2396,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_RBUTTONDOWN:
 	case WM_RBUTTONUP:
 	case WM_MOUSEWHEEL:
-	case WM_CHAR:
+	case WM_CHAR: {
+		if (g_TextInputImeFocused) {
+			AppendImeTrace(std::format("WM_CHAR ch=0x{:X}", static_cast<unsigned>(wParam)));
+		}
+		g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+		g_RenderEvent.Notify();
+		return 0;
+	}
+	case WM_IME_NOTIFY:
 	case WM_IME_STARTCOMPOSITION:
 	case WM_IME_COMPOSITION:
 	case WM_IME_ENDCOMPOSITION: {
+		AppendImeTrace(std::format("IME-msg msg=0x{:X} wp=0x{:X} lp=0x{:X}", static_cast<unsigned>(msg), static_cast<unsigned long long>(wParam), static_cast<unsigned long long>(lParam)));
+		g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
+		g_RenderEvent.Notify();
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
+	}
+	case WM_APP_SYNC_TEXTSTORE_STATE: {
 		g_CommandQueue.push(CmdWin32Msg{ hwnd, msg, wParam, lParam });
 		g_RenderEvent.Notify();
 		return 0;
@@ -1937,14 +2422,23 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_SYSKEYUP: {
 		if (wParam == VK_CONTROL) {
 			g_InjectedCtrlDown.store(false, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		if (wParam == VK_SHIFT) {
 			g_InjectedShiftDown.store(false, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		if (wParam == VK_MENU) {
 			g_InjectedAltDown.store(false, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		break;
@@ -1952,6 +2446,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_SYSKEYDOWN: {
 		if (wParam == VK_MENU) {
 			g_InjectedAltDown.store(true, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		if (wParam == 'F') { ShowCustomWin32Menu(hwnd, 0); return 0; }
@@ -1963,22 +2460,40 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 	case WM_KEYDOWN: {
 		if (wParam == VK_CONTROL) {
 			g_InjectedCtrlDown.store(true, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		if (wParam == VK_SHIFT) {
 			g_InjectedShiftDown.store(true, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		if (wParam == VK_MENU) {
 			g_InjectedAltDown.store(true, std::memory_order_relaxed);
+			if (g_TextInputImeFocused) {
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
+			}
 			return 0;
 		}
 		const bool ctrlDown = ((GetKeyState(VK_CONTROL) & 0x8000) != 0) || g_InjectedCtrlDown.load(std::memory_order_relaxed);
 		const bool shiftDown = ((GetKeyState(VK_SHIFT) & 0x8000) != 0) || g_InjectedShiftDown.load(std::memory_order_relaxed);
 		const bool altDown = ((GetKeyState(VK_MENU) & 0x8000) != 0) || g_InjectedAltDown.load(std::memory_order_relaxed);
+		if (g_TextInputImeFocused) {
+			AppendImeTrace(std::format("WM_KEYDOWN vk=0x{:X} ctrl={} shift={} alt={}", static_cast<unsigned>(wParam), ctrlDown ? 1 : 0, shiftDown ? 1 : 0, altDown ? 1 : 0));
+		}
+		if (g_TextInputImeFocused && ctrlDown && !shiftDown && !altDown && wParam == VK_SPACE) {
+			return DefWindowProcW(hwnd, msg, wParam, lParam);
+		}
 		if ((wParam == 'C' || wParam == 'c') && !ctrlDown) { g_CommandQueue.push(CmdResetCanvas{}); g_RenderEvent.Notify(); return 0; }
 		g_CommandQueue.push(CmdKeyDown{ wParam, ctrlDown, shiftDown, altDown });
 		g_RenderEvent.Notify();
+		if (g_TextInputImeFocused) {
+			return DefWindowProcW(hwnd, msg, wParam, lParam);
+		}
 		return 0;
 	}
 	case WM_SIZE: {
@@ -2020,14 +2535,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		break;
 	}
 	case WM_DESTROY: {
-		if (g_MainWindowImeContext) {
-			ImmAssociateContext(hwnd, NULL);
-			if (g_MainWindowImeContextOwned) {
-				ImmDestroyContext(g_MainWindowImeContext);
-			}
-			g_MainWindowImeContext = nullptr;
-			g_MainWindowImeContextOwned = false;
-		}
+		g_TextInputImeFocused = false;
+		DestroySystemImeCaret();
+		g_MainWindowImeContext = nullptr;
+		UninitTsf();
 		g_CommandQueue.push(CmdExit{}); g_isRunning.store(false, std::memory_order_relaxed);
 		g_RenderEvent.Notify(); PostQuitMessage(0); return 0;
 	}

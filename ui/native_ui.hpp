@@ -12,6 +12,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -29,6 +30,7 @@
 #include <d2d1helper.h>
 #include <dwrite.h>
 #include <imm.h>
+#include <msctf.h>
 #include <uianimation.h>
 #include <windowsx.h>
 #include <wrl.h>
@@ -155,6 +157,70 @@ namespace fusion::ui {
 		std::function<void()> onResetCanvas;
 		std::function<void(bool)> onTextInputFocusChanged;
 	};
+
+	inline std::atomic<int32_t> g_ImeCaretScreenX{ 0 };
+	inline std::atomic<int32_t> g_ImeCaretScreenY{ 0 };
+	inline std::atomic<int32_t> g_ImeCaretClientX{ 0 };
+	inline std::atomic<int32_t> g_ImeCaretClientY{ 0 };
+	inline std::atomic<int32_t> g_ImeCaretLineHeight{ 20 };
+	inline std::atomic<bool>    g_ImeCaretValid{ false };
+
+	struct SharedTextStoreSnapshot {
+		std::wstring text;
+		LONG selectionAnchor = 0;
+		LONG selectionCaret = 0;
+	};
+
+	struct SharedTextStoreChange {
+		LONG start = 0;
+		LONG oldEnd = 0;
+		LONG newEnd = 0;
+	};
+
+	inline std::mutex g_TextStoreStateMutex;
+	inline std::wstring g_TextStoreStateText;
+	inline LONG g_TextStoreSelectionAnchor = 0;
+	inline LONG g_TextStoreSelectionCaret = 0;
+
+	inline std::atomic<bool> g_TextStoreCompositionActive{ false };
+	inline std::atomic<LONG> g_TextStoreCompositionStart{ 0 };
+	inline std::atomic<LONG> g_TextStoreCompositionEnd{ 0 };
+
+	inline LONG ClampTextStoreAcp(LONG acp, size_t length) {
+		return (std::clamp)(acp, 0L, static_cast<LONG>(length));
+	}
+
+	inline SharedTextStoreSnapshot SnapshotSharedTextStore() {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		return SharedTextStoreSnapshot{ g_TextStoreStateText, g_TextStoreSelectionAnchor, g_TextStoreSelectionCaret };
+	}
+
+	inline void SetSharedTextStoreSelection(LONG selectionAnchor, LONG selectionCaret) {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		const LONG length = static_cast<LONG>(g_TextStoreStateText.size());
+		g_TextStoreSelectionAnchor = (std::clamp)(selectionAnchor, 0L, length);
+		g_TextStoreSelectionCaret = (std::clamp)(selectionCaret, 0L, length);
+	}
+
+	inline void SetSharedTextStoreState(std::wstring_view text, size_t selectionAnchor, size_t selectionCaret) {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		g_TextStoreStateText.assign(text.begin(), text.end());
+		const LONG length = static_cast<LONG>(g_TextStoreStateText.size());
+		g_TextStoreSelectionAnchor = (std::clamp)(static_cast<LONG>(selectionAnchor), 0L, length);
+		g_TextStoreSelectionCaret = (std::clamp)(static_cast<LONG>(selectionCaret), 0L, length);
+	}
+
+	inline SharedTextStoreChange ReplaceSharedTextStoreRange(LONG start, LONG end, std::wstring_view replacement) {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		const LONG length = static_cast<LONG>(g_TextStoreStateText.size());
+		const LONG clampedStart = ClampTextStoreAcp((std::min)(start, end), length);
+		const LONG clampedEnd = ClampTextStoreAcp((std::max)(start, end), length);
+		g_TextStoreStateText.replace(static_cast<size_t>(clampedStart), static_cast<size_t>(clampedEnd - clampedStart), replacement.data(), replacement.size());
+		const LONG newCaret = clampedStart + static_cast<LONG>(replacement.size());
+		g_TextStoreSelectionAnchor = newCaret;
+		g_TextStoreSelectionCaret = newCaret;
+		return SharedTextStoreChange{ clampedStart, clampedEnd, newCaret };
+	}
 
 	struct KeyModifiers {
 		bool ctrl = false;
@@ -949,6 +1015,7 @@ namespace fusion::ui {
 		virtual void OnImeStart(HWND) {}
 		virtual void OnImeComposition(HWND, LPARAM) {}
 		virtual void OnImeEnd(HWND) {}
+		virtual void RefreshImeWindowPosition(HWND) {}
 
 		virtual bool HasOpenPopup() const {
 			return false;
@@ -3397,6 +3464,55 @@ namespace fusion::ui {
 				return PointInRect(visual.box, point) ? CursorKind::IBeam : CursorKind::Arrow;
 			}
 
+			void SyncFromSharedTextStore() {
+				auto snapshot = SnapshotSharedTextStore();
+				const size_t textLength = snapshot.text.size();
+				const size_t nextAnchor = static_cast<size_t>(ClampTextStoreAcp(snapshot.selectionAnchor, textLength));
+				const size_t nextCaret = static_cast<size_t>(ClampTextStoreAcp(snapshot.selectionCaret, textLength));
+
+				tsfCompActive_ = g_TextStoreCompositionActive.load(std::memory_order_relaxed);
+				tsfCompStart_ = static_cast<size_t>(g_TextStoreCompositionStart.load(std::memory_order_relaxed));
+				tsfCompEnd_ = static_cast<size_t>(g_TextStoreCompositionEnd.load(std::memory_order_relaxed));
+
+				bool compChanged = (lastTsfCompActive_ != tsfCompActive_ || lastTsfCompStart_ != tsfCompStart_ || lastTsfCompEnd_ != tsfCompEnd_);
+				lastTsfCompActive_ = tsfCompActive_;
+				lastTsfCompStart_ = tsfCompStart_;
+				lastTsfCompEnd_ = tsfCompEnd_;
+
+				const bool changed = text_ != snapshot.text
+					|| selectionAnchor_ != nextAnchor
+					|| caret_ != nextCaret
+					|| tsfCompActive_
+					|| compChanged;
+
+				if (!changed) {
+					return;
+				}
+				text_ = std::move(snapshot.text);
+				selectionAnchor_ = nextAnchor;
+				caret_ = nextCaret;
+				imeActive_ = false;
+				imeComposition_.clear();
+				compositionReplaceLength_ = 0;
+				imeCursorPos_ = 0;
+				desiredCaretX_.reset();
+				ensureCaretVisible_ = true;
+				MarkSelectionMetricsDirty();
+				InvalidateTextLayoutState();
+				MarkContentChanged();
+				ResetCaretBlink();
+			}
+
+			void BindImeWindow(HWND hwnd) {
+				if (!hwnd) {
+					return;
+				}
+				imeWindow_ = hwnd;
+				if (focused_) {
+					RefreshImeWindowPosition(hwnd);
+				}
+			}
+
 			void ApplyStyledRanges(std::vector<StyledTextRange> ranges) {
 				styledRanges_ = std::move(ranges);
 				InvalidateTextLayoutState();
@@ -3437,12 +3553,10 @@ namespace fusion::ui {
 				context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.58f + FocusProgress() * 0.42f), focused_ ? 1.8f : 1.0f);
 				UpdateScrollbarVisibilityAnimations(visual);
 				SyncScrollOffsets(visual.layout, visual.content);
-				if (imeActive_ && imeWindow_) {
-					HIMC imeContext = ImmGetContext(imeWindow_);
-					if (imeContext) {
-						UpdateImeWindowPosition(imeWindow_, imeContext, visual);
-						ImmReleaseContext(imeWindow_, imeContext);
-					}
+				if (focused_ && imeWindow_) {
+					HIMC imeContext = imeActive_ ? ImmGetContext(imeWindow_) : nullptr;
+					UpdateImeWindowPosition(imeWindow_, imeContext, visual);
+					if (imeContext) ImmReleaseContext(imeWindow_, imeContext);
 				}
 				if (!multiline_) {
 					const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
@@ -3507,7 +3621,7 @@ namespace fusion::ui {
 					hScrollBar_.Render(context);
 				}
 				if (multiline_) {
-					const bool forceVerticalCue = scrollY_ > 0.5f || VerticalOverflowHintActive();
+					const bool forceVerticalCue = VerticalOverflowHintActive();
 					if (visual.renderVerticalScroll || forceVerticalCue) {
 						auto verticalScroll = visual.verticalScroll;
 						float effectiveVerticalOpacity = verticalScrollOpacity;
@@ -3601,8 +3715,16 @@ namespace fusion::ui {
 			}
 
 			void OnPointerMove(D2D1_POINT_2F point) override {
+				auto visual = ComputeVisualState();
+				AssignAndDirty(horizontalScrollHovered_, visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point));
+				AssignAndDirty(verticalScrollHovered_, visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point));
+				if (horizontalScrollHovered_) {
+					TouchHorizontalScrollReveal();
+				}
+				if (verticalScrollHovered_) {
+					TouchVerticalScrollReveal();
+				}
 				if (scrollDragMode_ != ScrollDragMode::None && pressed_) {
-					auto visual = ComputeVisualState();
 					if (scrollDragMode_ == ScrollDragMode::Horizontal && visual.showHorizontalScroll) {
 						TouchHorizontalScrollReveal();
 						const auto track = visual.horizontalScroll.TrackBounds();
@@ -3633,6 +3755,7 @@ namespace fusion::ui {
 				if (draggingSelection_) {
 					caret_ = HitTestText(point);
 					MarkSelectionMetricsDirty();
+					PublishSharedTextStoreState();
 					desiredCaretX_.reset();
 					ensureCaretVisible_ = true;
 					if (imeActive_ && imeWindow_) {
@@ -3783,6 +3906,9 @@ namespace fusion::ui {
 			}
 
 			void OnChar(wchar_t ch) override {
+				if (ShouldDeferCharToIme(ch)) {
+					return;
+				}
 				if (ch == L'\r') {
 					if (multiline_) {
 						InsertText(L"\n");
@@ -3806,9 +3932,14 @@ namespace fusion::ui {
 				if (!focused) {
 					draggingSelection_ = false;
 					scrollDragMode_ = ScrollDragMode::None;
+					g_ImeCaretValid.store(false, std::memory_order_release);
 					AnimateLinear(caretOpacityAnimation_, 0.0f, 0.08);
 					caretTargetVisible_ = false;
 					return;
+				}
+				PublishSharedTextStoreState();
+				if (imeWindow_) {
+					RefreshImeWindowPosition(imeWindow_);
 				}
 				ensureCaretVisible_ = true;
 				ResetCaretBlink();
@@ -3821,6 +3952,7 @@ namespace fusion::ui {
 				compositionReplaceLength_ = HasSelection() ? SelectionLength() : 0;
 				imeComposition_.clear();
 				imeCursorPos_ = 0;
+				PublishSharedTextStoreState();
 				UpdateImeWindowPosition(hwnd);
 				ResetCaretBlink();
 			}
@@ -3864,6 +3996,7 @@ namespace fusion::ui {
 					imeComposition_.clear();
 					imeActive_ = false;
 					compositionReplaceLength_ = 0;
+					PublishSharedTextStoreState();
 					return;
 				}
 				imeComposition_ = std::move(composition);
@@ -3879,14 +4012,49 @@ namespace fusion::ui {
 				imeComposition_.clear();
 				compositionReplaceLength_ = 0;
 				imeWindow_ = nullptr;
+				PublishSharedTextStoreState();
 				InvalidateTextLayoutState();
 				MarkContentChanged();
 				ResetCaretBlink();
 			}
 
+			void RefreshImeWindowPosition(HWND hwnd) override {
+				if (!focused_ || !hwnd) {
+					return;
+				}
+				HIMC context = nullptr;
+				if (imeActive_) {
+					context = ImmGetContext(hwnd);
+				}
+				auto visual = ComputeVisualState();
+				UpdateImeWindowPosition(hwnd, context, visual);
+				if (context) {
+					ImmReleaseContext(hwnd, context);
+				}
+			}
+
 			const std::wstring& Text() const { return text_; }
 
 		private:
+			bool ShouldDeferCharToIme(wchar_t ch) const {
+				if (!imeWindow_ || ch == L'\r' || ch == L'\n' || ch == L'\b' || ch == 0x7F) {
+					return false;
+				}
+				if (!((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z'))) {
+					return false;
+				}
+				HIMC context = ImmGetContext(imeWindow_);
+				if (!context) {
+					return false;
+				}
+				DWORD conversion = 0;
+				DWORD sentence = 0;
+				const BOOL imeOpen = ImmGetOpenStatus(context);
+				const BOOL hasConversion = ImmGetConversionStatus(context, &conversion, &sentence);
+				ImmReleaseContext(imeWindow_, context);
+				return imeOpen && hasConversion && ((conversion & IME_CMODE_NATIVE) != 0);
+			}
+
 			static constexpr float kScrollGutter = 18.0f;
 			static constexpr float kSingleLineScrollGutter = 12.0f;
 
@@ -4092,14 +4260,17 @@ namespace fusion::ui {
 			}
 
 			void TouchHorizontalScrollReveal() const {
-				horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
 			void TouchVerticalScrollReveal() const {
-				verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
-			std::wstring DisplayText() const {
+			std::wstring DisplayText() const { return text_; }
+			size_t DisplayCaret() const { return caret_; }
+
+			/*std::wstring DisplayText() const {
 				if (!imeActive_ || imeComposition_.empty()) {
 					return text_;
 				}
@@ -4113,7 +4284,7 @@ namespace fusion::ui {
 					return caret_;
 				}
 				return compositionAnchor_ + (std::min)(static_cast<size_t>((std::max)(0L, imeCursorPos_)), imeComposition_.size());
-			}
+			}*/
 
 			IDWriteTextLayout* CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
 				const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, MeasureSingleLineContentWidth(renderText) + 24.0f);
@@ -4263,13 +4434,12 @@ namespace fusion::ui {
 			}
 
 			void DrawImeUnderline(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* outlineBrush) {
-				if (!layout || !imeActive_ || imeComposition_.empty()) {
+				if (!layout || !tsfCompActive_ || tsfCompEnd_ <= tsfCompStart_) {
 					return;
 				}
-				const UINT32 textLength = static_cast<UINT32>(DisplayText().size());
-				const UINT32 start = (std::min)(static_cast<UINT32>(compositionAnchor_), textLength);
-				const UINT32 rawLength = static_cast<UINT32>(imeComposition_.size());
-				const UINT32 length = (std::min)(rawLength, textLength - start);
+				const UINT32 start = static_cast<UINT32>((std::min)(tsfCompStart_, text_.size()));
+				const UINT32 length = static_cast<UINT32>((std::min)(tsfCompEnd_ - tsfCompStart_, text_.size() - start));
+
 				if (length == 0) {
 					return;
 				}
@@ -4471,6 +4641,7 @@ namespace fusion::ui {
 				selectionAnchor_ = caret_;
 				MarkSelectionMetricsDirty();
 				ensureCaretVisible_ = true;
+				PublishSharedTextStoreState();
 				ResetCaretBlink();
 				NotifyChanged();
 			}
@@ -4497,6 +4668,7 @@ namespace fusion::ui {
 				}
 				if (previousCaret != caret_ || previousAnchor != selectionAnchor_) {
 					MarkSelectionMetricsDirty();
+					PublishSharedTextStoreState();
 				}
 				if (!preserveDesiredColumn) {
 					desiredCaretX_.reset();
@@ -4529,7 +4701,7 @@ namespace fusion::ui {
 			}
 
 			void UpdateImeWindowPosition(HWND hwnd, HIMC context, const VisualState& visual) {
-				if (!hwnd || !context) {
+				if (!hwnd) {
 					return;
 				}
 				if (!visual.layout) {
@@ -4543,28 +4715,54 @@ namespace fusion::ui {
 					return;
 				}
 
+				float originY = visual.content.top - scrollY_;
+				if (!multiline_) {
+					const float visibleHeight = (std::max)(1.0f, visual.content.bottom - visual.content.top);
+					const float textHeight = (std::max)(visual.metrics.height, detail::kLineHeight);
+					originY = visual.content.top + (std::max)(0.0f, std::floor((visibleHeight - textHeight) * 0.5f)) - scrollY_;
+				}
+				const float originX = visual.content.left - scrollX_;
+
 				const float dpiScale = (std::max)(0.5f, static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f);
-				const LONG clientX = static_cast<LONG>(std::lround((visual.content.left + caretX - scrollX_) * dpiScale));
-				const LONG clientY = static_cast<LONG>(std::lround((visual.content.top + caretY - scrollY_) * dpiScale));
+				const LONG clientX = static_cast<LONG>(std::lround((originX + caretX) * dpiScale));
+				const LONG clientY = static_cast<LONG>(std::lround((originY + caretY) * dpiScale));
 				const LONG lineHeight = static_cast<LONG>(std::lround((std::max)(caretMetrics.height, detail::kLineHeight) * dpiScale));
+
+				RECT clientRect{ 0, 0, 0, 0 };
+				GetClientRect(hwnd, &clientRect);
+				const LONG maxClientX = (std::max)(clientRect.left, clientRect.right - 1);
+				const LONG maxClientY = (std::max)(clientRect.top, clientRect.bottom - 1);
+				const LONG anchorX = (std::clamp)(clientX, clientRect.left, maxClientX);
+				const LONG anchorY = (std::clamp)(clientY, clientRect.top, maxClientY);
+				const LONG candidateY = (std::clamp)(anchorY + (std::max)(lineHeight, 1L), clientRect.top, maxClientY);
+
+				if (cachedImeX_ == anchorX && cachedImeY_ == anchorY && cachedImeH_ == lineHeight) {
+					return;
+				}
+				cachedImeX_ = anchorX; cachedImeY_ = anchorY; cachedImeH_ = lineHeight;
 
 				COMPOSITIONFORM composition{};
 				composition.dwStyle = CFS_POINT;
-				composition.ptCurrentPos = POINT{ clientX, clientY };
-				ImmSetCompositionWindow(context, &composition);
-
+				composition.ptCurrentPos = POINT{ anchorX, anchorY };
 				CANDIDATEFORM candidate{};
 				candidate.dwIndex = 0;
 				candidate.dwStyle = CFS_CANDIDATEPOS;
-				candidate.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
-				ImmSetCandidateWindow(context, &candidate);
+				candidate.ptCurrentPos = POINT{ anchorX, candidateY };
+				if (context) {
+					ImmSetCompositionWindow(context, &composition);
+					ImmSetCandidateWindow(context, &candidate);
+				}
 
-				CANDIDATEFORM exclude{};
-				exclude.dwIndex = 0;
-				exclude.dwStyle = CFS_EXCLUDE;
-				exclude.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
-				exclude.rcArea = RECT{ clientX - 1, clientY, clientX + 2, clientY + lineHeight };
-				ImmSetCandidateWindow(context, &exclude);
+				POINT screenCaretPt{ anchorX, anchorY };
+				ClientToScreen(hwnd, &screenCaretPt);
+
+				g_ImeCaretScreenX.store(screenCaretPt.x, std::memory_order_relaxed);
+				g_ImeCaretScreenY.store(screenCaretPt.y, std::memory_order_relaxed);
+				g_ImeCaretClientX.store(anchorX, std::memory_order_relaxed);
+				g_ImeCaretClientY.store(anchorY, std::memory_order_relaxed);
+				g_ImeCaretLineHeight.store(static_cast<int32_t>(lineHeight), std::memory_order_relaxed);
+				g_ImeCaretValid.store(true, std::memory_order_release);
+				PostMessageW(hwnd, WM_APP + 0x4B, 0, 0);
 			}
 
 			size_t MoveVerticalByLineBreak(int direction) const {
@@ -4620,10 +4818,18 @@ namespace fusion::ui {
 			void NotifyChanged() {
 				MarkSelectionMetricsDirty();
 				InvalidateTextLayoutState();
+				PublishSharedTextStoreState();
 				MarkContentChanged();
 				if (onChanged_) {
 					onChanged_(text_);
 				}
+			}
+
+			void PublishSharedTextStoreState() const {
+				if (!focused_) {
+					return;
+				}
+				SetSharedTextStoreState(text_, selectionAnchor_, caret_);
 			}
 
 			std::wstring label_;
@@ -4702,6 +4908,14 @@ namespace fusion::ui {
 			mutable float cachedSingleLineWidth_ = 0.0f;
 			mutable TextLayoutCache labelLayoutCache_;
 			mutable TextLayoutCache contentLayoutCache_;
+
+			LONG cachedImeX_ = -1, cachedImeY_ = -1, cachedImeH_ = -1;
+			bool tsfCompActive_ = false;
+			size_t tsfCompStart_ = 0;
+			size_t tsfCompEnd_ = 0;
+			bool lastTsfCompActive_ = false;
+			size_t lastTsfCompStart_ = 0;
+			size_t lastTsfCompEnd_ = 0;
 		};
 
 		class ListBox final : public UIComponent {
@@ -4888,7 +5102,7 @@ namespace fusion::ui {
 			}
 
 			void TouchScrollReveal() const {
-				scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				scrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
 			bool ShouldRevealScrollBar() const {
@@ -6539,6 +6753,10 @@ namespace fusion::ui {
 				return;
 			}
 
+			if (auto* focusedTextInput = dynamic_cast<detail::TextInput*>(host.focused_)) {
+				focusedTextInput->BindImeWindow(hwnd);
+			}
+
 			auto resolvePointerTarget = [&](D2D1_POINT_2F point, bool captureOutsideModal) -> UIComponent* {
 				if (auto* modal = ResolveModalComponent(host.components_, point, captureOutsideModal)) {
 					return modal;
@@ -6646,6 +6864,9 @@ namespace fusion::ui {
 				updateCardHoverState(point, target);
 				host.currentCursor_ = (target && target != host.leftCard_ && target != host.rightCard_) ? target->CursorAt(point) : CursorKind::Arrow;
 				host.UpdateFocused(target && target->IsFocusable() ? target : nullptr);
+				if (auto* focusedTextInput = dynamic_cast<detail::TextInput*>(host.focused_)) {
+					focusedTextInput->BindImeWindow(hwnd);
+				}
 				host.captured_ = target;
 				if (target) {
 					target->OnPointerDown(point);
@@ -6746,6 +6967,17 @@ namespace fusion::ui {
 					host.dynamicDirty_ = true;
 				}
 				return;
+			case WM_IME_NOTIFY: {
+				return;
+			}
+			case WM_APP_SYNC_TEXTSTORE_STATE: {
+				if (auto* textInput = dynamic_cast<detail::TextInput*>(host.focused_)) {
+					textInput->SyncFromSharedTextStore();
+					textInput->MarkDirty();
+					host.dynamicDirty_ = true;
+				}
+				return;
+			}
 			default:
 				return;
 			}
