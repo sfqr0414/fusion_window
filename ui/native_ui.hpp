@@ -838,7 +838,7 @@ namespace fusion::ui {
 		}
 
 		virtual bool WantsFrameTick() const {
-			return false;
+			return IsAnimating();
 		}
 
 		bool CanFocus() const {
@@ -898,6 +898,11 @@ namespace fusion::ui {
 				return rebuilt;
 			}
 			const bool animationOnly = IsOnlyAnimating();
+			if (WantsFrameTick()) {
+				Render(context);
+				dirty_ = false;
+				return rebuilt;
+			}
 			if (NeedsCacheRefresh()) {
 				if (!animationOnly) {
 					RebuildRenderCache(context);
@@ -1655,6 +1660,15 @@ namespace fusion::ui {
 			context->FillRoundedRectangle(roundedRect(thumb), thumbBrush);
 		}
 
+		inline void RenderStandardScrollbar(ID2D1DeviceContext* context, const ScrollbarState& state, const D2D1_COLOR_F& thumbColor, const D2D1_COLOR_F& trackColor, float visibility = 1.0f) {
+			if (!context || visibility <= 0.001f || !state.Visible()) {
+				return;
+			}
+			auto* thumbBrush = PrepareSharedBrush(context, SharedBrushSlot::Primary, thumbColor);
+			auto* trackBrush = PrepareSharedBrush(context, SharedBrushSlot::Secondary, trackColor);
+			DrawRadixScrollbar(context, state, thumbBrush, trackBrush, visibility);
+		}
+
 		inline D2D1_RECT_F InflateRect(const D2D1_RECT_F& rect, float inset) {
 			return D2D1::RectF(rect.left + inset, rect.top + inset, rect.right - inset, rect.bottom - inset);
 		}
@@ -2080,6 +2094,129 @@ namespace fusion::ui {
 			Property<bool> expanded_;
 		};
 
+		class ScrollBar final : public UIComponent {
+		public:
+			ScrollBar(ScrollOrientation orientation,
+				const D2D1_COLOR_F& surfaceColor,
+				const D2D1_COLOR_F& accentColor,
+				const D2D1_COLOR_F& outlineColor,
+				float value,
+				float pageSize,
+				std::function<void(float)> onChanged)
+				: orientation_(orientation), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), value_(Clamp01(value), [this]() { MarkCacheDirty(); }), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {
+			}
+
+			bool IsDynamic() const override { return true; }
+			bool IsFocusable() const override { return true; }
+			CursorKind Cursor() const override { return CursorKind::Arrow; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || valueAnimation_.IsAnimating(); }
+
+			float Value() const {
+				return value_;
+			}
+
+			void ApplyExternalValue(float value) {
+				ApplyValue(value, false);
+			}
+
+			void SetPageSize(float pageSize) {
+				pageSize_ = (std::max)(0.05f, (std::min)(1.0f, pageSize));
+			}
+
+			void SetVisibilityOpacity(float alpha) {
+				visibilityOpacity_ = (std::clamp)(alpha, 0.0f, 1.0f);
+			}
+
+			void SetSuppressOutline(bool suppress) {
+				suppressOutline_ = suppress;
+			}
+
+			void SetInset(float inset) { inset_ = inset; }
+
+			void SetEdgePadding(float edgePadding) { edgePadding_ = edgePadding; }
+
+			void SetExternalState(bool hovered, bool dragging) {
+				useExternalState_ = true;
+				externalHovered_ = hovered;
+				externalDragging_ = dragging;
+			}
+
+			void OnAttachAnimations() override {
+				if (animator_) {
+					animator_->Attach(valueAnimation_, value_);
+				}
+			}
+
+			void Render(ID2D1DeviceContext* context) override {
+				if (visibilityOpacity_ < 0.01f) return;
+				if (!suppressOutline_) {
+					context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, (0.5f + 0.5f * FocusProgress()) * visibilityOpacity_), focused_ ? 1.4f : 1.0f);
+				}
+				RenderStandardScrollbar(context, MakeScrollState(), accentColor_, outlineColor_, visibilityOpacity_);
+			}
+
+			void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); UpdateValue(point); }
+			void OnPointerMove(D2D1_POINT_2F point) override { if (pressed_) UpdateValue(point); }
+			void OnPointerUp(D2D1_POINT_2F point) override { if (pressed_) UpdateValue(point); UIComponent::OnPointerUp(point); }
+			bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
+				if (!PointInRect(bounds_, point)) {
+					return false;
+				}
+				ApplyValue(value_ + (delta > 0 ? -0.05f : 0.05f));
+				return true;
+			}
+			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
+				if (key == VK_LEFT || key == VK_UP) ApplyValue(value_ - 0.03f);
+				if (key == VK_RIGHT || key == VK_DOWN) ApplyValue(value_ + 0.03f);
+			}
+
+		private:
+			ScrollbarState MakeScrollState() const {
+				ScrollbarState state{ orientation_ };
+				state.viewport = bounds_;
+				const float viewportExtent = orientation_ == ScrollOrientation::Horizontal ? (bounds_.right - bounds_.left) : (bounds_.bottom - bounds_.top);
+				state.contentExtent = viewportExtent / (std::max)(pageSize_, 0.15f);
+				state.offset = valueAnimation_.Value() * (std::max)(0.0f, state.contentExtent - viewportExtent);
+				state.inset = inset_;
+				state.edgePadding = edgePadding_;
+				state.hovered = useExternalState_ ? externalHovered_ : (hovered_ || pressed_);
+				state.dragging = useExternalState_ ? externalDragging_ : pressed_;
+				return state;
+			}
+
+			void UpdateValue(D2D1_POINT_2F point) {
+				if (orientation_ == ScrollOrientation::Horizontal) {
+					float width = (std::max)(1.0f, bounds_.right - bounds_.left);
+					ApplyValue((point.x - bounds_.left) / width);
+					return;
+				}
+				float height = (std::max)(1.0f, bounds_.bottom - bounds_.top);
+				ApplyValue((point.y - bounds_.top) / height);
+			}
+
+			void ApplyValue(float value, bool notify = true) {
+				value_ = Clamp01(value);
+				Animate(valueAnimation_, value_, 0.12);
+				if (notify && onChanged_) onChanged_(value_);
+			}
+
+			ScrollOrientation orientation_ = ScrollOrientation::Horizontal;
+			D2D1_COLOR_F surfaceColor_{};
+			D2D1_COLOR_F accentColor_{};
+			D2D1_COLOR_F outlineColor_{};
+			Property<float> value_{};
+			float pageSize_ = 0.2f;
+			float visibilityOpacity_ = 1.0f;
+			float inset_ = 2.0f;
+			float edgePadding_ = 2.0f;
+			bool suppressOutline_ = false;
+			bool useExternalState_ = false;
+			bool externalHovered_ = false;
+			bool externalDragging_ = false;
+			UIAnimation valueAnimation_{};
+			std::function<void(float)> onChanged_;
+		};
+
 		class ScrollArea final : public UIComponent {
 		public:
 			ScrollArea(const D2D1_COLOR_F& fillColor, const D2D1_COLOR_F& outlineColor, const D2D1_COLOR_F& scrollThumbColor, const D2D1_COLOR_F& scrollTrackColor)
@@ -2089,20 +2226,27 @@ namespace fusion::ui {
 				scrollTrackColor_(MakeColorProperty(scrollTrackColor, [this]() { MarkContentChanged(); })),
 				contentHeight_(0.0f, [this]() { MarkCacheDirty(); }),
 				scrollOffset_(0.0f, [this]() { MarkCacheDirty(); }),
+				embeddedBar_(ScrollOrientation::Vertical, fillColor, scrollThumbColor, scrollTrackColor, 0.0f, 0.5f, nullptr),
 				contentHeight(contentHeight_),
 				scrollOffset(scrollOffset_) {
+				embeddedBar_.SetSuppressOutline(true);
 			}
 
 			bool IsDynamic() const override {
 				return scrollBar_.dragging || ScrollBarOpacity() > 0.01f || ScrollRevealActive();
 			}
 
+			bool IsAnimating() const override {
+				return UIComponent::IsAnimating() || embeddedBar_.IsAnimating();
+			}
+
 			bool WantsFrameTick() const override {
-				return ScrollRevealActive();
+				return IsAnimating() || ScrollRevealActive() || ScrollBarOpacity() > 0.01f || scrollBar_.hovered || scrollBar_.dragging;
 			}
 
 			void OnAttachAnimations() override {
 				RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
+				embeddedBar_.AttachAnimationSystem(animator_);
 			}
 
 			void RefreshContentMetrics(float contentHeight) {
@@ -2174,7 +2318,22 @@ namespace fusion::ui {
 				auto rounded = D2D1::RoundedRect(bounds_, kCardRadius, kCardRadius);
 				context->FillRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Primary, fillColor_));
 				context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), 1.0f);
-				DrawRadixScrollbar(context, scrollBar_, PrepareSharedBrush(context, SharedBrushSlot::Primary, scrollThumbColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, scrollTrackColor_), ScrollBarOpacity());
+
+				if (scrollBar_.Visible() || ScrollBarOpacity() > 0.01f) {
+					UpdateScrollBarViewport();
+					const auto clip = BaseContentClipBounds();
+					const float contentExtent = scrollBar_.contentExtent > 0.01f ? scrollBar_.contentExtent : 1.0f;
+					const float viewH = clip.bottom - clip.top;
+					const float pageSize = (std::clamp)(viewH / contentExtent, 0.05f, 1.0f);
+					const float maxOff = (std::max)(contentExtent - viewH, 0.01f);
+					const float normVal = (std::clamp)(scrollOffset_ / maxOff, 0.0f, 1.0f);
+					embeddedBar_.bounds = D2D1::RectF(clip.right - kScrollbarGutter, clip.top, clip.right, clip.bottom);
+					embeddedBar_.SetPageSize(pageSize);
+					embeddedBar_.SetVisibilityOpacity(ScrollBarOpacity());
+					embeddedBar_.SetExternalState(scrollBar_.hovered, scrollBar_.dragging);
+					embeddedBar_.ApplyExternalValue(normVal);
+					embeddedBar_.Render(context);
+				}
 			}
 
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
@@ -2333,6 +2492,7 @@ namespace fusion::ui {
 			float hintedContentHeight_ = 0.0f;
 			mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 			mutable ScrollbarState scrollBar_{ ScrollOrientation::Vertical };
+			ScrollBar embeddedBar_;
 			static constexpr float kScrollbarGutter = 18.0f;
 		};
 
@@ -2446,20 +2606,31 @@ namespace fusion::ui {
 				  mutedColor_(MakeColorProperty(mutedColor, [this]() { MarkContentChanged(); })),
 				  scrollX_(0.0f, [this]() { MarkCacheDirty(); }),
 				  scrollY_(0.0f, [this]() { MarkCacheDirty(); }),
+				  hScrollBar_(ScrollOrientation::Horizontal, mutedColor, accentColor, outlineColor, 0.0f, 1.0f / 1.65f, nullptr),
+				  vScrollBar_(ScrollOrientation::Vertical, mutedColor, accentColor, outlineColor, 0.0f, 1.0f / 1.75f, nullptr),
 				  scrollX(scrollX_),
 				  scrollY(scrollY_) {
+				hScrollBar_.SetSuppressOutline(true);
+				vScrollBar_.SetSuppressOutline(true);
 			}
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
 			CursorKind Cursor() const override { return CursorKind::Arrow; }
+			bool IsAnimating() const override {
+				return UIComponent::IsAnimating() || hScrollBar_.IsAnimating() || vScrollBar_.IsAnimating();
+			}
 			bool WantsFrameTick() const override {
-				return HorizontalScrollRevealActive() || VerticalScrollRevealActive();
+				return IsAnimating()
+					|| HorizontalScrollRevealActive() || VerticalScrollRevealActive()
+					|| HorizontalScrollNeedsFadeOut() || VerticalScrollNeedsFadeOut();
 			}
 
 			void OnAttachAnimations() override {
 				RegisterAnimationSlot(L"horizontalScrollbarVisibility", 0.0f);
 				RegisterAnimationSlot(L"verticalScrollbarVisibility", 0.0f);
+				hScrollBar_.AttachAnimationSystem(animator_);
+				vScrollBar_.AttachAnimationSystem(animator_);
 			}
 
 			void ApplyScrollOffset(float x, float y) {
@@ -2490,7 +2661,24 @@ namespace fusion::ui {
 				context->DrawLine(D2D1::Point2F(metrics.viewport.left + 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.72f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), accentBrush, 2.0f);
 				context->DrawLine(D2D1::Point2F(metrics.viewport.left + metrics.contentWidth * 0.45f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.34f - offsetY), D2D1::Point2F(metrics.viewport.left + metrics.contentWidth - 16.0f - offsetX, metrics.viewport.top + metrics.contentHeight * 0.64f - offsetY), accentBrush, 2.0f);
 				context->PopAxisAlignedClip();
-				DrawScrollBars(context, metrics);
+
+				const D2D1_RECT_F baseViewport = InflateRect(bounds_, 12.0f);
+				if (metrics.renderHorizontal) {
+					hScrollBar_.bounds = D2D1::RectF(baseViewport.left, baseViewport.bottom - kScrollGutter, baseViewport.right, baseViewport.bottom);
+					hScrollBar_.SetPageSize(1.0f / 1.65f);
+					hScrollBar_.SetVisibilityOpacity(metrics.horizontalOpacity);
+					hScrollBar_.SetExternalState(horizontalScrollHovered_ || dragMode_ == DragMode::Horizontal, dragMode_ == DragMode::Horizontal);
+					hScrollBar_.ApplyExternalValue(scrollX_);
+					hScrollBar_.Render(context);
+				}
+				if (metrics.renderVertical) {
+					vScrollBar_.bounds = D2D1::RectF(baseViewport.right - kScrollGutter, baseViewport.top, baseViewport.right, baseViewport.bottom);
+					vScrollBar_.SetPageSize(1.0f / 1.75f);
+					vScrollBar_.SetVisibilityOpacity(metrics.verticalOpacity);
+					vScrollBar_.SetExternalState(verticalScrollHovered_ || dragMode_ == DragMode::Vertical, dragMode_ == DragMode::Vertical);
+					vScrollBar_.ApplyExternalValue(scrollY_);
+					vScrollBar_.Render(context);
+				}
 				context->DrawRoundedRectangle(rounded, PrepareSharedBrush(context, SharedBrushSlot::Tertiary, outlineColor_, 0.55f), 1.0f);
 			}
 
@@ -2647,15 +2835,6 @@ namespace fusion::ui {
 				return CursorKind::Arrow;
 			}
 
-			void DrawScrollBars(ID2D1DeviceContext* context, const Metrics& metrics) {
-				if (metrics.renderHorizontal) {
-					DrawRadixScrollbar(context, metrics.horizontalScroll, PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), metrics.horizontalOpacity);
-				}
-				if (metrics.renderVertical) {
-					DrawRadixScrollbar(context, metrics.verticalScroll, PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), metrics.verticalOpacity);
-				}
-			}
-
 			float HorizontalScrollOpacity() const {
 				return AnimationSlotValue(L"horizontalScrollbarVisibility", 0.0f);
 			}
@@ -2672,12 +2851,22 @@ namespace fusion::ui {
 				return verticalScrollRevealUntil_ > std::chrono::steady_clock::now();
 			}
 
+			bool HorizontalScrollNeedsFadeOut() const {
+				return HorizontalScrollOpacity() > 0.01f && !horizontalScrollHovered_
+					&& !HorizontalScrollRevealActive() && dragMode_ != DragMode::Horizontal;
+			}
+
+			bool VerticalScrollNeedsFadeOut() const {
+				return VerticalScrollOpacity() > 0.01f && !verticalScrollHovered_
+					&& !VerticalScrollRevealActive() && dragMode_ != DragMode::Vertical;
+			}
+
 			void TouchHorizontalScrollReveal() const {
-				horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
 			void TouchVerticalScrollReveal() const {
-				verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(900);
+				verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
 			}
 
 			void UpdateScrollBarAnimations(const Metrics& metrics) {
@@ -2698,6 +2887,8 @@ namespace fusion::ui {
 			ColorProperty mutedColor_;
 			Property<float> scrollX_;
 			Property<float> scrollY_;
+			ScrollBar hScrollBar_;
+			ScrollBar vScrollBar_;
 			mutable bool horizontalScrollHovered_ = false;
 			mutable bool verticalScrollHovered_ = false;
 			bool horizontalScrollBarVisibleTarget_ = false;
@@ -3175,10 +3366,19 @@ namespace fusion::ui {
 			bool IsFocusable() const override { return true; }
 			CursorKind Cursor() const override { return CursorKind::IBeam; }
 			bool IsAnimating() const override {
-				return UIComponent::IsAnimating() || caretOpacityAnimation_.IsAnimating() || horizontalScrollVisibilityAnimation_.IsAnimating() || verticalScrollVisibilityAnimation_.IsAnimating();
+				return UIComponent::IsAnimating() || caretOpacityAnimation_.IsAnimating() || horizontalScrollVisibilityAnimation_.IsAnimating() || verticalScrollVisibilityAnimation_.IsAnimating()
+					|| hScrollBar_.IsAnimating() || vScrollBar_.IsAnimating();
 			}
 			bool WantsFrameTick() const override {
-				return HorizontalScrollRevealActive() || VerticalScrollRevealActive();
+				return focused_
+					|| IsAnimating()
+					|| HorizontalScrollRevealActive()
+					|| VerticalScrollRevealActive()
+					|| horizontalScrollVisibilityAnimation_.Value() > 0.01f
+					|| verticalScrollVisibilityAnimation_.Value() > 0.01f
+					|| horizontalScrollHovered_
+					|| verticalScrollHovered_
+					|| scrollDragMode_ != ScrollDragMode::None;
 			}
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				auto visual = ComputeVisualState();
@@ -3208,6 +3408,8 @@ namespace fusion::ui {
 					animator_->Attach(horizontalScrollVisibilityAnimation_, 0.0f);
 					animator_->Attach(verticalScrollVisibilityAnimation_, 0.0f);
 				}
+				hScrollBar_.AttachAnimationSystem(animator_);
+				vScrollBar_.AttachAnimationSystem(animator_);
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
@@ -3284,7 +3486,17 @@ namespace fusion::ui {
 				}
 				context->PopAxisAlignedClip();
 				if (visual.renderHorizontalScroll) {
-					DrawScrollBar(context, visual.horizontalScroll, horizontalScrollOpacity);
+					const auto& hs = visual.horizontalScroll;
+					const float hExt = hs.contentExtent > 0.01f ? hs.contentExtent : 1.0f;
+					const float hVp = hs.viewport.right - hs.viewport.left;
+					hScrollBar_.bounds = hs.viewport;
+					hScrollBar_.SetPageSize((std::clamp)(hVp / hExt, 0.05f, 1.0f));
+					hScrollBar_.SetInset(hs.inset);
+					hScrollBar_.SetEdgePadding(hs.edgePadding);
+					hScrollBar_.SetVisibilityOpacity(horizontalScrollOpacity);
+					hScrollBar_.SetExternalState(hs.hovered, hs.dragging);
+					hScrollBar_.ApplyExternalValue(hs.MaxOffset() > 0.01f ? hs.offset / hs.MaxOffset() : 0.0f);
+					hScrollBar_.Render(context);
 				}
 				if (multiline_) {
 					const bool forceVerticalCue = scrollY_ > 0.5f || VerticalOverflowHintActive();
@@ -3299,11 +3511,30 @@ namespace fusion::ui {
 							verticalScroll = MakeVerticalScrollState(visual.box, fallbackMaxScrollY, visual.content.bottom - visual.content.top);
 							verticalScroll.offset = (std::clamp)(scrollY_, 0.0f, fallbackMaxScrollY);
 						}
-						DrawScrollBar(context, verticalScroll, effectiveVerticalOpacity);
+						const float vExt = verticalScroll.contentExtent > 0.01f ? verticalScroll.contentExtent : 1.0f;
+						const float vVp = verticalScroll.viewport.bottom - verticalScroll.viewport.top;
+						vScrollBar_.bounds = verticalScroll.viewport;
+						vScrollBar_.SetPageSize((std::clamp)(vVp / vExt, 0.05f, 1.0f));
+						vScrollBar_.SetInset(verticalScroll.inset);
+						vScrollBar_.SetEdgePadding(verticalScroll.edgePadding);
+						vScrollBar_.SetVisibilityOpacity(effectiveVerticalOpacity);
+						vScrollBar_.SetExternalState(verticalScroll.hovered, verticalScroll.dragging);
+						vScrollBar_.ApplyExternalValue(verticalScroll.MaxOffset() > 0.01f ? verticalScroll.offset / verticalScroll.MaxOffset() : 0.0f);
+						vScrollBar_.Render(context);
 					}
 				}
 				else if (visual.renderVerticalScroll) {
-					DrawScrollBar(context, visual.verticalScroll, verticalScrollOpacity);
+					const auto& vs = visual.verticalScroll;
+					const float vExt = vs.contentExtent > 0.01f ? vs.contentExtent : 1.0f;
+					const float vVp = vs.viewport.bottom - vs.viewport.top;
+					vScrollBar_.bounds = vs.viewport;
+					vScrollBar_.SetPageSize((std::clamp)(vVp / vExt, 0.05f, 1.0f));
+					vScrollBar_.SetInset(vs.inset);
+					vScrollBar_.SetEdgePadding(vs.edgePadding);
+					vScrollBar_.SetVisibilityOpacity(verticalScrollOpacity);
+					vScrollBar_.SetExternalState(vs.hovered, vs.dragging);
+					vScrollBar_.ApplyExternalValue(vs.MaxOffset() > 0.01f ? vs.offset / vs.MaxOffset() : 0.0f);
+					vScrollBar_.Render(context);
 				}
 			}
 
@@ -3354,6 +3585,9 @@ namespace fusion::ui {
 				selectionAnchor_ = index;
 				desiredCaretX_.reset();
 				ensureCaretVisible_ = true;
+				if (imeActive_ && imeWindow_) {
+					UpdateImeWindowPosition(imeWindow_);
+				}
 				ResetCaretBlink();
 			}
 
@@ -3391,6 +3625,9 @@ namespace fusion::ui {
 					caret_ = HitTestText(point);
 					desiredCaretX_.reset();
 					ensureCaretVisible_ = true;
+					if (imeActive_ && imeWindow_) {
+						UpdateImeWindowPosition(imeWindow_);
+					}
 					ResetCaretBlink();
 				}
 			}
@@ -3565,12 +3802,14 @@ namespace fusion::ui {
 				ResetCaretBlink();
 			}
 
-			void OnImeStart(HWND) override {
+			void OnImeStart(HWND hwnd) override {
 				imeActive_ = true;
+				imeWindow_ = hwnd;
 				compositionAnchor_ = SelectionStart();
 				compositionReplaceLength_ = HasSelection() ? SelectionLength() : 0;
 				imeComposition_.clear();
 				imeCursorPos_ = 0;
+				UpdateImeWindowPosition(hwnd);
 				ResetCaretBlink();
 			}
 
@@ -3578,6 +3817,7 @@ namespace fusion::ui {
 				if (!imeActive_) {
 					OnImeStart(hwnd);
 				}
+				imeWindow_ = hwnd;
 				HIMC context = ImmGetContext(hwnd);
 				if (!context) {
 					return;
@@ -3602,6 +3842,7 @@ namespace fusion::ui {
 				if ((lParam & GCS_CURSORPOS) != 0) {
 					ImmGetCompositionStringW(context, GCS_CURSORPOS, &cursorPos, sizeof(cursorPos));
 				}
+				UpdateImeWindowPosition(hwnd, context);
 				ImmReleaseContext(hwnd, context);
 				if (!result.empty()) {
 					ReplaceRange(compositionAnchor_, compositionReplaceLength_, result);
@@ -3622,6 +3863,7 @@ namespace fusion::ui {
 				imeActive_ = false;
 				imeComposition_.clear();
 				compositionReplaceLength_ = 0;
+				imeWindow_ = nullptr;
 				InvalidateTextLayoutState();
 				MarkContentChanged();
 				ResetCaretBlink();
@@ -4089,10 +4331,6 @@ namespace fusion::ui {
 				return state;
 			}
 
-			void DrawScrollBar(ID2D1DeviceContext* context, const ScrollbarState& state, float opacity) {
-				DrawRadixScrollbar(context, state, PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), opacity);
-			}
-
 			void UpdateCaretBlink() {
 				if (!focused_) {
 					return;
@@ -4113,16 +4351,38 @@ namespace fusion::ui {
 			}
 
 			size_t HitTestText(D2D1_POINT_2F point) const {
-				const auto visual = ComputeVisualState();
-				if (!visual.layout) {
+				const D2D1_RECT_F box = TextBounds();
+				D2D1_RECT_F content = multiline_
+					? InflateRect(box, 12.0f)
+					: D2D1::RectF(box.left + 12.0f, box.top + 6.0f, box.right - 12.0f, box.bottom - 6.0f);
+
+				const bool reserveVertical = multiline_ && (previousVerticalOverflow_ || VerticalOverflowHintActive() || verticalScrollVisibilityAnimation_.Value() > 0.01f);
+				const bool reserveHorizontal = !multiline_ && (previousHorizontalOverflow_ || HorizontalOverflowHintActive() || horizontalScrollVisibilityAnimation_.Value() > 0.01f);
+				if (reserveVertical) {
+					content.right -= kScrollGutter;
+				}
+				if (reserveHorizontal) {
+					content.bottom -= kSingleLineScrollGutter;
+				}
+
+				std::wstring displayStorage;
+				std::wstring_view renderText = text_;
+				if (imeActive_ && !imeComposition_.empty()) {
+					displayStorage = text_;
+					displayStorage.replace(compositionAnchor_, compositionReplaceLength_, imeComposition_);
+					renderText = displayStorage;
+				}
+
+				auto* layout = CreateLayout(renderText, content);
+				if (!layout) {
 					return text_.size();
 				}
 				BOOL trailing = FALSE;
 				BOOL inside = FALSE;
 				DWRITE_HIT_TEST_METRICS metrics{};
-				const float localX = point.x - visual.content.left + scrollX_;
-				const float localY = point.y - visual.content.top + scrollY_;
-				if (FAILED(visual.layout->HitTestPoint(localX, localY, &trailing, &inside, &metrics))) {
+				const float localX = point.x - content.left + scrollX_;
+				const float localY = point.y - content.top + scrollY_;
+				if (FAILED(layout->HitTestPoint(localX, localY, &trailing, &inside, &metrics))) {
 					return text_.size();
 				}
 				size_t index = metrics.textPosition + (trailing ? metrics.length : 0);
@@ -4180,7 +4440,62 @@ namespace fusion::ui {
 					desiredCaretX_.reset();
 				}
 				ensureCaretVisible_ = true;
+				if (imeActive_ && imeWindow_) {
+					UpdateImeWindowPosition(imeWindow_);
+				}
 				ResetCaretBlink();
+			}
+
+			void UpdateImeWindowPosition(HWND hwnd) {
+				if (!hwnd) {
+					return;
+				}
+				HIMC context = ImmGetContext(hwnd);
+				if (!context) {
+					return;
+				}
+				UpdateImeWindowPosition(hwnd, context);
+				ImmReleaseContext(hwnd, context);
+			}
+
+			void UpdateImeWindowPosition(HWND hwnd, HIMC context) {
+				if (!hwnd || !context) {
+					return;
+				}
+				auto visual = ComputeVisualState();
+				if (!visual.layout) {
+					return;
+				}
+
+				FLOAT caretX = 0.0f;
+				FLOAT caretY = 0.0f;
+				DWRITE_HIT_TEST_METRICS caretMetrics{};
+				if (FAILED(visual.layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
+					return;
+				}
+
+				const float dpiScale = static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f;
+				const LONG clientX = static_cast<LONG>(std::lround((visual.content.left + caretX - scrollX_) * dpiScale));
+				const LONG clientY = static_cast<LONG>(std::lround((visual.content.top + caretY - scrollY_) * dpiScale));
+				const LONG lineHeight = static_cast<LONG>(std::lround((std::max)(caretMetrics.height, detail::kLineHeight) * dpiScale));
+
+				COMPOSITIONFORM composition{};
+				composition.dwStyle = CFS_FORCE_POSITION;
+				composition.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
+				ImmSetCompositionWindow(context, &composition);
+
+				CANDIDATEFORM candidate{};
+				candidate.dwIndex = 0;
+				candidate.dwStyle = CFS_CANDIDATEPOS;
+				candidate.ptCurrentPos = POINT{ clientX + 1, clientY + lineHeight };
+				ImmSetCandidateWindow(context, &candidate);
+
+				CANDIDATEFORM exclude{};
+				exclude.dwIndex = 0;
+				exclude.dwStyle = CFS_EXCLUDE;
+				exclude.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
+				exclude.rcArea = RECT{ clientX - 1, clientY, clientX + 2, clientY + lineHeight };
+				ImmSetCandidateWindow(context, &exclude);
 			}
 
 			size_t MoveVerticalByLineBreak(int direction) const {
@@ -4279,9 +4594,12 @@ namespace fusion::ui {
 			UIAnimation caretOpacityAnimation_{};
 			UIAnimation horizontalScrollVisibilityAnimation_{};
 			UIAnimation verticalScrollVisibilityAnimation_{};
+			ScrollBar hScrollBar_{ ScrollOrientation::Horizontal, outlineColor_, selectionColor_, outlineColor_, 0.0f, 0.5f, nullptr };
+			ScrollBar vScrollBar_{ ScrollOrientation::Vertical, outlineColor_, selectionColor_, outlineColor_, 0.0f, 0.5f, nullptr };
 			std::chrono::steady_clock::time_point nextCaretBlinkToggle_ = std::chrono::steady_clock::now();
 			std::wstring imeComposition_;
 			LONG imeCursorPos_ = 0;
+			HWND imeWindow_ = nullptr;
 			size_t compositionAnchor_ = 0;
 			size_t compositionReplaceLength_ = 0;
 			mutable std::optional<float> desiredCaretX_;
@@ -4326,6 +4644,15 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || embeddedBar_.IsAnimating(); }
+			bool WantsFrameTick() const override {
+				return IsAnimating() || ScrollRevealActive() || ScrollBarOpacity() > 0.01f || scrollBarHovered_ || draggingScroll_;
+			}
+
+			void OnAttachAnimations() override {
+				RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
+				embeddedBar_.AttachAnimationSystem(animator_);
+			}
 
 			void BindOnScrollChanged(std::function<void(float)> onScrollChanged) {
 				onScrollChanged_ = std::move(onScrollChanged);
@@ -4378,7 +4705,17 @@ namespace fusion::ui {
 				}
 				context->PopAxisAlignedClip();
 				if (renderScrollBar) {
-					DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), ScrollBarOpacity());
+					const auto state = MakeScrollState();
+					const float ext = state.contentExtent > 0.01f ? state.contentExtent : 1.0f;
+					const float vp = state.viewport.bottom - state.viewport.top;
+					embeddedBar_.bounds = state.viewport;
+					embeddedBar_.SetPageSize((std::clamp)(vp / ext, 0.05f, 1.0f));
+					embeddedBar_.SetInset(state.inset);
+					embeddedBar_.SetEdgePadding(state.edgePadding);
+					embeddedBar_.SetVisibilityOpacity(ScrollBarOpacity());
+					embeddedBar_.SetExternalState(state.hovered, state.dragging);
+					embeddedBar_.ApplyExternalValue(state.MaxOffset() > 0.01f ? state.offset / state.MaxOffset() : 0.0f);
+					embeddedBar_.Render(context);
 				}
 			}
 
@@ -4587,6 +4924,7 @@ namespace fusion::ui {
 			mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
 			std::function<void(std::wstring_view)> onChanged_;
 			std::function<void(float)> onScrollChanged_;
+			ScrollBar embeddedBar_{ ScrollOrientation::Vertical, surfaceColor_, accentColor_, outlineColor_, 0.0f, 0.5f, nullptr };
 			static constexpr float kScrollGutter = 18.0f;
 		};
 
@@ -4606,10 +4944,14 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
-			bool WantsFrameTick() const override { return ScrollRevealActive(); }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || embeddedBar_.IsAnimating(); }
+			bool WantsFrameTick() const override {
+				return IsAnimating() || ScrollRevealActive() || ScrollBarOpacity() > 0.01f || scrollBarHovered_ || draggingScroll_;
+			}
 
 			void OnAttachAnimations() override {
 				RegisterAnimationSlot(L"scrollbarVisibility", 0.0f);
+				embeddedBar_.AttachAnimationSystem(animator_);
 			}
 
 			void Render(ID2D1DeviceContext* context) override {
@@ -4641,7 +4983,17 @@ namespace fusion::ui {
 				}
 				context->PopAxisAlignedClip();
 				if (renderScroll) {
-					DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), ScrollBarOpacity());
+					const auto state = MakeScrollState();
+					const float ext = state.contentExtent > 0.01f ? state.contentExtent : 1.0f;
+					const float vp = state.viewport.right - state.viewport.left;
+					embeddedBar_.bounds = state.viewport;
+					embeddedBar_.SetPageSize((std::clamp)(vp / ext, 0.05f, 1.0f));
+					embeddedBar_.SetInset(state.inset);
+					embeddedBar_.SetEdgePadding(state.edgePadding);
+					embeddedBar_.SetVisibilityOpacity(ScrollBarOpacity());
+					embeddedBar_.SetExternalState(state.hovered, state.dragging);
+					embeddedBar_.ApplyExternalValue(state.MaxOffset() > 0.01f ? state.offset / state.MaxOffset() : 0.0f);
+					embeddedBar_.Render(context);
 				}
 			}
 
@@ -4824,6 +5176,7 @@ namespace fusion::ui {
 			float originScrollOffset_ = 0.0f;
 			size_t selectedIndex_ = 0;
 			mutable std::chrono::steady_clock::time_point scrollRevealUntil_{};
+			ScrollBar embeddedBar_{ ScrollOrientation::Horizontal, surfaceColor_, accentColor_, outlineColor_, 0.0f, 0.5f, nullptr };
 			static constexpr float kScrollGutter = 18.0f;
 		};
 
@@ -4842,8 +5195,10 @@ namespace fusion::ui {
 
 			bool IsDynamic() const override { return true; }
 			bool IsFocusable() const override { return true; }
-			bool IsAnimating() const override { return UIComponent::IsAnimating() || openAnimation_.IsAnimating(); }
-			bool WantsFrameTick() const override { return HasOpenPopup() || PopupScrollRevealActive(); }
+			bool IsAnimating() const override { return UIComponent::IsAnimating() || openAnimation_.IsAnimating() || popupScrollBar_.IsAnimating(); }
+			bool WantsFrameTick() const override {
+				return IsAnimating() || HasOpenPopup() || PopupScrollRevealActive() || PopupScrollBarOpacity() > 0.01f || popupScrollBarHovered_ || popupDraggingScroll_;
+			}
 
 			bool HasOpenPopup() const override {
 				return open_ || openAnimation_.Value() > 0.01f;
@@ -4902,7 +5257,17 @@ namespace fusion::ui {
 					context->PopAxisAlignedClip();
 				}
 				if (renderScrollBar) {
-					DrawRadixScrollbar(context, MakePopupScrollState(popup), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_), PopupScrollBarOpacity());
+					const auto state = MakePopupScrollState(popup);
+					const float ext = state.contentExtent > 0.01f ? state.contentExtent : 1.0f;
+					const float vp = state.viewport.bottom - state.viewport.top;
+					popupScrollBar_.bounds = state.viewport;
+					popupScrollBar_.SetPageSize((std::clamp)(vp / ext, 0.05f, 1.0f));
+					popupScrollBar_.SetInset(state.inset);
+					popupScrollBar_.SetEdgePadding(state.edgePadding);
+					popupScrollBar_.SetVisibilityOpacity(PopupScrollBarOpacity());
+					popupScrollBar_.SetExternalState(state.hovered, state.dragging);
+					popupScrollBar_.ApplyExternalValue(state.MaxOffset() > 0.01f ? state.offset / state.MaxOffset() : 0.0f);
+					popupScrollBar_.Render(context);
 				}
 			}
 
@@ -4936,6 +5301,8 @@ namespace fusion::ui {
 				if (animator_) {
 					animator_->Attach(openAnimation_, open_ ? 1.0f : 0.0f);
 				}
+				popupScrollBar_.AttachAnimationSystem(animator_);
+				popupScrollBar_.SetSuppressOutline(true);
 			}
 
 			void OnPointerDown(D2D1_POINT_2F point) override {
@@ -5262,99 +5629,9 @@ namespace fusion::ui {
 			mutable D2D1_RECT_F cachedPopupHostBounds_{ D2D1::RectF() };
 			mutable D2D1_RECT_F cachedPopupBounds_{ D2D1::RectF() };
 			mutable float cachedPopupOpenAmount_ = -1.0f;
+			ScrollBar popupScrollBar_{ ScrollOrientation::Vertical, surfaceColor_, accentColor_, outlineColor_, 0.0f, 0.5f, nullptr };
 			static constexpr size_t kPopupMaxVisibleRows = 5;
 			static constexpr float kPopupScrollGutter = 18.0f;
-		};
-
-		class ScrollBar final : public UIComponent {
-		public:
-			ScrollBar(ScrollOrientation orientation,
-				const D2D1_COLOR_F& surfaceColor,
-				const D2D1_COLOR_F& accentColor,
-				const D2D1_COLOR_F& outlineColor,
-				float value,
-				float pageSize,
-				std::function<void(float)> onChanged)
-				: orientation_(orientation), surfaceColor_(surfaceColor), accentColor_(accentColor), outlineColor_(outlineColor), value_(Clamp01(value), [this]() { MarkCacheDirty(); }), pageSize_(Clamp01(pageSize)), onChanged_(std::move(onChanged)) {
-			}
-
-			bool IsDynamic() const override { return true; }
-			bool IsFocusable() const override { return true; }
-			CursorKind Cursor() const override { return CursorKind::Arrow; }
-			bool IsAnimating() const override { return UIComponent::IsAnimating() || valueAnimation_.IsAnimating(); }
-
-			float Value() const {
-				return value_;
-			}
-
-			void ApplyExternalValue(float value) {
-				ApplyValue(value, false);
-			}
-
-			void OnAttachAnimations() override {
-				if (animator_) {
-					animator_->Attach(valueAnimation_, value_);
-				}
-			}
-
-			void Render(ID2D1DeviceContext* context) override {
-				context->DrawRoundedRectangle(D2D1::RoundedRect(bounds_, 10.0f, 10.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.5f + 0.5f * FocusProgress()), focused_ ? 1.4f : 1.0f);
-				DrawRadixScrollbar(context, MakeScrollState(), PrepareSharedBrush(context, SharedBrushSlot::Primary, accentColor_), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_));
-			}
-
-			void OnPointerDown(D2D1_POINT_2F point) override { UIComponent::OnPointerDown(point); UpdateValue(point); }
-			void OnPointerMove(D2D1_POINT_2F point) override { if (pressed_) UpdateValue(point); }
-			void OnPointerUp(D2D1_POINT_2F point) override { if (pressed_) UpdateValue(point); UIComponent::OnPointerUp(point); }
-			bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
-				if (!PointInRect(bounds_, point)) {
-					return false;
-				}
-				ApplyValue(value_ + (delta > 0 ? -0.05f : 0.05f));
-				return true;
-			}
-			void OnKeyDown(WPARAM key, const KeyModifiers&) override {
-				if (key == VK_LEFT || key == VK_UP) ApplyValue(value_ - 0.03f);
-				if (key == VK_RIGHT || key == VK_DOWN) ApplyValue(value_ + 0.03f);
-			}
-
-		private:
-			ScrollbarState MakeScrollState() const {
-				ScrollbarState state{ orientation_ };
-				state.viewport = bounds_;
-				const float viewportExtent = orientation_ == ScrollOrientation::Horizontal ? (bounds_.right - bounds_.left) : (bounds_.bottom - bounds_.top);
-				state.contentExtent = viewportExtent / (std::max)(pageSize_, 0.15f);
-				state.offset = valueAnimation_.Value() * (std::max)(0.0f, state.contentExtent - viewportExtent);
-				state.inset = 2.0f;
-				state.edgePadding = 2.0f;
-				state.hovered = hovered_ || pressed_;
-				state.dragging = pressed_;
-				return state;
-			}
-
-			void UpdateValue(D2D1_POINT_2F point) {
-				if (orientation_ == ScrollOrientation::Horizontal) {
-					float width = (std::max)(1.0f, bounds_.right - bounds_.left);
-					ApplyValue((point.x - bounds_.left) / width);
-					return;
-				}
-				float height = (std::max)(1.0f, bounds_.bottom - bounds_.top);
-				ApplyValue((point.y - bounds_.top) / height);
-			}
-
-			void ApplyValue(float value, bool notify = true) {
-				value_ = Clamp01(value);
-				Animate(valueAnimation_, value_, 0.12);
-				if (notify && onChanged_) onChanged_(value_);
-			}
-
-			ScrollOrientation orientation_ = ScrollOrientation::Horizontal;
-			D2D1_COLOR_F surfaceColor_{};
-			D2D1_COLOR_F accentColor_{};
-			D2D1_COLOR_F outlineColor_{};
-			Property<float> value_{};
-			float pageSize_ = 0.2f;
-			UIAnimation valueAnimation_{};
-			std::function<void(float)> onChanged_;
 		};
 
 		class Knob final : public UIComponent {
