@@ -3436,6 +3436,9 @@ namespace fusion::ui {
 				context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.58f + FocusProgress() * 0.42f), focused_ ? 1.8f : 1.0f);
 				UpdateScrollbarVisibilityAnimations(visual);
 				SyncScrollOffsets(visual.layout, visual.content);
+				if (imeActive_ && imeWindow_) {
+					UpdateImeWindowPosition(imeWindow_);
+				}
 				if (!multiline_) {
 					const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
 					const float drawMaxScrollX = (std::max)(0.0f, MeasureSingleLineContentWidth(visual.renderText) - visibleWidth + 4.0f);
@@ -3583,6 +3586,7 @@ namespace fusion::ui {
 				const size_t index = HitTestText(point);
 				caret_ = index;
 				selectionAnchor_ = index;
+				MarkSelectionMetricsDirty();
 				desiredCaretX_.reset();
 				ensureCaretVisible_ = true;
 				if (imeActive_ && imeWindow_) {
@@ -3623,6 +3627,7 @@ namespace fusion::ui {
 				}
 				if (draggingSelection_) {
 					caret_ = HitTestText(point);
+					MarkSelectionMetricsDirty();
 					desiredCaretX_.reset();
 					ensureCaretVisible_ = true;
 					if (imeActive_ && imeWindow_) {
@@ -3692,6 +3697,7 @@ namespace fusion::ui {
 					case 'a':
 						selectionAnchor_ = 0;
 						caret_ = text_.size();
+						MarkSelectionMetricsDirty();
 						desiredCaretX_.reset();
 						ensureCaretVisible_ = true;
 						MarkCacheDirty();
@@ -3727,6 +3733,7 @@ namespace fusion::ui {
 						text_.erase(caret_ - 1, 1);
 						--caret_;
 						selectionAnchor_ = caret_;
+						MarkSelectionMetricsDirty();
 						desiredCaretX_.reset();
 						NotifyChanged();
 					}
@@ -4159,6 +4166,11 @@ namespace fusion::ui {
 			void InvalidateTextLayoutState() {
 				cachedTextLayoutValid_ = false;
 				cachedSingleLineWidthValid_ = false;
+				MarkSelectionMetricsDirty();
+			}
+
+			void MarkSelectionMetricsDirty() const {
+				selectionMetricsDirty_ = true;
 			}
 
 			void ShiftStyledRanges(size_t start, ptrdiff_t delta, size_t removedLength = 0) {
@@ -4201,27 +4213,38 @@ namespace fusion::ui {
 				if (!layout || imeActive_ || !HasSelection()) {
 					return;
 				}
-				std::array<DWRITE_HIT_TEST_METRICS, 8> stackMetrics{};
-				UINT32 actualCount = 0;
-				const UINT32 length = static_cast<UINT32>(SelectionLength());
-				HRESULT hr = layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, origin.x, origin.y, stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
-				std::vector<DWRITE_HIT_TEST_METRICS> dynamicMetrics;
-				if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
-					dynamicMetrics.resize(actualCount);
-					if (SUCCEEDED(layout->HitTestTextRange(static_cast<UINT32>(SelectionStart()), length, origin.x, origin.y, dynamicMetrics.data(), actualCount, &actualCount))) {
-						for (const auto& metric : dynamicMetrics) {
-							selectionBrush->SetOpacity(0.18f + FocusProgress() * 0.18f);
-							context->FillRectangle(D2D1::RectF(metric.left, metric.top, metric.left + metric.width, metric.top + metric.height), selectionBrush);
+				const size_t start = SelectionStart();
+				const size_t length = SelectionLength();
+				if (selectionMetricsDirty_
+					|| cachedSelectionLayout_ != layout
+					|| start != cachedSelectionStart_
+					|| length != cachedSelectionLength_) {
+					cachedSelectionMetrics_.clear();
+					UINT32 actualCount = 0;
+					HRESULT hr = layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, nullptr, 0, &actualCount);
+					if (FAILED(hr) && hr != E_NOT_SUFFICIENT_BUFFER && hr != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
+						return;
+					}
+					if (actualCount > 0) {
+						cachedSelectionMetrics_.resize(actualCount);
+						hr = layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, cachedSelectionMetrics_.data(), actualCount, &actualCount);
+						if (FAILED(hr)) {
+							cachedSelectionMetrics_.clear();
+							return;
 						}
+						cachedSelectionMetrics_.resize(actualCount);
 					}
-					return;
+					cachedSelectionLayout_ = layout;
+					cachedSelectionStart_ = start;
+					cachedSelectionLength_ = length;
+					selectionMetricsDirty_ = false;
 				}
-				if (SUCCEEDED(hr)) {
-					for (UINT32 index = 0; index < actualCount; ++index) {
-						const auto& metric = stackMetrics[index];
-						selectionBrush->SetOpacity(0.18f + FocusProgress() * 0.18f);
-						context->FillRectangle(D2D1::RectF(metric.left, metric.top, metric.left + metric.width, metric.top + metric.height), selectionBrush);
-					}
+
+				selectionBrush->SetOpacity(0.18f + FocusProgress() * 0.18f);
+				for (const auto& metric : cachedSelectionMetrics_) {
+					context->FillRectangle(
+						D2D1::RectF(origin.x + metric.left, origin.y + metric.top, origin.x + metric.left + metric.width, origin.y + metric.top + metric.height),
+						selectionBrush);
 				}
 			}
 
@@ -4398,6 +4421,7 @@ namespace fusion::ui {
 				text_.erase(start, SelectionLength());
 				caret_ = start;
 				selectionAnchor_ = start;
+				MarkSelectionMetricsDirty();
 				ensureCaretVisible_ = true;
 				NotifyChanged();
 				return true;
@@ -4413,6 +4437,7 @@ namespace fusion::ui {
 				text_.replace(start, length, replacement.data(), replacement.size());
 				caret_ = start + replacement.size();
 				selectionAnchor_ = caret_;
+				MarkSelectionMetricsDirty();
 				ensureCaretVisible_ = true;
 				ResetCaretBlink();
 				NotifyChanged();
@@ -4432,9 +4457,14 @@ namespace fusion::ui {
 			}
 
 			void MoveCaret(size_t index, bool extendSelection, bool preserveDesiredColumn = false) {
+				const size_t previousCaret = caret_;
+				const size_t previousAnchor = selectionAnchor_;
 				caret_ = (std::min)(index, text_.size());
 				if (!extendSelection) {
 					selectionAnchor_ = caret_;
+				}
+				if (previousCaret != caret_ || previousAnchor != selectionAnchor_) {
+					MarkSelectionMetricsDirty();
 				}
 				if (!preserveDesiredColumn) {
 					desiredCaretX_.reset();
@@ -4474,20 +4504,20 @@ namespace fusion::ui {
 					return;
 				}
 
-				const float dpiScale = static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f;
+				const float dpiScale = (std::max)(0.5f, static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f);
 				const LONG clientX = static_cast<LONG>(std::lround((visual.content.left + caretX - scrollX_) * dpiScale));
 				const LONG clientY = static_cast<LONG>(std::lround((visual.content.top + caretY - scrollY_) * dpiScale));
 				const LONG lineHeight = static_cast<LONG>(std::lround((std::max)(caretMetrics.height, detail::kLineHeight) * dpiScale));
 
 				COMPOSITIONFORM composition{};
-				composition.dwStyle = CFS_FORCE_POSITION;
-				composition.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
+				composition.dwStyle = CFS_POINT;
+				composition.ptCurrentPos = POINT{ clientX, clientY };
 				ImmSetCompositionWindow(context, &composition);
 
 				CANDIDATEFORM candidate{};
 				candidate.dwIndex = 0;
 				candidate.dwStyle = CFS_CANDIDATEPOS;
-				candidate.ptCurrentPos = POINT{ clientX + 1, clientY + lineHeight };
+				candidate.ptCurrentPos = POINT{ clientX, clientY + lineHeight };
 				ImmSetCandidateWindow(context, &candidate);
 
 				CANDIDATEFORM exclude{};
@@ -4549,6 +4579,7 @@ namespace fusion::ui {
 			}
 
 			void NotifyChanged() {
+				MarkSelectionMetricsDirty();
 				InvalidateTextLayoutState();
 				MarkContentChanged();
 				if (onChanged_) {
@@ -4623,6 +4654,11 @@ namespace fusion::ui {
 			mutable bool cachedSingleLineWidthValid_ = false;
 			mutable std::wstring cachedSingleLineText_;
 			mutable bool cachedSingleLineHasStyleOverride_ = false;
+			mutable bool selectionMetricsDirty_ = true;
+			mutable std::vector<DWRITE_HIT_TEST_METRICS> cachedSelectionMetrics_;
+			mutable IDWriteTextLayout* cachedSelectionLayout_ = nullptr;
+			mutable size_t cachedSelectionStart_ = 0;
+			mutable size_t cachedSelectionLength_ = 0;
 			mutable TextStyle cachedSingleLineStyle_{};
 			mutable float cachedSingleLineWidth_ = 0.0f;
 			mutable TextLayoutCache labelLayoutCache_;

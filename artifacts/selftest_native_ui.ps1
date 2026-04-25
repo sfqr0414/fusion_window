@@ -548,6 +548,9 @@ $multiInputY = $multiBoundsTop + (Scale-Logical 44)
 $multiLinePitch = (Scale-Logical 16)
 $multiLineStartX = $controlLeft + (Scale-Logical 16)
 $multiLine1Y = $multiBoundsTop + (Scale-Logical 44)
+$multiSelectStartX = $controlLeft + $controlWidth - (Scale-Logical 20)
+$multiSelectEndX = $controlLeft + (Scale-Logical 14)
+$multiSelectY = $multiBoundsTop + (Scale-Logical 48)
 $multiScrollX = $controlLeft + $controlWidth - (Scale-Logical 6)
 $multiScrollStartY = $multiBoundsTop + (Scale-Logical 38)
 $multiScrollEndY = $multiBoundsTop + $multiBoundsHeight - (Scale-Logical 18)
@@ -664,6 +667,10 @@ $cardScrollbarsHoverOk = $false
 $knobOk = $false
 $expandCollapseOk = $false
 $comboPopupCaptured = $false
+$imeCandidateScreenshotCaptured = $false
+$multiChineseBulkScreenshotCaptured = $false
+$multiChineseSelectionScreenshotCaptured = $false
+$multiChineseSelectionLatencyMs = 0.0
 
 $dirtyProbeX = if ($twoColumn) { $previewButtonX } else { $singleInputX }
 $dirtyProbeY = if ($twoColumn) { $previewButtonY } else { $singleInputY }
@@ -761,6 +768,17 @@ Send-Text 'short text'
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_01c_single_collapsed.png'
 
+Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
+Start-Sleep -Milliseconds 130
+Save-Capture 'native_ui_01ad_single_ime_before.png' -useCopyFromScreen
+Send-KeyChord ([Native]::VK_CONTROL) 0x20 40
+Send-Text 'nihao'
+Start-Sleep -Milliseconds 220
+Save-Capture 'native_ui_01ae_single_ime_candidate.png' -useCopyFromScreen
+Send-KeyPress 0x1B 35
+Send-KeyChord ([Native]::VK_CONTROL) 0x20 40
+$imeCandidateScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_01ae_single_ime_candidate.png'))
+
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
 Click-Client ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 40))
@@ -829,6 +847,34 @@ Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
 Start-Sleep -Milliseconds 120
 $multiArrowDownText = Read-ClipboardText
 $multiArrowDownOk = $multiArrowDownText -match "Header-only migration complete\.\r?\nvNext: richer text selection and IME support\."
+
+$chineseLines = @()
+$cnSentence = -join ([char[]](0x8FD9,0x662F,0x4E2D,0x6587,0x9009,0x533A,0x6027,0x80FD,0x538B,0x529B,0x6D4B,0x8BD5,0x6587,0x672C,0x7528,0x4E8E,0x9A8C,0x8BC1,0x5927,0x91CF,0x4E2D,0x6587,0x5185,0x5BB9,0x4E0B,0x62D6,0x62FD,0x9009,0x62E9,0x4E0D,0x5361,0x987F))
+for ($line = 1; $line -le 64; $line++) {
+    $chineseLines += (([char]0x7B2C).ToString() + $line + ([char]0x884C) + ([char]0xFF1A) + $cnSentence + $cnSentence)
+}
+
+Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Start-Sleep -Milliseconds 120
+for ($i = 0; $i -lt $chineseLines.Count; $i++) {
+    Send-Text $chineseLines[$i]
+    if ($i -lt ($chineseLines.Count - 1)) {
+        Send-Enter
+    }
+}
+Start-Sleep -Milliseconds 200
+Save-Capture 'native_ui_02ad_multi_chinese_bulk.png'
+$multiChineseBulkScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_02ad_multi_chinese_bulk.png'))
+
+$selectionProbe = Measure-Command {
+    Drag-Client $multiSelectStartX $multiSelectY $multiSelectEndX $multiSelectY 14
+    Start-Sleep -Milliseconds 90
+    Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+    Start-Sleep -Milliseconds 90
+}
+$multiChineseSelectionLatencyMs = [Math]::Round($selectionProbe.TotalMilliseconds, 2)
+Save-Capture 'native_ui_02ae_multi_chinese_select_drag.png'
+$multiChineseSelectionScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_02ae_multi_chinese_select_drag.png'))
 
 Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
 Start-Sleep -Milliseconds 120
@@ -965,6 +1011,10 @@ $result = [pscustomobject]@{
     MultiInputCaretVisible = $multiCaretVisible
     MultiInputArrowUpOneLine = $multiArrowUpOk
     MultiInputArrowDownOneLine = $multiArrowDownOk
+    ImeCandidateScreenshotCaptured = $imeCandidateScreenshotCaptured
+    MultiInputChineseBulkScreenshotCaptured = $multiChineseBulkScreenshotCaptured
+    MultiInputChineseSelectionScreenshotCaptured = $multiChineseSelectionScreenshotCaptured
+    MultiInputChineseSelectionLatencyMs = $multiChineseSelectionLatencyMs
     SliderExercised = $sliderOk
     ScrollbarsExercised = $scrollbarsOk
     InputScrollbarsExercised = $inputScrollbarsOk
@@ -992,6 +1042,8 @@ $screenshotPaths = @(
     (Join-Path $PicDir 'native_ui_01_single_caret.png'),
     (Join-Path $PicDir 'native_ui_01a_single_overflow.png'),
     (Join-Path $PicDir 'native_ui_01aa_single_hover_scrollbar.png'),
+    (Join-Path $PicDir 'native_ui_01ad_single_ime_before.png'),
+    (Join-Path $PicDir 'native_ui_01ae_single_ime_candidate.png'),
     (Join-Path $PicDir 'native_ui_01b_single_scrolled.png'),
     (Join-Path $PicDir 'native_ui_01c_single_collapsed.png'),
     (Join-Path $PicDir 'native_ui_02_multi_caret.png'),
@@ -999,6 +1051,8 @@ $screenshotPaths = @(
     (Join-Path $PicDir 'native_ui_02a_multi_overflow.png'),
     (Join-Path $PicDir 'native_ui_02ab_multi_up_one_line.png'),
     (Join-Path $PicDir 'native_ui_02ac_multi_down_one_line.png'),
+    (Join-Path $PicDir 'native_ui_02ad_multi_chinese_bulk.png'),
+    (Join-Path $PicDir 'native_ui_02ae_multi_chinese_select_drag.png'),
     (Join-Path $PicDir 'native_ui_02b_multi_collapsed.png'),
     (Join-Path $PicDir 'native_ui_02c_combo_animating.png'),
     (Join-Path $PicDir 'native_ui_02_combo_open.png'),
@@ -1031,6 +1085,9 @@ if (-not $result.SingleInputCaretVisible) { $failures += 'single-input-caret' }
 if (-not $result.MultiInputCaretVisible) { $failures += 'multi-input-caret' }
 if (-not $result.MultiInputArrowUpOneLine) { $failures += 'multi-input-arrow-up' }
 if (-not $result.MultiInputArrowDownOneLine) { $failures += 'multi-input-arrow-down' }
+if (-not $result.ImeCandidateScreenshotCaptured) { $failures += 'ime-candidate-screenshot' }
+if (-not $result.MultiInputChineseBulkScreenshotCaptured) { $failures += 'multi-input-chinese-bulk-screenshot' }
+if (-not $result.MultiInputChineseSelectionScreenshotCaptured) { $failures += 'multi-input-chinese-selection-screenshot' }
 if (-not $result.SliderExercised) { $failures += 'slider' }
 if (-not $result.ScrollbarsExercised) { $failures += 'scrollbars' }
 if (-not $result.InputScrollbarsExercised) { $failures += 'input-scrollbars' }
