@@ -190,6 +190,35 @@ namespace fusion::ui {
 		return (std::clamp)(acp, 0L, static_cast<LONG>(length));
 	}
 
+	// 【新增】：轻量级获取长度，不需要拷贝字符串
+	inline size_t GetSharedTextStoreLength() {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		return g_TextStoreStateText.size();
+	}
+
+	// 【新增】：仅获取选区，避免拷贝文本
+	inline void GetSharedTextStoreSelection(LONG& anchor, LONG& caret) {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		anchor = g_TextStoreSelectionAnchor;
+		caret = g_TextStoreSelectionCaret;
+	}
+
+	// 【新增】：范围切片读取，避免值拷贝
+	inline void ReadSharedTextStoreRange(LONG acpStart, LONG acpEnd, WCHAR* plainText, ULONG capacity, ULONG& copied, LONG& nextAcp) {
+		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
+		const LONG len = static_cast<LONG>(g_TextStoreStateText.size());
+		const LONG start = ClampTextStoreAcp(acpStart, len);
+		const LONG end = acpEnd < 0 ? len : ClampTextStoreAcp(acpEnd, len);
+		const LONG orderedStart = (std::min)(start, end);
+		const LONG orderedEnd = (std::max)(start, end);
+		const ULONG available = static_cast<ULONG>(orderedEnd - orderedStart);
+		copied = (plainText && capacity > 0) ? (std::min)(available, capacity) : 0;
+		if (copied > 0) {
+			wmemcpy(plainText, g_TextStoreStateText.data() + orderedStart, copied);
+		}
+		nextAcp = orderedEnd;
+	}
+
 	inline SharedTextStoreSnapshot SnapshotSharedTextStore() {
 		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
 		return SharedTextStoreSnapshot{ g_TextStoreStateText, g_TextStoreSelectionAnchor, g_TextStoreSelectionCaret };
@@ -202,9 +231,12 @@ namespace fusion::ui {
 		g_TextStoreSelectionCaret = (std::clamp)(selectionCaret, 0L, length);
 	}
 
+	// 【优化】：当文本一致时只更新选区，避免重复为整篇大文本分配内存
 	inline void SetSharedTextStoreState(std::wstring_view text, size_t selectionAnchor, size_t selectionCaret) {
 		std::lock_guard<std::mutex> lock(g_TextStoreStateMutex);
-		g_TextStoreStateText.assign(text.begin(), text.end());
+		if (g_TextStoreStateText != text) {
+			g_TextStoreStateText.assign(text.begin(), text.end());
+		}
 		const LONG length = static_cast<LONG>(g_TextStoreStateText.size());
 		g_TextStoreSelectionAnchor = (std::clamp)(static_cast<LONG>(selectionAnchor), 0L, length);
 		g_TextStoreSelectionCaret = (std::clamp)(static_cast<LONG>(selectionCaret), 0L, length);
@@ -3425,7 +3457,13 @@ namespace fusion::ui {
 				const D2D1_COLOR_F& selectionColor,
 				bool multiline,
 				std::function<void(std::wstring_view)> onChanged)
-				: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)), dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)), surfaceColor_(surfaceColor), outlineColor_(outlineColor), textColor_(textColor), mutedColor_(mutedColor), selectionColor_(selectionColor), multiline_(multiline), onChanged_(std::move(onChanged)), textStyle_(MakeTextStyleProperty(CaptureTextStyle(format_.Get(), textColor_), [this]() { styleOverride_ = true; InvalidateTextLayoutState(); MarkContentChanged(); })), labelStyle_(MakeTextStyleProperty(CaptureTextStyle(format_.Get(), mutedColor_), [this]() { labelStyleOverride_ = true; MarkContentChanged(); })) {
+				: label_(std::move(label)), placeholder_(std::move(placeholder)), text_(std::move(initialText)),
+				dwriteFactory_(std::move(dwriteFactory)), format_(std::move(format)),
+				surfaceColor_(surfaceColor), outlineColor_(outlineColor), textColor_(textColor),
+				mutedColor_(mutedColor), selectionColor_(selectionColor), multiline_(multiline),
+				onChanged_(std::move(onChanged)),
+				textStyle_(MakeTextStyleProperty(CaptureTextStyle(format_.Get(), textColor_), [this]() { styleOverride_ = true; MarkLayoutDirty(); MarkContentChanged(); })),
+				labelStyle_(MakeTextStyleProperty(CaptureTextStyle(format_.Get(), mutedColor_), [this]() { labelStyleOverride_ = true; MarkContentChanged(); })) {
 				caret_ = text_.size();
 				selectionAnchor_ = caret_;
 			}
@@ -3437,30 +3475,26 @@ namespace fusion::ui {
 				return UIComponent::IsAnimating() || caretOpacityAnimation_.IsAnimating() || horizontalScrollVisibilityAnimation_.IsAnimating() || verticalScrollVisibilityAnimation_.IsAnimating()
 					|| hScrollBar_.IsAnimating() || vScrollBar_.IsAnimating();
 			}
+
+			// 【修复光标闪烁】：聚焦时告诉系统需要时间驱动，动画执行中也要连续刷新
 			bool WantsFrameTick() const override {
 				return focused_
-					|| IsAnimating()
+					|| caretOpacityAnimation_.IsAnimating()
+					|| UIComponent::IsAnimating()
+					|| horizontalScrollVisibilityAnimation_.IsAnimating()
+					|| verticalScrollVisibilityAnimation_.IsAnimating()
 					|| HorizontalScrollRevealActive()
 					|| VerticalScrollRevealActive()
-					|| horizontalScrollVisibilityAnimation_.Value() > 0.01f
-					|| verticalScrollVisibilityAnimation_.Value() > 0.01f
-					|| horizontalScrollHovered_
-					|| verticalScrollHovered_
 					|| scrollDragMode_ != ScrollDragMode::None;
 			}
+
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				auto visual = ComputeVisualState();
 				AssignAndDirty(horizontalScrollHovered_, visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point));
 				AssignAndDirty(verticalScrollHovered_, visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point));
-				if (horizontalScrollHovered_) {
-					TouchHorizontalScrollReveal();
-				}
-				if (verticalScrollHovered_) {
-					TouchVerticalScrollReveal();
-				}
-				if (horizontalScrollHovered_ || verticalScrollHovered_) {
-					return CursorKind::Arrow;
-				}
+				if (horizontalScrollHovered_) TouchHorizontalScrollReveal();
+				if (verticalScrollHovered_) TouchVerticalScrollReveal();
+				if (horizontalScrollHovered_ || verticalScrollHovered_) return CursorKind::Arrow;
 				return PointInRect(visual.box, point) ? CursorKind::IBeam : CursorKind::Arrow;
 			}
 
@@ -3479,16 +3513,16 @@ namespace fusion::ui {
 				lastTsfCompStart_ = tsfCompStart_;
 				lastTsfCompEnd_ = tsfCompEnd_;
 
-				const bool changed = text_ != snapshot.text
-					|| selectionAnchor_ != nextAnchor
-					|| caret_ != nextCaret
-					|| tsfCompActive_
-					|| compChanged;
+				const bool textChanged = (text_ != snapshot.text);
+				const bool selChanged = (selectionAnchor_ != nextAnchor || caret_ != nextCaret);
 
-				if (!changed) {
-					return;
+				if (!textChanged && !selChanged && !compChanged && !tsfCompActive_) return;
+
+				if (textChanged) {
+					text_ = std::move(snapshot.text);
+					MarkLayoutDirty(); // 文本改变时才打翻 Layout
 				}
-				text_ = std::move(snapshot.text);
+
 				selectionAnchor_ = nextAnchor;
 				caret_ = nextCaret;
 				imeActive_ = false;
@@ -3497,25 +3531,21 @@ namespace fusion::ui {
 				imeCursorPos_ = 0;
 				desiredCaretX_.reset();
 				ensureCaretVisible_ = true;
+				MarkCaretMetricsDirty();
 				MarkSelectionMetricsDirty();
-				InvalidateTextLayoutState();
 				MarkContentChanged();
 				ResetCaretBlink();
 			}
 
 			void BindImeWindow(HWND hwnd) {
-				if (!hwnd) {
-					return;
-				}
+				if (!hwnd) return;
 				imeWindow_ = hwnd;
-				if (focused_) {
-					RefreshImeWindowPosition(hwnd);
-				}
+				if (focused_) RefreshImeWindowPosition(hwnd);
 			}
 
 			void ApplyStyledRanges(std::vector<StyledTextRange> ranges) {
 				styledRanges_ = std::move(ranges);
-				InvalidateTextLayoutState();
+				MarkLayoutDirty();
 				MarkContentChanged();
 			}
 
@@ -3534,45 +3564,43 @@ namespace fusion::ui {
 				auto visual = ComputeVisualState();
 				float horizontalScrollOpacity = visual.horizontalOpacity;
 				float verticalScrollOpacity = visual.verticalOpacity;
-				if (!multiline_ && HorizontalOverflowHintActive() && horizontalScrollOpacity < 0.01f) {
-					horizontalScrollOpacity = 1.0f;
-				}
-				if (multiline_ && VerticalOverflowHintActive() && verticalScrollOpacity < 0.01f) {
-					verticalScrollOpacity = 1.0f;
-				}
+				if (!multiline_ && HorizontalOverflowHintActive() && horizontalScrollOpacity < 0.01f) horizontalScrollOpacity = 1.0f;
+				if (multiline_ && VerticalOverflowHintActive() && verticalScrollOpacity < 0.01f) verticalScrollOpacity = 1.0f;
+
 				const D2D1_RECT_F labelRect = D2D1::RectF(bounds_.left, bounds_.top, bounds_.right, bounds_.top + 18.0f);
 				auto* labelLayout = labelLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), label_, labelRect.right - labelRect.left, labelRect.bottom - labelRect.top, labelStyleOverride_ ? &labelStyle_.Get() : nullptr);
 				if (labelLayout) {
 					context->DrawTextLayout(D2D1::Point2F(labelRect.left, labelRect.top), labelLayout, PrepareSharedBrush(context, SharedBrushSlot::Secondary, labelStyleOverride_ ? labelStyle_->color : mutedColor_), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 				}
+
 				D2D1_RECT_F box = TextBounds();
 				if (focused_) {
 					context->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(box.left - 1.0f, box.top - 1.0f, box.right + 1.0f, box.bottom + 1.0f), 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_, 0.12f));
 				}
 				context->FillRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Primary, surfaceColor_));
 				context->DrawRoundedRectangle(D2D1::RoundedRect(box, 12.0f, 12.0f), PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_, 0.58f + FocusProgress() * 0.42f), focused_ ? 1.8f : 1.0f);
+
 				UpdateScrollbarVisibilityAnimations(visual);
 				SyncScrollOffsets(visual.layout, visual.content);
+
 				if (focused_ && imeWindow_) {
 					HIMC imeContext = imeActive_ ? ImmGetContext(imeWindow_) : nullptr;
 					UpdateImeWindowPosition(imeWindow_, imeContext, visual);
 					if (imeContext) ImmReleaseContext(imeWindow_, imeContext);
 				}
+
 				if (!multiline_) {
 					const float visibleWidth = (std::max)(1.0f, visual.content.right - visual.content.left);
-					const float drawMaxScrollX = (std::max)(0.0f, MeasureSingleLineContentWidth(visual.renderText) - visibleWidth + 4.0f);
+					const float drawMaxScrollX = (std::max)(0.0f, visual.metrics.widthIncludingTrailingWhitespace + 4.0f - visibleWidth);
 					const float clampedScrollX = (std::clamp)(scrollX_, 0.0f, drawMaxScrollX);
 					if (!NearlyEqual(clampedScrollX, scrollX_, 0.001f)) {
 						scrollX_ = clampedScrollX;
 						MarkCacheDirty();
 					}
 				}
-				if (visual.renderHorizontalScroll) {
-					visual.horizontalScroll.offset = scrollX_;
-				}
-				if (visual.renderVerticalScroll) {
-					visual.verticalScroll.offset = scrollY_;
-				}
+				if (visual.renderHorizontalScroll) visual.horizontalScroll.offset = scrollX_;
+				if (visual.renderVerticalScroll) visual.verticalScroll.offset = scrollY_;
+
 				float originY = visual.content.top - scrollY_;
 				if (!multiline_) {
 					const float visibleHeight = (std::max)(1.0f, visual.content.bottom - visual.content.top);
@@ -3580,9 +3608,11 @@ namespace fusion::ui {
 					originY = visual.content.top + (std::max)(0.0f, std::floor((visibleHeight - textHeight) * 0.5f)) - scrollY_;
 				}
 				const D2D1_POINT_2F origin = D2D1::Point2F(visual.content.left - scrollX_, originY);
+
 				context->PushAxisAlignedClip(visual.content, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 				DrawSelection(context, visual.layout, origin, PrepareSharedBrush(context, SharedBrushSlot::Primary, selectionColor_));
-				if (visual.renderText.empty()) {
+
+				if (text_.empty()) {
 					D2D1_RECT_F placeholderRect = visual.content;
 					if (!multiline_) {
 						const float textHeight = detail::kLineHeight + 2.0f;
@@ -3592,21 +3622,22 @@ namespace fusion::ui {
 					context->DrawTextW(placeholder_.c_str(), static_cast<UINT32>(placeholder_.size()), format_.Get(), placeholderRect, PrepareSharedBrush(context, SharedBrushSlot::Secondary, mutedColor_));
 				}
 				else {
-					if (multiline_) {
-						context->DrawTextLayout(origin, visual.layout, PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_->color : textColor_), D2D1_DRAW_TEXT_OPTIONS_NONE);
-					}
-					else {
-						const float textHeight = (std::max)(detail::kLineHeight + 2.0f, visual.metrics.height);
-						const float textWidth = MeasureSingleLineContentWidth(visual.renderText) + 24.0f;
-						const D2D1_RECT_F textRect = D2D1::RectF(origin.x, origin.y, origin.x + textWidth, origin.y + textHeight);
-						context->DrawTextW(visual.renderText.c_str(), static_cast<UINT32>(visual.renderText.size()), format_.Get(), textRect, PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_->color : textColor_), D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL);
+					// 【核心优化】：D2D1_DRAW_TEXT_OPTIONS_CLIP 剔除视口外不可见的成千上万个字符的字形渲染
+					if (visual.layout) {
+						context->DrawTextLayout(
+							origin, visual.layout,
+							PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_->color : textColor_),
+							D2D1_DRAW_TEXT_OPTIONS_CLIP
+						);
 					}
 					DrawImeUnderline(context, visual.layout, origin, PrepareSharedBrush(context, SharedBrushSlot::Secondary, outlineColor_));
 				}
+
 				if (focused_ && caretOpacityAnimation_.Value() > 0.15f) {
 					DrawCaret(context, visual.layout, origin, styleOverride_ ? textStyle_->color : textColor_, caretOpacityAnimation_.Value());
 				}
 				context->PopAxisAlignedClip();
+
 				if (visual.renderHorizontalScroll) {
 					const auto& hs = visual.horizontalScroll;
 					const float hExt = hs.contentExtent > 0.01f ? hs.contentExtent : 1.0f;
@@ -3625,7 +3656,7 @@ namespace fusion::ui {
 					if (visual.renderVerticalScroll || forceVerticalCue) {
 						auto verticalScroll = visual.verticalScroll;
 						float effectiveVerticalOpacity = verticalScrollOpacity;
-						if (forceVerticalCue && effectiveVerticalOpacity < 0.01f) {
+						if (forceVerticalCue&& effectiveVerticalOpacity < 0.01f) {
 							effectiveVerticalOpacity = VerticalOverflowHintActive() ? 1.0f : 0.85f;
 						}
 						if (!verticalScroll.Visible()) {
@@ -3644,19 +3675,6 @@ namespace fusion::ui {
 						vScrollBar_.ApplyExternalValue(verticalScroll.MaxOffset() > 0.01f ? verticalScroll.offset / verticalScroll.MaxOffset() : 0.0f);
 						vScrollBar_.Render(context);
 					}
-				}
-				else if (visual.renderVerticalScroll) {
-					const auto& vs = visual.verticalScroll;
-					const float vExt = vs.contentExtent > 0.01f ? vs.contentExtent : 1.0f;
-					const float vVp = vs.viewport.bottom - vs.viewport.top;
-					vScrollBar_.bounds = vs.viewport;
-					vScrollBar_.SetPageSize((std::clamp)(vVp / vExt, 0.05f, 1.0f));
-					vScrollBar_.SetInset(vs.inset);
-					vScrollBar_.SetEdgePadding(vs.edgePadding);
-					vScrollBar_.SetVisibilityOpacity(verticalScrollOpacity);
-					vScrollBar_.SetExternalState(vs.hovered, vs.dragging);
-					vScrollBar_.ApplyExternalValue(vs.MaxOffset() > 0.01f ? vs.offset / vs.MaxOffset() : 0.0f);
-					vScrollBar_.Render(context);
 				}
 			}
 
@@ -3705,6 +3723,7 @@ namespace fusion::ui {
 				const size_t index = HitTestText(point);
 				caret_ = index;
 				selectionAnchor_ = index;
+				MarkCaretMetricsDirty();
 				MarkSelectionMetricsDirty();
 				desiredCaretX_.reset();
 				ensureCaretVisible_ = true;
@@ -3718,12 +3737,8 @@ namespace fusion::ui {
 				auto visual = ComputeVisualState();
 				AssignAndDirty(horizontalScrollHovered_, visual.renderHorizontalScroll && visual.horizontalScroll.HitTrack(point));
 				AssignAndDirty(verticalScrollHovered_, visual.renderVerticalScroll && visual.verticalScroll.HitTrack(point));
-				if (horizontalScrollHovered_) {
-					TouchHorizontalScrollReveal();
-				}
-				if (verticalScrollHovered_) {
-					TouchVerticalScrollReveal();
-				}
+				if (horizontalScrollHovered_) TouchHorizontalScrollReveal();
+				if (verticalScrollHovered_) TouchVerticalScrollReveal();
 				if (scrollDragMode_ != ScrollDragMode::None && pressed_) {
 					if (scrollDragMode_ == ScrollDragMode::Horizontal && visual.showHorizontalScroll) {
 						TouchHorizontalScrollReveal();
@@ -3754,6 +3769,7 @@ namespace fusion::ui {
 				}
 				if (draggingSelection_) {
 					caret_ = HitTestText(point);
+					MarkCaretMetricsDirty();
 					MarkSelectionMetricsDirty();
 					PublishSharedTextStoreState();
 					desiredCaretX_.reset();
@@ -3787,13 +3803,9 @@ namespace fusion::ui {
 
 			bool OnMouseWheel(int delta, D2D1_POINT_2F point) override {
 				auto visual = ComputeVisualState();
-				if (!PointInRect(visual.box, point)) {
-					return false;
-				}
+				if (!PointInRect(visual.box, point)) return false;
 				if (multiline_) {
-					if (!visual.showVerticalScroll) {
-						return false;
-					}
+					if (!visual.showVerticalScroll) return false;
 					const float previous = scrollY_;
 					scrollY_ = (std::clamp)(scrollY_ + (delta > 0 ? -28.0f : 28.0f), 0.0f, visual.maxScrollY);
 					ensureCaretVisible_ = false;
@@ -3804,9 +3816,7 @@ namespace fusion::ui {
 					}
 					return changed;
 				}
-				if (!visual.showHorizontalScroll) {
-					return false;
-				}
+				if (!visual.showHorizontalScroll) return false;
 				const float previous = scrollX_;
 				scrollX_ = (std::clamp)(scrollX_ + (delta > 0 ? -32.0f : 32.0f), 0.0f, visual.maxScrollX);
 				ensureCaretVisible_ = false;
@@ -3825,6 +3835,7 @@ namespace fusion::ui {
 					case 'a':
 						selectionAnchor_ = 0;
 						caret_ = text_.size();
+						MarkCaretMetricsDirty();
 						MarkSelectionMetricsDirty();
 						desiredCaretX_.reset();
 						ensureCaretVisible_ = true;
@@ -3854,22 +3865,17 @@ namespace fusion::ui {
 				}
 				switch (key) {
 				case VK_BACK:
-					if (DeleteSelection()) {
-						return;
-					}
+					if (DeleteSelection()) return;
 					if (caret_ > 0) {
 						text_.erase(caret_ - 1, 1);
 						--caret_;
 						selectionAnchor_ = caret_;
-						MarkSelectionMetricsDirty();
 						desiredCaretX_.reset();
 						NotifyChanged();
 					}
 					break;
 				case VK_DELETE:
-					if (DeleteSelection()) {
-						return;
-					}
+					if (DeleteSelection()) return;
 					if (caret_ < text_.size()) {
 						text_.erase(caret_, 1);
 						desiredCaretX_.reset();
@@ -3889,14 +3895,10 @@ namespace fusion::ui {
 					MoveCaret(text_.size(), modifiers.shift);
 					break;
 				case VK_UP:
-					if (multiline_) {
-						MoveCaret(MoveVertical(-1), modifiers.shift, true);
-					}
+					if (multiline_) MoveCaret(MoveVertical(-1), modifiers.shift, true);
 					break;
 				case VK_DOWN:
-					if (multiline_) {
-						MoveCaret(MoveVertical(1), modifiers.shift, true);
-					}
+					if (multiline_) MoveCaret(MoveVertical(1), modifiers.shift, true);
 					break;
 				default:
 					break;
@@ -3906,21 +3908,13 @@ namespace fusion::ui {
 			}
 
 			void OnChar(wchar_t ch) override {
-				if (ShouldDeferCharToIme(ch)) {
-					return;
-				}
+				if (ShouldDeferCharToIme(ch)) return;
 				if (ch == L'\r') {
-					if (multiline_) {
-						InsertText(L"\n");
-					}
+					if (multiline_) InsertText(L"\n");
 					return;
 				}
-				if (ch == L'\b' || ch == 0x7F) {
-					return;
-				}
-				if (!multiline_ && (ch == L'\n' || ch == L'\t')) {
-					return;
-				}
+				if (ch == L'\b' || ch == 0x7F) return;
+				if (!multiline_ && (ch == L'\n' || ch == L'\t')) return;
 				if (std::iswprint(ch) || (multiline_ && ch == L'\n')) {
 					std::wstring value(1, ch);
 					InsertText(value);
@@ -3938,9 +3932,7 @@ namespace fusion::ui {
 					return;
 				}
 				PublishSharedTextStoreState();
-				if (imeWindow_) {
-					RefreshImeWindowPosition(imeWindow_);
-				}
+				if (imeWindow_) RefreshImeWindowPosition(imeWindow_);
 				ensureCaretVisible_ = true;
 				ResetCaretBlink();
 			}
@@ -3958,14 +3950,10 @@ namespace fusion::ui {
 			}
 
 			void OnImeComposition(HWND hwnd, LPARAM lParam) override {
-				if (!imeActive_) {
-					OnImeStart(hwnd);
-				}
+				if (!imeActive_) OnImeStart(hwnd);
 				imeWindow_ = hwnd;
 				HIMC context = ImmGetContext(hwnd);
-				if (!context) {
-					return;
-				}
+				if (!context) return;
 				std::wstring result;
 				std::wstring composition;
 				LONG cursorPos = 0;
@@ -3985,9 +3973,7 @@ namespace fusion::ui {
 				}
 				if ((lParam & GCS_CURSORPOS) != 0) {
 					const LONG cursorResult = ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
-					if (cursorResult >= 0) {
-						cursorPos = static_cast<LONG>(cursorResult & 0xFFFF);
-					}
+					if (cursorResult >= 0) cursorPos = static_cast<LONG>(cursorResult & 0xFFFF);
 				}
 				UpdateImeWindowPosition(hwnd, context);
 				ImmReleaseContext(hwnd, context);
@@ -4001,7 +3987,7 @@ namespace fusion::ui {
 				}
 				imeComposition_ = std::move(composition);
 				imeCursorPos_ = cursorPos;
-				InvalidateTextLayoutState();
+				MarkCaretMetricsDirty();
 				MarkContentChanged();
 				ensureCaretVisible_ = true;
 				ResetCaretBlink();
@@ -4013,42 +3999,28 @@ namespace fusion::ui {
 				compositionReplaceLength_ = 0;
 				imeWindow_ = nullptr;
 				PublishSharedTextStoreState();
-				InvalidateTextLayoutState();
+				MarkCaretMetricsDirty();
 				MarkContentChanged();
 				ResetCaretBlink();
 			}
 
 			void RefreshImeWindowPosition(HWND hwnd) override {
-				if (!focused_ || !hwnd) {
-					return;
-				}
-				HIMC context = nullptr;
-				if (imeActive_) {
-					context = ImmGetContext(hwnd);
-				}
+				if (!focused_ || !hwnd) return;
+				HIMC context = imeActive_ ? ImmGetContext(hwnd) : nullptr;
 				auto visual = ComputeVisualState();
 				UpdateImeWindowPosition(hwnd, context, visual);
-				if (context) {
-					ImmReleaseContext(hwnd, context);
-				}
+				if (context) ImmReleaseContext(hwnd, context);
 			}
 
 			const std::wstring& Text() const { return text_; }
 
 		private:
 			bool ShouldDeferCharToIme(wchar_t ch) const {
-				if (!imeWindow_ || ch == L'\r' || ch == L'\n' || ch == L'\b' || ch == 0x7F) {
-					return false;
-				}
-				if (!((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z'))) {
-					return false;
-				}
+				if (!imeWindow_ || ch == L'\r' || ch == L'\n' || ch == L'\b' || ch == 0x7F) return false;
+				if (!((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z'))) return false;
 				HIMC context = ImmGetContext(imeWindow_);
-				if (!context) {
-					return false;
-				}
-				DWORD conversion = 0;
-				DWORD sentence = 0;
+				if (!context) return false;
+				DWORD conversion = 0, sentence = 0;
 				const BOOL imeOpen = ImmGetOpenStatus(context);
 				const BOOL hasConversion = ImmGetConversionStatus(context, &conversion, &sentence);
 				ImmReleaseContext(imeWindow_, context);
@@ -4058,14 +4030,9 @@ namespace fusion::ui {
 			static constexpr float kScrollGutter = 18.0f;
 			static constexpr float kSingleLineScrollGutter = 12.0f;
 
-			enum class ScrollDragMode {
-				None,
-				Horizontal,
-				Vertical,
-			};
+			enum class ScrollDragMode { None, Horizontal, Vertical };
 
 			struct VisualState {
-				std::wstring renderText;
 				D2D1_RECT_F box{ D2D1::RectF() };
 				D2D1_RECT_F content{ D2D1::RectF() };
 				IDWriteTextLayout* layout = nullptr;
@@ -4082,83 +4049,108 @@ namespace fusion::ui {
 				ScrollbarState verticalScroll{ ScrollOrientation::Vertical };
 			};
 
-			bool HasSelection() const {
-				return caret_ != selectionAnchor_;
+			bool HasSelection() const { return caret_ != selectionAnchor_; }
+			size_t SelectionStart() const { return (std::min)(caret_, selectionAnchor_); }
+			size_t SelectionLength() const { return (std::max)(caret_, selectionAnchor_) - SelectionStart(); }
+			D2D1_RECT_F TextBounds() const { return D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom); }
+
+			void MarkLayoutDirty() {
+				layoutDirty_ = true;
+				cachedMetricsValid_ = false;
+				MarkCaretMetricsDirty();
+				MarkSelectionMetricsDirty();
 			}
 
-			size_t SelectionStart() const {
-				return (std::min)(caret_, selectionAnchor_);
+			void MarkCaretMetricsDirty() {
+				caretMetricsValid_ = false;
 			}
 
-			size_t SelectionLength() const {
-				return (std::max)(caret_, selectionAnchor_) - SelectionStart();
+			void MarkSelectionMetricsDirty() {
+				selectionMetricsDirty_ = true;
 			}
 
-			D2D1_RECT_F TextBounds() const {
-				return D2D1::RectF(bounds_.left, bounds_.top + 20.0f, bounds_.right, bounds_.bottom);
-			}
+			// 【性能核心】：按需构建单例 Layout，绝对不给 100000.0f 触发 DWrite 全篇死磕
+			IDWriteTextLayout* GetOrCreateLayout(const D2D1_RECT_F& content) const {
+				const float targetWidth = multiline_ ? (std::max)(1.0f, content.right - content.left) : 100000.0f;
+				const float targetHeight = multiline_ ? (std::max)(32768.0f, (content.bottom - content.top) * 4.0f) : (std::max)(1.0f, content.bottom - content.top);
 
-			float MeasureMultilineContentHeight(IDWriteTextLayout* layout, const DWRITE_TEXT_METRICS& metrics) const {
-				if (!layout) {
-					return 0.0f;
+				if (!layoutDirty_ && textLayout_) {
+					if (multiline_ && std::fabs(lastAssignedWidth_ - targetWidth) > 0.5f) {
+						textLayout_->SetMaxWidth(targetWidth);
+						lastAssignedWidth_ = targetWidth;
+						cachedMetricsValid_ = false;
+					}
+					return textLayout_.Get();
 				}
-				std::array<DWRITE_LINE_METRICS, 16> stackMetrics{};
-				UINT32 actualCount = 0;
-				HRESULT hr = layout->GetLineMetrics(stackMetrics.data(), static_cast<UINT32>(stackMetrics.size()), &actualCount);
-				if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER) {
-					std::vector<DWRITE_LINE_METRICS> lineMetrics(actualCount);
-					hr = layout->GetLineMetrics(lineMetrics.data(), actualCount, &actualCount);
-					if (SUCCEEDED(hr)) {
-						float totalHeight = 0.0f;
-						for (UINT32 index = 0; index < actualCount; ++index) {
-							totalHeight += lineMetrics[index].height;
+
+				textLayout_.Reset();
+				const auto wrapping = multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP;
+
+				ComPtr<IDWriteTextFormat> effFormat = format_;
+				if (styleOverride_) {
+					dwriteFactory_->CreateTextFormat(
+						textStyle_->fontFamily.c_str(), nullptr, textStyle_->weight, textStyle_->style,
+						textStyle_->stretch, textStyle_->fontSize, textStyle_->locale.c_str(), &effFormat);
+				}
+
+				if (FAILED(dwriteFactory_->CreateTextLayout(
+					text_.data(), static_cast<UINT32>(text_.size()), effFormat.Get(),
+					targetWidth, targetHeight, &textLayout_))) {
+					return nullptr;
+				}
+
+				textLayout_->SetWordWrapping(wrapping);
+				if (!styledRanges_.empty()) {
+					for (const auto& r : styledRanges_) {
+						if (r.length > 0 && r.start < text_.size()) {
+							DWRITE_TEXT_RANGE range{ static_cast<UINT32>(r.start), static_cast<UINT32>((std::min)(r.length, text_.size() - r.start)) };
+							textLayout_->SetFontFamilyName(r.style.fontFamily.c_str(), range);
+							textLayout_->SetFontSize(r.style.fontSize, range);
+							textLayout_->SetFontWeight(r.style.weight, range);
 						}
-						return (std::max)(totalHeight, metrics.height);
 					}
 				}
-				else if (SUCCEEDED(hr)) {
-					float totalHeight = 0.0f;
-					for (UINT32 index = 0; index < actualCount; ++index) {
-						totalHeight += stackMetrics[index].height;
-					}
-					return (std::max)(totalHeight, metrics.height);
-				}
-				return metrics.height;
+
+				lastAssignedWidth_ = targetWidth;
+				layoutDirty_ = false;
+				cachedMetricsValid_ = false;
+				return textLayout_.Get();
 			}
 
 			VisualState ComputeVisualState() const {
 				VisualState state;
-				state.renderText = DisplayText();
 				state.box = TextBounds();
 				state.horizontalOpacity = multiline_ ? 0.0f : horizontalScrollVisibilityAnimation_.Value();
 				state.verticalOpacity = multiline_ ? verticalScrollVisibilityAnimation_.Value() : 0.0f;
 				bool reserveHorizontalScroll = !multiline_ && (state.horizontalOpacity > 0.01f || HorizontalOverflowHintActive());
 				bool reserveVerticalScroll = multiline_ && (state.verticalOpacity > 0.01f || VerticalOverflowHintActive());
 
-				auto refreshLayout = [&]() {
+				auto refreshMetrics = [&]() {
 					state.content = multiline_
 						? InflateRect(state.box, 12.0f)
 						: D2D1::RectF(state.box.left + 12.0f, state.box.top + 6.0f, state.box.right - 12.0f, state.box.bottom - 6.0f);
-					if (reserveVerticalScroll) {
-						state.content.right -= kScrollGutter;
+					if (reserveVerticalScroll) state.content.right -= kScrollGutter;
+					if (reserveHorizontalScroll) state.content.bottom -= kSingleLineScrollGutter;
+
+					state.layout = GetOrCreateLayout(state.content);
+					if (state.layout) {
+						if (!cachedMetricsValid_) {
+							state.layout->GetMetrics(&cachedLayoutMetrics_);
+							cachedMetricsValid_ = true;
+						}
+						state.metrics = cachedLayoutMetrics_;
 					}
-					if (reserveHorizontalScroll) {
-						state.content.bottom -= kSingleLineScrollGutter;
-					}
-					state.layout = CreateLayout(state.renderText, state.content);
-					state.metrics = state.layout ? cachedTextLayoutMetrics_ : DWRITE_TEXT_METRICS{};
 					};
 
-				refreshLayout();
+				refreshMetrics();
 				if (multiline_) {
-					const float contentHeight = MeasureMultilineContentHeight(state.layout, state.metrics);
+					const float contentHeight = state.metrics.height;
 					state.maxScrollY = (std::max)(0.0f, contentHeight - (state.content.bottom - state.content.top) + 6.0f);
 					state.showVerticalScroll = state.maxScrollY > 0.5f;
 					if (state.showVerticalScroll != reserveVerticalScroll) {
 						reserveVerticalScroll = state.showVerticalScroll || state.verticalOpacity > 0.01f;
-						refreshLayout();
-						const float reservedContentHeight = MeasureMultilineContentHeight(state.layout, state.metrics);
-						state.maxScrollY = (std::max)(0.0f, reservedContentHeight - (state.content.bottom - state.content.top) + 6.0f);
+						refreshMetrics();
+						state.maxScrollY = (std::max)(0.0f, state.metrics.height - (state.content.bottom - state.content.top) + 6.0f);
 					}
 					state.showVerticalScroll = state.maxScrollY > 0.5f;
 					UpdateVerticalOverflowCue(state.showVerticalScroll, state.maxScrollY);
@@ -4167,19 +4159,17 @@ namespace fusion::ui {
 					if (state.renderVerticalScroll) {
 						const float effectiveMaxScrollY = (std::max)(1.0f, hintedMaxScrollY);
 						state.verticalScroll = MakeVerticalScrollState(state.box, effectiveMaxScrollY, state.content.bottom - state.content.top);
-						if (!state.showVerticalScroll) {
-							state.verticalScroll.offset = 0.0f;
-						}
+						if (!state.showVerticalScroll) state.verticalScroll.offset = 0.0f;
 					}
 				}
 				else {
-					float contentWidth = MeasureSingleLineContentWidth(state.renderText);
+					float contentWidth = state.metrics.widthIncludingTrailingWhitespace + 2.0f;
 					state.maxScrollX = (std::max)(0.0f, contentWidth - (state.content.right - state.content.left) + 8.0f);
 					state.showHorizontalScroll = state.maxScrollX > 0.5f;
 					if (state.showHorizontalScroll != reserveHorizontalScroll) {
 						reserveHorizontalScroll = state.showHorizontalScroll || state.horizontalOpacity > 0.01f;
-						refreshLayout();
-						contentWidth = MeasureSingleLineContentWidth(state.renderText);
+						refreshMetrics();
+						contentWidth = state.metrics.widthIncludingTrailingWhitespace + 2.0f;
 						state.maxScrollX = (std::max)(0.0f, contentWidth - (state.content.right - state.content.left) + 8.0f);
 					}
 					state.showHorizontalScroll = state.maxScrollX > 0.5f;
@@ -4189,9 +4179,7 @@ namespace fusion::ui {
 					if (state.renderHorizontalScroll) {
 						const float effectiveMaxScrollX = (std::max)(1.0f, hintedMaxScrollX);
 						state.horizontalScroll = MakeHorizontalScrollState(state.box, effectiveMaxScrollX, state.content.right - state.content.left);
-						if (!state.showHorizontalScroll) {
-							state.horizontalScroll.offset = 0.0f;
-						}
+						if (!state.showHorizontalScroll) state.horizontalScroll.offset = 0.0f;
 					}
 				}
 
@@ -4215,18 +4203,11 @@ namespace fusion::ui {
 				}
 			}
 
-			bool HorizontalOverflowHintActive() const {
-				return horizontalHintMaxScroll_ > 0.5f && HorizontalScrollRevealActive();
-			}
-
-			bool VerticalOverflowHintActive() const {
-				return verticalHintMaxScroll_ > 0.5f && VerticalScrollRevealActive();
-			}
+			bool HorizontalOverflowHintActive() const { return horizontalHintMaxScroll_ > 0.5f && HorizontalScrollRevealActive(); }
+			bool VerticalOverflowHintActive() const { return verticalHintMaxScroll_ > 0.5f && VerticalScrollRevealActive(); }
 
 			void UpdateHorizontalOverflowCue(bool overflowing, float maxScroll) const {
-				if (overflowing) {
-					lastHorizontalMaxScroll_ = maxScroll;
-				}
+				if (overflowing) lastHorizontalMaxScroll_ = maxScroll;
 				if (overflowing != previousHorizontalOverflow_) {
 					horizontalHintMaxScroll_ = overflowing ? maxScroll : lastHorizontalMaxScroll_;
 					TouchHorizontalScrollReveal();
@@ -4238,9 +4219,7 @@ namespace fusion::ui {
 			}
 
 			void UpdateVerticalOverflowCue(bool overflowing, float maxScroll) const {
-				if (overflowing) {
-					lastVerticalMaxScroll_ = maxScroll;
-				}
+				if (overflowing) lastVerticalMaxScroll_ = maxScroll;
 				if (overflowing != previousVerticalOverflow_) {
 					verticalHintMaxScroll_ = overflowing ? maxScroll : lastVerticalMaxScroll_;
 					TouchVerticalScrollReveal();
@@ -4251,106 +4230,10 @@ namespace fusion::ui {
 				}
 			}
 
-			bool HorizontalScrollRevealActive() const {
-				return horizontalScrollRevealUntil_ > std::chrono::steady_clock::now();
-			}
-
-			bool VerticalScrollRevealActive() const {
-				return verticalScrollRevealUntil_ > std::chrono::steady_clock::now();
-			}
-
-			void TouchHorizontalScrollReveal() const {
-				horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
-			}
-
-			void TouchVerticalScrollReveal() const {
-				verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650);
-			}
-
-			std::wstring DisplayText() const { return text_; }
-			size_t DisplayCaret() const { return caret_; }
-
-			/*std::wstring DisplayText() const {
-				if (!imeActive_ || imeComposition_.empty()) {
-					return text_;
-				}
-				std::wstring display = text_;
-				display.replace(compositionAnchor_, compositionReplaceLength_, imeComposition_);
-				return display;
-			}
-
-			size_t DisplayCaret() const {
-				if (!imeActive_) {
-					return caret_;
-				}
-				return compositionAnchor_ + (std::min)(static_cast<size_t>((std::max)(0L, imeCursorPos_)), imeComposition_.size());
-			}*/
-
-			IDWriteTextLayout* CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
-				const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, MeasureSingleLineContentWidth(renderText) + 24.0f);
-				const float height = multiline_ ? 32768.0f : (content.bottom - content.top);
-				const auto wrapping = multiline_ ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP;
-				const bool hasOverride = styleOverride_;
-				auto rectEqual = [](const D2D1_RECT_F& lhs, const D2D1_RECT_F& rhs) {
-					return detail::NearlyEqual(lhs.left, rhs.left, 0.01f)
-						&& detail::NearlyEqual(lhs.top, rhs.top, 0.01f)
-						&& detail::NearlyEqual(lhs.right, rhs.right, 0.01f)
-						&& detail::NearlyEqual(lhs.bottom, rhs.bottom, 0.01f);
-					};
-				const bool layoutMatches = cachedTextLayoutValid_
-					&& cachedLayoutText_ == renderText
-					&& rectEqual(cachedLayoutContentRect_, content)
-					&& detail::NearlyEqual(cachedLayoutWidth_, width, 0.01f)
-					&& detail::NearlyEqual(cachedLayoutHeight_, height, 0.01f)
-					&& cachedLayoutWrapping_ == wrapping
-					&& cachedLayoutHasStyleOverride_ == hasOverride
-					&& (!hasOverride || detail::TextStyleEqual(cachedLayoutStyle_, textStyle_))
-					&& detail::StyledRangesEqual(cachedLayoutRanges_, styledRanges_);
-				if (!layoutMatches) {
-					cachedTextLayout_ = contentLayoutCache_.GetOrCreate(dwriteFactory_.Get(), format_.Get(), renderText, width, height, hasOverride ? &textStyle_.Get() : nullptr, styledRanges_, wrapping);
-					cachedLayoutText_.assign(renderText.begin(), renderText.end());
-					cachedLayoutContentRect_ = content;
-					cachedLayoutWidth_ = width;
-					cachedLayoutHeight_ = height;
-					cachedLayoutWrapping_ = wrapping;
-					cachedLayoutHasStyleOverride_ = hasOverride;
-					cachedLayoutStyle_ = textStyle_;
-					cachedLayoutRanges_ = styledRanges_;
-					cachedTextLayoutMetrics_ = {};
-					if (cachedTextLayout_) {
-						cachedTextLayout_->GetMetrics(&cachedTextLayoutMetrics_);
-					}
-					cachedTextLayoutValid_ = true;
-				}
-				return cachedTextLayout_;
-			}
-
-			float MeasureSingleLineContentWidth(std::wstring_view renderText) const {
-				const bool hasOverride = styleOverride_;
-				const bool cacheHit = cachedSingleLineWidthValid_
-					&& cachedSingleLineText_ == renderText
-					&& cachedSingleLineHasStyleOverride_ == hasOverride
-					&& (!hasOverride || detail::TextStyleEqual(cachedSingleLineStyle_, textStyle_));
-				if (!cacheHit) {
-					const auto metrics = MeasureTextMetrics(dwriteFactory_.Get(), format_.Get(), renderText, hasOverride ? &textStyle_.Get() : nullptr, DWRITE_WORD_WRAPPING_NO_WRAP);
-					cachedSingleLineText_.assign(renderText.begin(), renderText.end());
-					cachedSingleLineHasStyleOverride_ = hasOverride;
-					cachedSingleLineStyle_ = textStyle_;
-					cachedSingleLineWidth_ = (std::max)(1.0f, metrics.widthIncludingTrailingWhitespace + 2.0f);
-					cachedSingleLineWidthValid_ = true;
-				}
-				return cachedSingleLineWidth_;
-			}
-
-			void InvalidateTextLayoutState() {
-				cachedTextLayoutValid_ = false;
-				cachedSingleLineWidthValid_ = false;
-				MarkSelectionMetricsDirty();
-			}
-
-			void MarkSelectionMetricsDirty() const {
-				selectionMetricsDirty_ = true;
-			}
+			bool HorizontalScrollRevealActive() const { return horizontalScrollRevealUntil_ > std::chrono::steady_clock::now(); }
+			bool VerticalScrollRevealActive() const { return verticalScrollRevealUntil_ > std::chrono::steady_clock::now(); }
+			void TouchHorizontalScrollReveal() const { horizontalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650); }
+			void TouchVerticalScrollReveal() const { verticalScrollRevealUntil_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(650); }
 
 			void ShiftStyledRanges(size_t start, ptrdiff_t delta, size_t removedLength = 0) {
 				std::vector<StyledTextRange> updated;
@@ -4372,9 +4255,7 @@ namespace fusion::ui {
 						const size_t preservedSuffix = rangeEnd > start + removedLength ? rangeEnd - (start + removedLength) : 0;
 						range.start = newStart;
 						range.length = preservedPrefix + preservedSuffix;
-						if (range.length > 0) {
-							updated.push_back(range);
-						}
+						if (range.length > 0) updated.push_back(range);
 						continue;
 					}
 					if (range.start >= start) {
@@ -4389,37 +4270,20 @@ namespace fusion::ui {
 			}
 
 			void DrawSelection(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* selectionBrush) {
-				if (!layout || imeActive_ || !HasSelection()) {
-					return;
-				}
-				const size_t textLength = DisplayText().size();
+				if (!layout || imeActive_ || !HasSelection()) return;
+				const size_t textLength = text_.size();
 				const size_t start = (std::min)(SelectionStart(), textLength);
 				const size_t length = (std::min)(SelectionLength(), textLength - start);
-				if (length == 0) {
-					cachedSelectionMetrics_.clear();
-					selectionMetricsDirty_ = true;
-					return;
-				}
-				if (selectionMetricsDirty_
-					|| cachedSelectionLayout_ != layout
-					|| start != cachedSelectionStart_
-					|| length != cachedSelectionLength_) {
+				if (length == 0) return;
+
+				if (selectionMetricsDirty_ || cachedSelectionStart_ != start || cachedSelectionLength_ != length) {
 					cachedSelectionMetrics_.clear();
 					UINT32 actualCount = 0;
-					HRESULT hr = layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, nullptr, 0, &actualCount);
-					if (FAILED(hr) && hr != E_NOT_SUFFICIENT_BUFFER && hr != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
-						return;
-					}
+					layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, nullptr, 0, &actualCount);
 					if (actualCount > 0) {
 						cachedSelectionMetrics_.resize(actualCount);
-						hr = layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, cachedSelectionMetrics_.data(), actualCount, &actualCount);
-						if (FAILED(hr)) {
-							cachedSelectionMetrics_.clear();
-							return;
-						}
-						cachedSelectionMetrics_.resize(actualCount);
+						layout->HitTestTextRange(static_cast<UINT32>(start), static_cast<UINT32>(length), 0.0f, 0.0f, cachedSelectionMetrics_.data(), actualCount, &actualCount);
 					}
-					cachedSelectionLayout_ = layout;
 					cachedSelectionStart_ = start;
 					cachedSelectionLength_ = length;
 					selectionMetricsDirty_ = false;
@@ -4434,83 +4298,75 @@ namespace fusion::ui {
 			}
 
 			void DrawImeUnderline(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, ID2D1SolidColorBrush* outlineBrush) {
-				if (!layout || !tsfCompActive_ || tsfCompEnd_ <= tsfCompStart_) {
-					return;
-				}
+				if (!layout || !tsfCompActive_ || tsfCompEnd_ <= tsfCompStart_) return;
 				const UINT32 start = static_cast<UINT32>((std::min)(tsfCompStart_, text_.size()));
 				const UINT32 length = static_cast<UINT32>((std::min)(tsfCompEnd_ - tsfCompStart_, text_.size() - start));
-
-				if (length == 0) {
-					return;
-				}
+				if (length == 0) return;
 
 				UINT32 actualCount = 0;
-				HRESULT hr = layout->HitTestTextRange(start, length, 0.0f, 0.0f, nullptr, 0, &actualCount);
-				if (FAILED(hr) && hr != E_NOT_SUFFICIENT_BUFFER && hr != HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER)) {
-					return;
-				}
-				if (actualCount == 0) {
-					return;
-				}
+				layout->HitTestTextRange(start, length, 0.0f, 0.0f, nullptr, 0, &actualCount);
+				if (actualCount == 0) return;
 
 				std::vector<DWRITE_HIT_TEST_METRICS> metrics(actualCount);
-				hr = layout->HitTestTextRange(start, length, 0.0f, 0.0f, metrics.data(), actualCount, &actualCount);
-				if (FAILED(hr)) {
+				if (SUCCEEDED(layout->HitTestTextRange(start, length, 0.0f, 0.0f, metrics.data(), actualCount, &actualCount))) {
+					for (const auto& metric : metrics) {
+						context->DrawLine(
+							D2D1::Point2F(origin.x + metric.left, origin.y + metric.top + metric.height + 1.0f),
+							D2D1::Point2F(origin.x + metric.left + metric.width, origin.y + metric.top + metric.height + 1.0f),
+							outlineBrush, 1.0f);
+					}
+				}
+			}
+
+			// 【关键性能提升】：缓存 Caret 几何指标，严禁每帧重复调 HitTestTextPosition，且声明为 const 避免编译错误
+			void QueryCaretMetrics(IDWriteTextLayout* layout, FLOAT& outX, FLOAT& outY, FLOAT& outHeight) const {
+				if (caretMetricsValid_) {
+					outX = cachedCaretX_;
+					outY = cachedCaretY_;
+					outHeight = cachedCaretH_;
 					return;
 				}
-				metrics.resize(actualCount);
-				for (const auto& metric : metrics) {
-					context->DrawLine(
-						D2D1::Point2F(origin.x + metric.left, origin.y + metric.top + metric.height + 1.0f),
-						D2D1::Point2F(origin.x + metric.left + metric.width, origin.y + metric.top + metric.height + 1.0f),
-						outlineBrush,
-						1.0f);
+				DWRITE_HIT_TEST_METRICS m{};
+				FLOAT x = 0.0f, y = 0.0f;
+				if (!layout || FAILED(layout->HitTestTextPosition(static_cast<UINT32>(caret_), FALSE, &x, &y, &m))) {
+					outX = 1.0f;
+					outY = 2.0f;
+					outHeight = multiline_ ? 18.0f : detail::kLineHeight;
 				}
+				else {
+					outX = x;
+					outY = y;
+					outHeight = (std::max)(m.height, 18.0f);
+				}
+				cachedCaretX_ = outX;
+				cachedCaretY_ = outY;
+				cachedCaretH_ = outHeight;
+				caretMetricsValid_ = true;
 			}
 
 			void DrawCaret(ID2D1DeviceContext* context, IDWriteTextLayout* layout, D2D1_POINT_2F origin, const D2D1_COLOR_F& caretColor, float opacity) {
-				FLOAT x = origin.x;
-				FLOAT y = origin.y;
-				DWRITE_HIT_TEST_METRICS metrics{};
-				if (!layout || FAILED(layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &x, &y, &metrics))) {
-					metrics.height = multiline_ ? 18.0f : detail::kLineHeight;
-					x = origin.x + 1.0f;
-					y = origin.y + 2.0f;
-				}
-				else {
-					x += origin.x;
-					y += origin.y;
-				}
+				FLOAT cx = 0, cy = 0, ch = 0;
+				QueryCaretMetrics(layout, cx, cy, ch);
 				auto* caretBrush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, caretColor, opacity);
-				if (!caretBrush) {
-					return;
+				if (caretBrush) {
+					context->FillRectangle(D2D1::RectF(origin.x + cx, origin.y + cy, origin.x + cx + 1.5f, origin.y + cy + ch), caretBrush);
 				}
-				context->FillRectangle(D2D1::RectF(x, y, x + 1.0f, y + (std::max)(metrics.height, 18.0f)), caretBrush);
 			}
 
 			void SyncScrollOffsets(IDWriteTextLayout* layout, const D2D1_RECT_F& content) {
-				if (!layout) {
-					return;
-				}
+				if (!layout) return;
 				const float previousScrollX = scrollX_;
 				const float previousScrollY = scrollY_;
-				DWRITE_TEXT_METRICS textMetrics{};
-				layout->GetMetrics(&textMetrics);
 				const float visibleWidth = (std::max)(1.0f, content.right - content.left);
 				const float visibleHeight = (std::max)(1.0f, content.bottom - content.top);
-				const float contentWidth = multiline_ ? 0.0f : MeasureSingleLineContentWidth(DisplayText());
-				const float contentHeight = multiline_ ? MeasureMultilineContentHeight(layout, textMetrics) : 0.0f;
+				const float contentWidth = multiline_ ? 0.0f : cachedLayoutMetrics_.widthIncludingTrailingWhitespace + 2.0f;
+				const float contentHeight = multiline_ ? cachedLayoutMetrics_.height : 0.0f;
 				const float maxScrollX = multiline_ ? 0.0f : (std::max)(0.0f, contentWidth - visibleWidth + 8.0f);
 				const float maxScrollY = multiline_ ? (std::max)(0.0f, contentHeight - visibleHeight + 6.0f) : 0.0f;
-				scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
-				scrollY_ = (std::clamp)(scrollY_, 0.0f, maxScrollY);
-				if (!ensureCaretVisible_) {
-					return;
-				}
-				FLOAT caretX = 0.0f;
-				FLOAT caretY = 0.0f;
-				DWRITE_HIT_TEST_METRICS caretMetrics{};
-				if (SUCCEEDED(layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
+
+				if (ensureCaretVisible_) {
+					FLOAT caretX = 0, caretY = 0, caretH = 0;
+					QueryCaretMetrics(layout, caretX, caretY, caretH);
 					if (caretX < scrollX_ + 4.0f) {
 						scrollX_ = (std::max)(0.0f, caretX - 4.0f);
 					}
@@ -4520,19 +4376,20 @@ namespace fusion::ui {
 					if (caretY < scrollY_ + 2.0f) {
 						scrollY_ = (std::max)(0.0f, caretY - 2.0f);
 					}
-					else if (caretY + caretMetrics.height > scrollY_ + visibleHeight - 4.0f) {
-						scrollY_ = (std::min)(maxScrollY, caretY + caretMetrics.height - visibleHeight + 4.0f);
+					else if (caretY + caretH > scrollY_ + visibleHeight - 4.0f) {
+						scrollY_ = (std::min)(maxScrollY, caretY + caretH - visibleHeight + 4.0f);
 					}
+					ensureCaretVisible_ = false;
 				}
+
 				scrollX_ = (std::clamp)(scrollX_, 0.0f, maxScrollX);
 				scrollY_ = (std::clamp)(scrollY_, 0.0f, maxScrollY);
 				if (!NearlyEqual(previousScrollX, scrollX_, 0.001f) || !NearlyEqual(previousScrollY, scrollY_, 0.001f)) {
 					MarkCacheDirty();
 				}
-				ensureCaretVisible_ = false;
 			}
 
-			ScrollbarState MakeHorizontalScrollState(const D2D1_RECT_F& box, float maxScrollX, float visibleWidth) const {
+			ScrollbarState MakeHorizontalScrollState(const D2D1_RECT_F& box, float maxScrollX, float) const {
 				ScrollbarState state{ ScrollOrientation::Horizontal };
 				state.viewport = box;
 				state.contentExtent = (box.right - box.left) + (std::max)(0.0f, maxScrollX);
@@ -4544,7 +4401,7 @@ namespace fusion::ui {
 				return state;
 			}
 
-			ScrollbarState MakeVerticalScrollState(const D2D1_RECT_F& box, float maxScrollY, float visibleHeight) const {
+			ScrollbarState MakeVerticalScrollState(const D2D1_RECT_F& box, float maxScrollY, float) const {
 				ScrollbarState state{ ScrollOrientation::Vertical };
 				state.viewport = box;
 				state.contentExtent = (box.bottom - box.top) + (std::max)(0.0f, maxScrollY);
@@ -4557,14 +4414,13 @@ namespace fusion::ui {
 			}
 
 			void UpdateCaretBlink() {
-				if (!focused_) {
-					return;
-				}
+				if (!focused_) return;
 				const auto now = std::chrono::steady_clock::now();
 				if (now >= nextCaretBlinkToggle_) {
 					caretTargetVisible_ = !caretTargetVisible_;
-					AnimateLinear(caretOpacityAnimation_, caretTargetVisible_ ? 1.0f : 0.0f, 0.12);
+					AnimateLinear(caretOpacityAnimation_, caretTargetVisible_ ? 1.0f : 0.0f, 0.08);
 					nextCaretBlinkToggle_ = now + std::chrono::milliseconds(530);
+					MarkCacheDirty(); // 触发脏标记
 				}
 			}
 
@@ -4576,38 +4432,19 @@ namespace fusion::ui {
 			}
 
 			size_t HitTestText(D2D1_POINT_2F point) const {
-				const D2D1_RECT_F box = TextBounds();
-				D2D1_RECT_F content = multiline_
-					? InflateRect(box, 12.0f)
-					: D2D1::RectF(box.left + 12.0f, box.top + 6.0f, box.right - 12.0f, box.bottom - 6.0f);
-
-				const bool reserveVertical = multiline_ && (previousVerticalOverflow_ || VerticalOverflowHintActive() || verticalScrollVisibilityAnimation_.Value() > 0.01f);
-				const bool reserveHorizontal = !multiline_ && (previousHorizontalOverflow_ || HorizontalOverflowHintActive() || horizontalScrollVisibilityAnimation_.Value() > 0.01f);
-				if (reserveVertical) {
-					content.right -= kScrollGutter;
-				}
-				if (reserveHorizontal) {
-					content.bottom -= kSingleLineScrollGutter;
-				}
-
-				std::wstring displayStorage;
-				std::wstring_view renderText = text_;
-				if (imeActive_ && !imeComposition_.empty()) {
-					displayStorage = text_;
-					displayStorage.replace(compositionAnchor_, compositionReplaceLength_, imeComposition_);
-					renderText = displayStorage;
-				}
-
-				auto* layout = CreateLayout(renderText, content);
-				if (!layout) {
-					return text_.size();
-				}
-				BOOL trailing = FALSE;
-				BOOL inside = FALSE;
+				const auto visual = ComputeVisualState();
+				if (!visual.layout) return text_.size();
+				BOOL trailing = FALSE, inside = FALSE;
 				DWRITE_HIT_TEST_METRICS metrics{};
-				const float localX = point.x - content.left + scrollX_;
-				const float localY = point.y - content.top + scrollY_;
-				if (FAILED(layout->HitTestPoint(localX, localY, &trailing, &inside, &metrics))) {
+				float originY = visual.content.top - scrollY_;
+				if (!multiline_) {
+					const float visibleHeight = (std::max)(1.0f, visual.content.bottom - visual.content.top);
+					const float textHeight = (std::max)(visual.metrics.height, detail::kLineHeight);
+					originY = visual.content.top + (std::max)(0.0f, std::floor((visibleHeight - textHeight) * 0.5f)) - scrollY_;
+				}
+				const float localX = point.x - (visual.content.left - scrollX_);
+				const float localY = point.y - originY;
+				if (FAILED(visual.layout->HitTestPoint(localX, localY, &trailing, &inside, &metrics))) {
 					return text_.size();
 				}
 				size_t index = metrics.textPosition + (trailing ? metrics.length : 0);
@@ -4615,14 +4452,13 @@ namespace fusion::ui {
 			}
 
 			bool DeleteSelection() {
-				if (!HasSelection()) {
-					return false;
-				}
+				if (!HasSelection()) return false;
 				const size_t start = SelectionStart();
 				ShiftStyledRanges(start, -static_cast<ptrdiff_t>(SelectionLength()), SelectionLength());
 				text_.erase(start, SelectionLength());
 				caret_ = start;
 				selectionAnchor_ = start;
+				MarkCaretMetricsDirty();
 				MarkSelectionMetricsDirty();
 				ensureCaretVisible_ = true;
 				NotifyChanged();
@@ -4630,15 +4466,12 @@ namespace fusion::ui {
 			}
 
 			void ReplaceRange(size_t start, size_t length, std::wstring_view replacement) {
-				if (length > 0) {
-					ShiftStyledRanges(start, -static_cast<ptrdiff_t>(length), length);
-				}
-				if (!replacement.empty()) {
-					ShiftStyledRanges(start, static_cast<ptrdiff_t>(replacement.size()));
-				}
+				if (length > 0) ShiftStyledRanges(start, -static_cast<ptrdiff_t>(length), length);
+				if (!replacement.empty()) ShiftStyledRanges(start, static_cast<ptrdiff_t>(replacement.size()));
 				text_.replace(start, length, replacement.data(), replacement.size());
 				caret_ = start + replacement.size();
 				selectionAnchor_ = caret_;
+				MarkCaretMetricsDirty();
 				MarkSelectionMetricsDirty();
 				ensureCaretVisible_ = true;
 				PublishSharedTextStoreState();
@@ -4647,9 +4480,7 @@ namespace fusion::ui {
 			}
 
 			void InsertText(std::wstring_view value) {
-				if (value.empty()) {
-					return;
-				}
+				if (value.empty()) return;
 				const size_t start = HasSelection() ? SelectionStart() : caret_;
 				const size_t length = HasSelection() ? SelectionLength() : 0;
 				ReplaceRange(start, length, value);
@@ -4663,57 +4494,37 @@ namespace fusion::ui {
 				const size_t previousCaret = caret_;
 				const size_t previousAnchor = selectionAnchor_;
 				caret_ = (std::min)(index, text_.size());
-				if (!extendSelection) {
-					selectionAnchor_ = caret_;
-				}
+				if (!extendSelection) selectionAnchor_ = caret_;
 				if (previousCaret != caret_ || previousAnchor != selectionAnchor_) {
+					MarkCaretMetricsDirty();
 					MarkSelectionMetricsDirty();
 					PublishSharedTextStoreState();
 				}
-				if (!preserveDesiredColumn) {
-					desiredCaretX_.reset();
-				}
+				if (!preserveDesiredColumn) desiredCaretX_.reset();
 				ensureCaretVisible_ = true;
-				if (imeActive_ && imeWindow_) {
-					UpdateImeWindowPosition(imeWindow_);
-				}
+				if (imeActive_ && imeWindow_) UpdateImeWindowPosition(imeWindow_);
 				ResetCaretBlink();
 			}
 
 			void UpdateImeWindowPosition(HWND hwnd) {
-				if (!hwnd) {
-					return;
-				}
+				if (!hwnd) return;
 				HIMC context = ImmGetContext(hwnd);
-				if (!context) {
-					return;
-				}
+				if (!context) return;
 				UpdateImeWindowPosition(hwnd, context);
 				ImmReleaseContext(hwnd, context);
 			}
 
 			void UpdateImeWindowPosition(HWND hwnd, HIMC context) {
-				if (!hwnd || !context) {
-					return;
-				}
+				if (!hwnd || !context) return;
 				auto visual = ComputeVisualState();
 				UpdateImeWindowPosition(hwnd, context, visual);
 			}
 
 			void UpdateImeWindowPosition(HWND hwnd, HIMC context, const VisualState& visual) {
-				if (!hwnd) {
-					return;
-				}
-				if (!visual.layout) {
-					return;
-				}
+				if (!hwnd || !visual.layout) return;
 
-				FLOAT caretX = 0.0f;
-				FLOAT caretY = 0.0f;
-				DWRITE_HIT_TEST_METRICS caretMetrics{};
-				if (FAILED(visual.layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
-					return;
-				}
+				FLOAT caretX = 0, caretY = 0, caretH = 0;
+				QueryCaretMetrics(visual.layout, caretX, caretY, caretH);
 
 				float originY = visual.content.top - scrollY_;
 				if (!multiline_) {
@@ -4726,7 +4537,7 @@ namespace fusion::ui {
 				const float dpiScale = (std::max)(0.5f, static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f);
 				const LONG clientX = static_cast<LONG>(std::lround((originX + caretX) * dpiScale));
 				const LONG clientY = static_cast<LONG>(std::lround((originY + caretY) * dpiScale));
-				const LONG lineHeight = static_cast<LONG>(std::lround((std::max)(caretMetrics.height, detail::kLineHeight) * dpiScale));
+				const LONG lineHeight = static_cast<LONG>(std::lround(caretH * dpiScale));
 
 				RECT clientRect{ 0, 0, 0, 0 };
 				GetClientRect(hwnd, &clientRect);
@@ -4736,9 +4547,7 @@ namespace fusion::ui {
 				const LONG anchorY = (std::clamp)(clientY, clientRect.top, maxClientY);
 				const LONG candidateY = (std::clamp)(anchorY + (std::max)(lineHeight, 1L), clientRect.top, maxClientY);
 
-				if (cachedImeX_ == anchorX && cachedImeY_ == anchorY && cachedImeH_ == lineHeight) {
-					return;
-				}
+				if (cachedImeX_ == anchorX && cachedImeY_ == anchorY && cachedImeH_ == lineHeight) return;
 				cachedImeX_ = anchorX; cachedImeY_ = anchorY; cachedImeH_ = lineHeight;
 
 				COMPOSITIONFORM composition{};
@@ -4771,17 +4580,13 @@ namespace fusion::ui {
 				const size_t lineEnd = text_.find(L'\n', caret_);
 				const size_t column = caret_ - lineStart;
 				if (direction < 0) {
-					if (lineStart == 0) {
-						return 0;
-					}
+					if (lineStart == 0) return 0;
 					const size_t prevEnd = lineStart - 1;
 					const size_t prevBreak = text_.rfind(L'\n', prevEnd == 0 ? 0 : prevEnd - 1);
 					const size_t prevStart = prevBreak == std::wstring::npos ? 0 : prevBreak + 1;
 					return prevStart + (std::min)(column, prevEnd - prevStart);
 				}
-				if (lineEnd == std::wstring::npos) {
-					return text_.size();
-				}
+				if (lineEnd == std::wstring::npos) return text_.size();
 				const size_t nextStart = lineEnd + 1;
 				const size_t nextEnd = text_.find(L'\n', nextStart);
 				const size_t boundedNextEnd = nextEnd == std::wstring::npos ? text_.size() : nextEnd;
@@ -4790,45 +4595,31 @@ namespace fusion::ui {
 
 			size_t MoveVertical(int direction) const {
 				const auto visual = ComputeVisualState();
-				if (!visual.layout) {
-					return MoveVerticalByLineBreak(direction);
-				}
-				FLOAT caretX = 0.0f;
-				FLOAT caretY = 0.0f;
-				DWRITE_HIT_TEST_METRICS caretMetrics{};
-				if (FAILED(visual.layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
-					return MoveVerticalByLineBreak(direction);
-				}
-				const float lineHeight = (std::max)(caretMetrics.height, detail::kLineHeight);
+				if (!visual.layout) return MoveVerticalByLineBreak(direction);
+				FLOAT caretX = 0, caretY = 0, caretH = 0;
+				QueryCaretMetrics(visual.layout, caretX, caretY, caretH);
+
+				const float lineHeight = (std::max)(caretH, detail::kLineHeight);
 				const float targetX = desiredCaretX_.has_value() ? *desiredCaretX_ : caretX;
 				desiredCaretX_ = targetX;
-				const float targetY = direction < 0
-					? (std::max)(0.0f, caretY - lineHeight * 0.5f)
-					: caretY + lineHeight * 1.5f;
-				BOOL trailing = FALSE;
-				BOOL inside = FALSE;
+				const float targetY = direction < 0 ? (std::max)(0.0f, caretY - lineHeight * 0.5f) : caretY + lineHeight * 1.5f;
+				BOOL trailing = FALSE, inside = FALSE;
 				DWRITE_HIT_TEST_METRICS targetMetrics{};
 				if (FAILED(visual.layout->HitTestPoint(targetX, targetY, &trailing, &inside, &targetMetrics))) {
 					return direction < 0 ? 0 : text_.size();
 				}
-				const size_t index = targetMetrics.textPosition + (trailing ? targetMetrics.length : 0);
-				return (std::min)(index, text_.size());
+				return (std::min)(static_cast<size_t>(targetMetrics.textPosition + (trailing ? targetMetrics.length : 0)), text_.size());
 			}
 
 			void NotifyChanged() {
-				MarkSelectionMetricsDirty();
-				InvalidateTextLayoutState();
+				MarkLayoutDirty();
 				PublishSharedTextStoreState();
 				MarkContentChanged();
-				if (onChanged_) {
-					onChanged_(text_);
-				}
+				if (onChanged_) onChanged_(text_);
 			}
 
 			void PublishSharedTextStoreState() const {
-				if (!focused_) {
-					return;
-				}
+				if (!focused_) return;
 				SetSharedTextStoreState(text_, selectionAnchor_, caret_);
 			}
 
@@ -4885,29 +4676,27 @@ namespace fusion::ui {
 			bool styleOverride_ = false;
 			bool labelStyleOverride_ = false;
 			std::vector<StyledTextRange> styledRanges_;
-			mutable bool cachedTextLayoutValid_ = false;
-			mutable IDWriteTextLayout* cachedTextLayout_ = nullptr;
-			mutable DWRITE_TEXT_METRICS cachedTextLayoutMetrics_{};
-			mutable std::wstring cachedLayoutText_;
-			mutable D2D1_RECT_F cachedLayoutContentRect_{ D2D1::RectF() };
-			mutable float cachedLayoutWidth_ = 0.0f;
-			mutable float cachedLayoutHeight_ = 0.0f;
-			mutable DWRITE_WORD_WRAPPING cachedLayoutWrapping_ = DWRITE_WORD_WRAPPING_NO_WRAP;
-			mutable bool cachedLayoutHasStyleOverride_ = false;
-			mutable TextStyle cachedLayoutStyle_{};
-			mutable std::vector<StyledTextRange> cachedLayoutRanges_;
-			mutable bool cachedSingleLineWidthValid_ = false;
-			mutable std::wstring cachedSingleLineText_;
-			mutable bool cachedSingleLineHasStyleOverride_ = false;
+
+			// 唯一持有的 DirectWrite 布局对象和缓存状态
+			mutable ComPtr<IDWriteTextLayout> textLayout_;
+			mutable bool layoutDirty_ = true;
+			mutable float lastAssignedWidth_ = -1.0f;
+			mutable DWRITE_TEXT_METRICS cachedLayoutMetrics_{};
+			mutable bool cachedMetricsValid_ = false;
+
+			// 光标几何指标缓存
+			mutable bool caretMetricsValid_ = false;
+			mutable FLOAT cachedCaretX_ = 0.0f;
+			mutable FLOAT cachedCaretY_ = 0.0f;
+			mutable FLOAT cachedCaretH_ = 0.0f;
+
+			// 选区 HitTest 缓存
 			mutable bool selectionMetricsDirty_ = true;
 			mutable std::vector<DWRITE_HIT_TEST_METRICS> cachedSelectionMetrics_;
-			mutable IDWriteTextLayout* cachedSelectionLayout_ = nullptr;
 			mutable size_t cachedSelectionStart_ = 0;
 			mutable size_t cachedSelectionLength_ = 0;
-			mutable TextStyle cachedSingleLineStyle_{};
-			mutable float cachedSingleLineWidth_ = 0.0f;
+
 			mutable TextLayoutCache labelLayoutCache_;
-			mutable TextLayoutCache contentLayoutCache_;
 
 			LONG cachedImeX_ = -1, cachedImeY_ = -1, cachedImeH_ = -1;
 			bool tsfCompActive_ = false;
