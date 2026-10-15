@@ -496,7 +496,7 @@ void SyncImm32CandidatePosition(HWND hwnd) {
 	cf.dwIndex          = 0;
 	cf.dwStyle          = CFS_CANDIDATEPOS;
 	cf.ptCurrentPos.x   = cx;
-	cf.ptCurrentPos.y   = cy + h;
+	cf.ptCurrentPos.y   = cy + h + static_cast<int>(fusion::ui::detail::TextInput::CandidateWindowUnderlineSpacingPx());
 	ImmSetCandidateWindow(himc, &cf);
 	// 同时同步组合文字窗口位置
 	COMPOSITIONFORM cmpf{};
@@ -525,7 +525,7 @@ class SimpleTextStore final : public ITextStoreACP, public ITfContextOwnerCompos
 	ULONG ref_{ 1 };
 	ComPtr<ITextStoreACPSink> sink_;
 	DWORD sinkMask_ = 0;
-	bool  locked_   = false;
+	bool  locked_ = false;
 	DWORD pendingLockFlags_ = 0;
 
 	void PostTextStoreSync() const {
@@ -534,9 +534,23 @@ class SimpleTextStore final : public ITextStoreACP, public ITfContextOwnerCompos
 		}
 	}
 
+	static std::wstring_view MakeReplacementView(const WCHAR* text, ULONG length) {
+		return (text && length > 0) ? std::wstring_view(text, length) : std::wstring_view();
+	}
+
+public:
+	explicit SimpleTextStore(HWND h) : hwnd_(h) {}
+
+	// 公开供外部通知 TSF 状态变化
 	void NotifySelectionChange() {
 		if (sink_ && (sinkMask_ & TS_AS_SEL_CHANGE)) {
 			sink_->OnSelectionChange();
+		}
+	}
+
+	void NotifyLayoutChange() {
+		if (sink_ && (sinkMask_ & TS_AS_LAYOUT_CHANGE)) {
+			sink_->OnLayoutChange(TS_LC_CHANGE, 0);
 		}
 	}
 
@@ -549,12 +563,6 @@ class SimpleTextStore final : public ITextStoreACP, public ITfContextOwnerCompos
 			sink_->OnTextChange(0, &textChange);
 		}
 	}
-
-	static std::wstring_view MakeReplacementView(const WCHAR* text, ULONG length) {
-		return (text && length > 0) ? std::wstring_view(text, length) : std::wstring_view();
-	}
-public:
-	explicit SimpleTextStore(HWND h) : hwnd_(h) {}
 
 	// IUnknown
 	ULONG STDMETHODCALLTYPE AddRef()  override { return ++ref_; }
@@ -586,7 +594,6 @@ public:
 		sink_.Reset(); sinkMask_ = 0; return S_OK;
 	}
 
-	// 同步锁：立即回调 OnLockGranted，规避异步复杂性
 	HRESULT STDMETHODCALLTYPE RequestLock(DWORD dwLockFlags, HRESULT* phrSession) override {
 		if (!phrSession) return E_INVALIDARG;
 		AppendImeTrace(std::format("RequestLock flags=0x{:X} locked={} sink={}", dwLockFlags, locked_ ? 1 : 0, sink_ ? 1 : 0));
@@ -613,11 +620,10 @@ public:
 		return S_OK;
 	}
 
-	// 文档状态：只读、无隐藏文本
 	HRESULT STDMETHODCALLTYPE GetStatus(TS_STATUS* p) override {
 		if (!p) return E_INVALIDARG;
 		p->dwDynamicFlags = 0;
-		p->dwStaticFlags  = TS_SS_NOHIDDENTEXT;
+		p->dwStaticFlags = TS_SS_NOHIDDENTEXT;
 		return S_OK;
 	}
 
@@ -630,7 +636,6 @@ public:
 		return S_OK;
 	}
 
-	// 当前选区：报告真实焦点输入框的共享文档选区
 	HRESULT STDMETHODCALLTYPE GetSelection(ULONG, ULONG cnt, TS_SELECTION_ACP* pSel, ULONG* pFetched) override {
 		if (!pSel || !pFetched) return E_INVALIDARG;
 		if (!locked_) return TS_E_NOLOCK;
@@ -656,7 +661,7 @@ public:
 	}
 
 	HRESULT STDMETHODCALLTYPE GetText(LONG acpStart, LONG acpEnd, WCHAR* plainText, ULONG plainTextCapacity, ULONG* plainTextCopied,
-			TS_RUNINFO* runInfo, ULONG runInfoCapacity, ULONG* runInfoCopied, LONG* nextAcp) override {
+		TS_RUNINFO* runInfo, ULONG runInfoCapacity, ULONG* runInfoCopied, LONG* nextAcp) override {
 		if (!locked_) return TS_E_NOLOCK;
 		auto snapshot = fusion::ui::SnapshotSharedTextStore();
 		const LONG start = fusion::ui::ClampTextStoreAcp(acpStart, snapshot.text.size());
@@ -734,13 +739,11 @@ public:
 		return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE InsertEmbeddedAtSelection(DWORD, IDataObject*, LONG*, LONG*, TS_TEXTCHANGE*) override { return E_NOTIMPL; }
-
-	// 属性：不支持任何属性
 	HRESULT STDMETHODCALLTYPE RequestSupportedAttrs(DWORD, ULONG, const TS_ATTRID*) override { return S_OK; }
 	HRESULT STDMETHODCALLTYPE RequestAttrsAtPosition(LONG, ULONG, const TS_ATTRID*, DWORD) override { return S_OK; }
 	HRESULT STDMETHODCALLTYPE RequestAttrsTransitioningAtPosition(LONG, ULONG, const TS_ATTRID*, DWORD) override { return S_OK; }
 	HRESULT STDMETHODCALLTYPE FindNextAttrTransition(LONG, LONG, ULONG, const TS_ATTRID*, DWORD,
-			LONG* pn, BOOL* pf, LONG* po) override {
+		LONG* pn, BOOL* pf, LONG* po) override {
 		if (pn) *pn = 0; if (pf) *pf = FALSE; if (po) *po = 0; return S_OK;
 	}
 	HRESULT STDMETHODCALLTYPE RetrieveRequestedAttrs(ULONG, TS_ATTRVAL*, ULONG* p) override {
@@ -761,7 +764,6 @@ public:
 		return S_OK;
 	}
 
-	// ★ 核心：返回光标物理屏幕坐标 → TSF 据此定位候选窗
 	HRESULT STDMETHODCALLTYPE GetTextExt(TsViewCookie, LONG, LONG, RECT* prc, BOOL* pfClipped) override {
 		if (!prc || !pfClipped) return E_INVALIDARG;
 		if (!locked_) return TS_E_NOLOCK;
@@ -770,8 +772,8 @@ public:
 			LONG x = fusion::ui::g_ImeCaretScreenX.load(std::memory_order_relaxed);
 			LONG y = fusion::ui::g_ImeCaretScreenY.load(std::memory_order_relaxed);
 			LONG h = (std::max)(1L, (LONG)fusion::ui::g_ImeCaretLineHeight.load(std::memory_order_relaxed));
-			prc->left = x; prc->top = y; prc->right = x + 2; prc->bottom = y + h;
-			AppendImeTrace(std::format("GetTextExt caret-valid rect=({},{}-{},{} )", prc->left, prc->top, prc->right, prc->bottom));
+			prc->left = x; prc->top = y; prc->right = x + 2; prc->bottom = y + h + fusion::ui::detail::TextInput::CandidateWindowUnderlineSpacingPx();
+			AppendImeTrace(std::format("GetTextExt caret-valid rect=({},{}-{},{})", prc->left, prc->top, prc->right, prc->bottom));
 			return S_OK;
 		}
 		AppendImeTrace("GetTextExt no-layout");
@@ -783,13 +785,6 @@ public:
 	}
 	HRESULT STDMETHODCALLTYPE GetWnd(TsViewCookie, HWND* p) override {
 		if (!p) return E_INVALIDARG; *p = hwnd_; return S_OK;
-	}
-
-	// 通知 TSF 布局已改变（光标移动后调用）
-	void NotifyLayoutChange() {
-		if (sink_ && (sinkMask_ & TS_AS_LAYOUT_CHANGE)) {
-			sink_->OnLayoutChange(TS_LC_CHANGE, 1);
-		}
 	}
 
 	HRESULT STDMETHODCALLTYPE OnStartComposition(ITfCompositionView*, BOOL* pfOk) override {
@@ -817,6 +812,10 @@ SimpleTextStore* g_TextStore = nullptr;
 
 void NotifyTsfLayoutChange() {
 	if (g_TextStore) g_TextStore->NotifyLayoutChange();
+}
+
+void NotifyTsfSelectionChange() {
+	if (g_TextStore) g_TextStore->NotifySelectionChange();
 }
 
 void InitTsf(HWND hwnd) {
@@ -2153,8 +2152,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 		if (focusedTextInput) {
 			ImmAssociateContextEx(hwnd, nullptr, IACE_DEFAULT);
 			SyncSystemImeCaretFromSharedState(hwnd);
-			// TSF: 通知微软拼音等TSF输入法我们的文档获得焦点
-			if (g_TfThreadMgr && g_TfDocMgr) g_TfThreadMgr->SetFocus(g_TfDocMgr);
+			if (g_TfThreadMgr && g_TfDocMgr) {
+				g_TfThreadMgr->SetFocus(g_TfDocMgr);
+			}
+			// 关键修复：主动告知 TSF 选区和布局已全部就绪，微软拼音首键立即接管！
+			NotifyTsfSelectionChange();
+			NotifyTsfLayoutChange();
 		}
 		else {
 			if (HIMC himc = ImmGetContext(hwnd)) {
@@ -2162,7 +2165,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 				ImmReleaseContext(hwnd, himc);
 			}
 			DestroySystemImeCaret();
-			// TSF: 放弃TSF焦点
 			if (g_TfThreadMgr) g_TfThreadMgr->SetFocus(nullptr);
 		}
 		return 0;

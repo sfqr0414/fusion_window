@@ -3438,78 +3438,6 @@ namespace fusion::ui {
 			mutable std::wstring cachedProgressLabel_;
 		};
 
-		// 【核心突破】：视口行级几何剔除渲染器，屏幕外的万行文字 0 开销瞬间掐断！
-		class ClippedTextRenderer final : public IDWriteTextRenderer {
-			ULONG refCount_ = 1;
-			ID2D1DeviceContext* context_ = nullptr;
-			ID2D1Brush* brush_ = nullptr;
-			float clipTop_ = 0.0f;
-			float clipBottom_ = 0.0f;
-		public:
-			ClippedTextRenderer(ID2D1DeviceContext* ctx, ID2D1Brush* brush, float top, float bottom)
-				: context_(ctx), brush_(brush), clipTop_(top), clipBottom_(bottom) {
-			}
-
-			IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
-				if (!ppv) return E_INVALIDARG;
-				if (riid == __uuidof(IUnknown) || riid == __uuidof(IDWritePixelSnapping) || riid == __uuidof(IDWriteTextRenderer)) {
-					*ppv = static_cast<IDWriteTextRenderer*>(this);
-					AddRef();
-					return S_OK;
-				}
-				*ppv = nullptr;
-				return E_NOINTERFACE;
-			}
-			IFACEMETHODIMP_(ULONG) AddRef() override { return ++refCount_; }
-			IFACEMETHODIMP_(ULONG) Release() override {
-				ULONG r = --refCount_;
-				if (!r) delete this;
-				return r;
-			}
-			IFACEMETHODIMP IsPixelSnappingDisabled(void*, BOOL* disabled) override {
-				*disabled = FALSE;
-				return S_OK;
-			}
-			IFACEMETHODIMP GetCurrentTransform(void*, DWRITE_MATRIX* transform) override {
-				D2D1_MATRIX_3X2_F m;
-				context_->GetTransform(&m);
-				transform->m11 = m._11; transform->m12 = m._12;
-				transform->m21 = m._21; transform->m22 = m._22;
-				transform->dx = m._31; transform->dy = m._32;
-				return S_OK;
-			}
-			IFACEMETHODIMP GetPixelsPerDip(void*, FLOAT* pixelsPerDip) override {
-				float dpiX, dpiY;
-				context_->GetDpi(&dpiX, &dpiY);
-				*pixelsPerDip = dpiX / 96.0f;
-				return S_OK;
-			}
-
-			// ★ 关键拦截：如果整行文字的 Y 坐标在屏幕可见视口之外，直接跳过，0 开销！
-			IFACEMETHODIMP DrawGlyphRun(
-				void*,
-				FLOAT baselineOriginX,
-				FLOAT baselineOriginY,
-				DWRITE_MEASURING_MODE measuringMode,
-				const DWRITE_GLYPH_RUN* glyphRun,
-				const DWRITE_GLYPH_RUN_DESCRIPTION*,
-				IUnknown* clientDrawingEffect) override {
-
-				// 粗略但极快的行高度盒判断（标准字体基线向上约 20px，向下 10px）
-				if (baselineOriginY + 15.0f < clipTop_ || baselineOriginY - 30.0f > clipBottom_) {
-					return S_OK; // 视口之外，彻底抛弃！几万个字在此瞬间蒸发！
-				}
-
-				ID2D1Brush* drawBrush = clientDrawingEffect ? static_cast<ID2D1Brush*>(clientDrawingEffect) : brush_;
-				context_->DrawGlyphRun(D2D1::Point2F(baselineOriginX, baselineOriginY), glyphRun, drawBrush, measuringMode);
-				return S_OK;
-			}
-
-			IFACEMETHODIMP DrawUnderline(void*, FLOAT, FLOAT, const DWRITE_UNDERLINE*, IUnknown*) override { return S_OK; }
-			IFACEMETHODIMP DrawStrikethrough(void*, FLOAT, FLOAT, const DWRITE_STRIKETHROUGH*, IUnknown*) override { return S_OK; }
-			IFACEMETHODIMP DrawInlineObject(void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override { return S_OK; }
-		};
-
 		class TextInput final : public UIComponent {
 		public:
 			TextInput(std::wstring label,
@@ -3543,7 +3471,6 @@ namespace fusion::ui {
 					|| hScrollBar_.IsAnimating() || vScrollBar_.IsAnimating();
 			}
 
-			// 【性能优化 1】：静止时不占用多余帧率，只在真实动画或光标闪烁切换时重绘
 			bool WantsFrameTick() const override {
 				const auto now = std::chrono::steady_clock::now();
 				const bool caretNeedsTick = focused_ && (caretOpacityAnimation_.IsAnimating() || now >= nextCaretBlinkToggle_);
@@ -3558,7 +3485,6 @@ namespace fusion::ui {
 					|| scrollDragMode_ != ScrollDragMode::None;
 			}
 
-			// 【性能优化 2】：极速命中测试，绝不在移动鼠标时触发 ComputeVisualState 排版！
 			CursorKind CursorAt(D2D1_POINT_2F point) const override {
 				const D2D1_RECT_F box = TextBounds();
 				if (!PointInRect(box, point)) {
@@ -3706,7 +3632,6 @@ namespace fusion::ui {
 				}
 				else {
 					if (multiline_) {
-						// ★ 手术核心：换用 ClippedTextRenderer 绘制，视口外文字根本不传给 GPU！
 						auto* brush = PrepareSharedBrush(context, SharedBrushSlot::Tertiary, styleOverride_ ? textStyle_->color : textColor_);
 						ClippedTextRenderer renderer(context, brush, visual.content.top, visual.content.bottom);
 						visual.layout->Draw(nullptr, &renderer, origin.x, origin.y);
@@ -3725,7 +3650,6 @@ namespace fusion::ui {
 				}
 				context->PopAxisAlignedClip();
 
-				// 滚动条渲染
 				if (visual.renderHorizontalScroll) {
 					const auto& hs = visual.horizontalScroll;
 					const float hExt = hs.contentExtent > 0.01f ? hs.contentExtent : 1.0f;
@@ -4026,6 +3950,46 @@ namespace fusion::ui {
 				}
 			}
 
+			void CalculateAndPublishImeCaretImmediate() {
+				HWND hwnd = imeWindow_ ? imeWindow_ : GetActiveWindow();
+				if (!hwnd) return;
+				imeWindow_ = hwnd;
+				auto visual = ComputeVisualState();
+				if (!visual.layout) return;
+
+				FLOAT caretX = 0.0f;
+				FLOAT caretY = 0.0f;
+				DWRITE_HIT_TEST_METRICS caretMetrics{};
+				if (FAILED(visual.layout->HitTestTextPosition(static_cast<UINT32>(DisplayCaret()), FALSE, &caretX, &caretY, &caretMetrics))) {
+					caretMetrics.height = multiline_ ? 18.0f : detail::kLineHeight;
+					caretX = 1.0f;
+					caretY = 2.0f;
+				}
+
+				float originY = visual.content.top - scrollY_;
+				if (!multiline_) {
+					const float visibleHeight = (std::max)(1.0f, visual.content.bottom - visual.content.top);
+					const float textHeight = (std::max)(visual.metrics.height, detail::kLineHeight);
+					originY = visual.content.top + (std::max)(0.0f, std::floor((visibleHeight - textHeight) * 0.5f)) - scrollY_;
+				}
+				const float originX = visual.content.left - scrollX_;
+
+				const float dpiScale = (std::max)(0.5f, static_cast<float>(GetDpiForWindow(hwnd)) / 96.0f);
+				const LONG clientX = static_cast<LONG>(std::lround((originX + caretX) * dpiScale));
+				const LONG clientY = static_cast<LONG>(std::lround((originY + caretY) * dpiScale));
+				const LONG lineHeight = static_cast<LONG>(std::lround((std::max)(caretMetrics.height, detail::kLineHeight) * dpiScale));
+
+				POINT screenCaretPt{ clientX, clientY };
+				ClientToScreen(hwnd, &screenCaretPt);
+
+				g_ImeCaretScreenX.store(screenCaretPt.x, std::memory_order_relaxed);
+				g_ImeCaretScreenY.store(screenCaretPt.y, std::memory_order_relaxed);
+				g_ImeCaretClientX.store(clientX, std::memory_order_relaxed);
+				g_ImeCaretClientY.store(clientY, std::memory_order_relaxed);
+				g_ImeCaretLineHeight.store(static_cast<int32_t>(lineHeight), std::memory_order_relaxed);
+				g_ImeCaretValid.store(true, std::memory_order_release);
+			}
+
 			void OnFocus(bool focused) override {
 				UIComponent::OnFocus(focused);
 				if (!focused) {
@@ -4037,6 +4001,7 @@ namespace fusion::ui {
 					return;
 				}
 				PublishSharedTextStoreText();
+				CalculateAndPublishImeCaretImmediate();
 				if (imeWindow_) {
 					RefreshImeWindowPosition(imeWindow_);
 				}
@@ -4131,6 +4096,79 @@ namespace fusion::ui {
 
 			const std::wstring& Text() const { return text_; }
 
+			static constexpr LONG CandidateWindowUnderlineSpacingPx() noexcept {
+				return 8L;
+			}
+
+			class ClippedTextRenderer final : public IDWriteTextRenderer {
+				ULONG refCount_ = 1;
+				ID2D1DeviceContext* context_ = nullptr;
+				ID2D1Brush* brush_ = nullptr;
+				float clipTop_ = 0.0f;
+				float clipBottom_ = 0.0f;
+			public:
+				ClippedTextRenderer(ID2D1DeviceContext* ctx, ID2D1Brush* brush, float top, float bottom)
+					: context_(ctx), brush_(brush), clipTop_(top), clipBottom_(bottom) {
+				}
+
+				IFACEMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+					if (!ppv) return E_INVALIDARG;
+					if (riid == __uuidof(IUnknown) || riid == __uuidof(IDWritePixelSnapping) || riid == __uuidof(IDWriteTextRenderer)) {
+						*ppv = static_cast<IDWriteTextRenderer*>(this);
+						AddRef();
+						return S_OK;
+					}
+					*ppv = nullptr;
+					return E_NOINTERFACE;
+				}
+				IFACEMETHODIMP_(ULONG) AddRef() override { return ++refCount_; }
+				IFACEMETHODIMP_(ULONG) Release() override {
+					ULONG r = --refCount_;
+					if (!r) delete this;
+					return r;
+				}
+				IFACEMETHODIMP IsPixelSnappingDisabled(void*, BOOL* disabled) override {
+					*disabled = FALSE;
+					return S_OK;
+				}
+				IFACEMETHODIMP GetCurrentTransform(void*, DWRITE_MATRIX* transform) override {
+					D2D1_MATRIX_3X2_F m;
+					context_->GetTransform(&m);
+					transform->m11 = m._11; transform->m12 = m._12;
+					transform->m21 = m._21; transform->m22 = m._22;
+					transform->dx = m._31; transform->dy = m._32;
+					return S_OK;
+				}
+				IFACEMETHODIMP GetPixelsPerDip(void*, FLOAT* pixelsPerDip) override {
+					float dpiX, dpiY;
+					context_->GetDpi(&dpiX, &dpiY);
+					*pixelsPerDip = dpiX / 96.0f;
+					return S_OK;
+				}
+
+				IFACEMETHODIMP DrawGlyphRun(
+					void*,
+					FLOAT baselineOriginX,
+					FLOAT baselineOriginY,
+					DWRITE_MEASURING_MODE measuringMode,
+					const DWRITE_GLYPH_RUN* glyphRun,
+					const DWRITE_GLYPH_RUN_DESCRIPTION*,
+					IUnknown* clientDrawingEffect) override {
+
+					if (baselineOriginY + 15.0f < clipTop_ || baselineOriginY - 30.0f > clipBottom_) {
+						return S_OK;
+					}
+
+					ID2D1Brush* drawBrush = clientDrawingEffect ? static_cast<ID2D1Brush*>(clientDrawingEffect) : brush_;
+					context_->DrawGlyphRun(D2D1::Point2F(baselineOriginX, baselineOriginY), glyphRun, drawBrush, measuringMode);
+					return S_OK;
+				}
+
+				IFACEMETHODIMP DrawUnderline(void*, FLOAT, FLOAT, const DWRITE_UNDERLINE*, IUnknown*) override { return S_OK; }
+				IFACEMETHODIMP DrawStrikethrough(void*, FLOAT, FLOAT, const DWRITE_STRIKETHROUGH*, IUnknown*) override { return S_OK; }
+				IFACEMETHODIMP DrawInlineObject(void*, FLOAT, FLOAT, IDWriteInlineObject*, BOOL, BOOL, IUnknown*) override { return S_OK; }
+			};
+
 		private:
 			bool ShouldDeferCharToIme(wchar_t ch) const {
 				if (!imeWindow_ || ch == L'\r' || ch == L'\n' || ch == L'\b' || ch == 0x7F) {
@@ -4188,7 +4226,6 @@ namespace fusion::ui {
 				return metrics.height;
 			}
 
-			// 【性能关键修复 3】：绝不来回试探！直接按稳定的 hasVerticalScroll_ 宽度排版，命中率 100%
 			VisualState ComputeVisualState() const {
 				VisualState state;
 				state.renderText = DisplayText();
@@ -4216,7 +4253,6 @@ namespace fusion::ui {
 					state.maxScrollY = (std::max)(0.0f, contentHeight - viewH + 6.0f);
 					const bool needsScroll = state.maxScrollY > 0.5f;
 
-					// 只有当文本真实内容长度改变导致“需要滚动条”的状态反转时，才调整一次
 					if (needsScroll != hasVerticalScroll_) {
 						hasVerticalScroll_ = needsScroll;
 						state.content = InflateRect(state.box, 12.0f);
@@ -4318,7 +4354,6 @@ namespace fusion::ui {
 			std::wstring DisplayText() const { return text_; }
 			size_t DisplayCaret() const { return caret_; }
 
-			// 【性能关键修复 4】：排版缓存 100% 命中！
 			IDWriteTextLayout* CreateLayout(std::wstring_view renderText, const D2D1_RECT_F& content) const {
 				const float width = multiline_ ? (content.right - content.left) : (std::max)(content.right - content.left, MeasureSingleLineContentWidth(renderText) + 24.0f);
 				const float height = multiline_ ? 1000000.0f : (content.bottom - content.top);
@@ -4588,7 +4623,6 @@ namespace fusion::ui {
 				nextCaretBlinkToggle_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(700);
 			}
 
-			// 【性能优化 5】：直接使用已有 Layout 执行 HitTestPoint，微秒级命中
 			size_t HitTestText(D2D1_POINT_2F point) const {
 				auto visual = ComputeVisualState();
 				if (!visual.layout) return text_.size();
@@ -4717,7 +4751,7 @@ namespace fusion::ui {
 				const LONG maxClientY = (std::max)(clientRect.top, clientRect.bottom - 1);
 				const LONG anchorX = (std::clamp)(clientX, clientRect.left, maxClientX);
 				const LONG anchorY = (std::clamp)(clientY, clientRect.top, maxClientY);
-				const LONG candidateY = (std::clamp)(anchorY + (std::max)(lineHeight, 1L), clientRect.top, maxClientY);
+				const LONG candidateY = (std::clamp)(anchorY + (std::max)(lineHeight, 1L) + CandidateWindowUnderlineSpacingPx(), clientRect.top, maxClientY);
 
 				if (cachedImeX_ == anchorX && cachedImeY_ == anchorY && cachedImeH_ == lineHeight) {
 					return;
@@ -6738,7 +6772,6 @@ namespace fusion::ui {
 				return;
 			}
 
-			// 只有在点击激活输入框或者输入法输入时才绑定 IME 窗口，杜绝 MOUSEMOVE 频繁刷新
 			if (msg == WM_LBUTTONDOWN || msg == WM_IME_STARTCOMPOSITION || msg == WM_CHAR) {
 				if (auto* focusedTextInput = dynamic_cast<detail::TextInput*>(host.focused_)) {
 					focusedTextInput->BindImeWindow(hwnd);
