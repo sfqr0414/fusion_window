@@ -28,6 +28,13 @@ public static class Native {
     public const int VK_HOME = 0x24;
     public const int VK_END = 0x23;
     public const int VK_RETURN = 0x0D;
+    public const int VK_ESCAPE = 0x1B;
+    public const int VK_SPACE = 0x20;
+    public const int VK_UP = 0x26;
+    public const int VK_DOWN = 0x28;
+    public const int VK_A = 0x41;
+    public const int VK_C = 0x43;
+    public const int VK_V = 0x56;
     
     public const int GW_HWNDNEXT = 2;
 
@@ -468,6 +475,49 @@ function Send-Text([string]$text, [int]$delayMs = 22) {
     }
 }
 
+function Ensure-Ime {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Chinese', 'English')]
+        [string]$Language,
+
+        [int]$DelayMs = 180
+    )
+
+    # 语言 -> 键盘布局 KLID
+    # 00000804 = 简体中文 (zh-CN)
+    # 00000409 = 美式英语 (en-US)
+    $klid = switch ($Language) {
+        'Chinese' { '00000804' }
+        'English' { '00000409' }
+    }
+
+    [Native]::SetForegroundWindow($hwnd) | Out-Null
+
+    # 优先复用系统里已经加载的同类键盘布局，避免重复 LoadKeyboardLayoutW
+    $hkl = [IntPtr]::Zero
+    $twoLetter = if ($Language -eq 'Chinese') { 'zh' } else { 'en' }
+    foreach ($lang in [System.Windows.Forms.InputLanguage]::InstalledInputLanguages) {
+        if ($lang.Culture.TwoLetterISOLanguageName -eq $twoLetter) {
+            $hkl = $lang.Handle
+            break
+        }
+    }
+
+    # 没找到再显式加载
+    if ($hkl -eq [IntPtr]::Zero) {
+        $hkl = [Native]::LoadKeyboardLayoutW($klid, 1)
+    }
+
+    if ($hkl -ne [IntPtr]::Zero) {
+        [Native]::ActivateKeyboardLayout($hkl, 0) | Out-Null
+        [Native]::PostMessageW($hwnd, [Native]::WM_INPUTLANGCHANGEREQUEST, [IntPtr]::Zero, $hkl) | Out-Null
+    }
+
+    Start-Sleep -Milliseconds $DelayMs
+}
+
+<#
 function Ensure-ChineseIme([int]$delayMs = 180) {
     [Native]::SetForegroundWindow($hwnd) | Out-Null
     $hkl = [Native]::LoadKeyboardLayoutW('00000804', 1)
@@ -477,6 +527,7 @@ function Ensure-ChineseIme([int]$delayMs = 180) {
     }
     Start-Sleep -Milliseconds $delayMs
 }
+#>
 
 function Send-Enter([int]$delayMs = 40) {
     [Native]::SetForegroundWindow($hwnd) | Out-Null
@@ -818,6 +869,8 @@ for ($attempt = 0; $attempt -lt 3; $attempt++) {
 }
 $copyOk = $clipboardBefore -eq 'draw hitmarker'
 
+Send-PhysicalKeyChord ([Native]::VK_CONTROL) ([Native]::VK_SPACE) 40
+
 Drag-Client $singleSelectStartX $singleInputY $singleSelectEndX $singleInputY 12
 Start-Sleep -Milliseconds 120
 Send-Text 'native ui selection ok'
@@ -859,25 +912,26 @@ $singleImePoint = Get-ScreenPoint ($controlLeft + (Scale-Logical 16)) $singleInp
 Click-ScreenLeft $singleImePoint.X $singleImePoint.Y 160
 Save-Capture 'native_ui_01ad_single_ime_before.png' -useCopyFromScreen
 Add-Content -Path (Join-Path $LogDir 'ime_trace.txt') -Value '=== IME STEP BEGIN ==='
-Ensure-ChineseIme
+Ensure-Ime -Language 'Chinese'
 Click-ScreenLeft $singleImePoint.X $singleImePoint.Y 180
 Start-Sleep -Milliseconds 120
-Send-PhysicalKeyChord ([Native]::VK_CONTROL) 0x20 40
+Send-PhysicalKeyChord ([Native]::VK_CONTROL) ([Native]::VK_SPACE) 40
 Start-Sleep -Milliseconds 120
 Send-PhysicalText 'nihao' 80
 Start-Sleep -Milliseconds 220
 Save-Capture 'native_ui_01ae_single_ime_candidate.png' -useCopyFromScreen -fullScreen
 Add-Content -Path (Join-Path $LogDir 'ime_trace.txt') -Value '=== IME STEP END ==='
-Send-KeyPress 0x1B 35
+Send-KeyPress ([Native]::VK_ESCAPE) 35
 Click-Client $noteX $noteVisibleY
 Start-Sleep -Milliseconds 140
 Save-Capture 'native_ui_01af_single_ime_blur.png' -useCopyFromScreen
 Click-Client ($controlLeft + (Scale-Logical 16)) $singleInputY
 Start-Sleep -Milliseconds 90
-Send-KeyChord ([Native]::VK_CONTROL) 0x20 40
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_SPACE) 40
 $imeCandidateScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_01ae_single_ime_candidate.png'))
 $imeBlurScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_01af_single_ime_blur.png'))
 
+Send-PhysicalKeyChord ([Native]::VK_CONTROL) ([Native]::VK_SPACE) 40
 Click-Client $multiInputX $multiInputY
 Start-Sleep -Milliseconds 120
 Click-Client ($controlLeft + (Scale-Logical 16)) ($multiBoundsTop + (Scale-Logical 40))
@@ -894,7 +948,7 @@ $multiLines = @(
     'Seventh line confirms the hover hotspot on the vertical track.',
     'Eighth line keeps the overflow state obvious in screenshots.'
 )
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 Start-Sleep -Milliseconds 120
 for ($i = 0; $i -lt $multiLines.Count; $i++) {
     Send-Text $multiLines[$i]
@@ -908,33 +962,33 @@ Save-Capture 'native_ui_02a_multi_overflow.png'
 $null = Write-ClipboardText '__pending__'
 Send-KeyPress ([Native]::VK_HOME)
 Start-Sleep -Milliseconds 100
-Send-KeyPress 40
+Send-KeyPress ([Native]::VK_DOWN)
 Start-Sleep -Milliseconds 80
-Send-KeyPress 38
+Send-KeyPress ([Native]::VK_UP)
 Start-Sleep -Milliseconds 80
 Send-Text '^'
 Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_02ab_multi_up_one_line.png'
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 Start-Sleep -Milliseconds 120
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_C)
 Start-Sleep -Milliseconds 120
 $multiArrowUpText = Read-ClipboardText
 $multiArrowUpOk = $multiArrowUpText -match '^\^Header-only migration complete\.'
 
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 
 $null = Write-ClipboardText '__pending__'
 Send-KeyPress ([Native]::VK_HOME)
 Start-Sleep -Milliseconds 100
-Send-KeyPress 40
+Send-KeyPress ([Native]::VK_DOWN)
 Start-Sleep -Milliseconds 80
 Send-Text 'v'
 Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_02ac_multi_down_one_line.png'
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 Start-Sleep -Milliseconds 120
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_C)
 Start-Sleep -Milliseconds 120
 $multiArrowDownText = Read-ClipboardText
 $multiArrowDownOk = $multiArrowDownText -match "Header-only migration complete\.\r?\nvNext: richer text selection and IME support\."
@@ -951,15 +1005,15 @@ for ($i = 0; $i -lt $chineseLines.Count; $i++) {
         Send-Enter
     }
     elseif ($i -eq 7) {
-        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+        Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
         Start-Sleep -Milliseconds 120
-        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+        Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_C)
         Start-Sleep -Milliseconds 120
     }
     elseif ($i -gt 7 -and ($i % 16) -eq 0) {
         Send-KeyPress ([Native]::VK_END)
         Send-Enter
-        Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'V')
+        Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_V)
         Start-Sleep -Milliseconds 80
     }
 }
@@ -971,14 +1025,14 @@ $multiChineseBulkScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_0
 $selectionProbe = Measure-Command {
     Drag-Client $multiSelectStartX $multiSelectY $multiSelectEndX $multiSelectY 14
     Start-Sleep -Milliseconds 90
-    Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'C')
+    Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_C)
     Start-Sleep -Milliseconds 90
 }
 $multiChineseSelectionLatencyMs = [Math]::Round($selectionProbe.TotalMilliseconds, 2)
 Save-Capture 'native_ui_02ae_multi_chinese_select_drag.png'
 $multiChineseSelectionScreenshotCaptured = (Test-Path (Join-Path $PicDir 'native_ui_02ae_multi_chinese_select_drag.png'))
 
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 Start-Sleep -Milliseconds 120
 for ($i = 0; $i -lt $multiLines.Count; $i++) {
     Send-Text $multiLines[$i]
@@ -992,7 +1046,7 @@ Start-Sleep -Milliseconds 120
 Save-Capture 'native_ui_02aa_multi_hover_scrollbar.png'
 Drag-Client $multiScrollX $multiScrollStartY $multiScrollX $multiScrollEndY
 Start-Sleep -Milliseconds 120
-Send-KeyChord ([Native]::VK_CONTROL) ([int][char]'A')
+Send-KeyChord ([Native]::VK_CONTROL) ([Native]::VK_A)
 Start-Sleep -Milliseconds 120
 Send-Text 'Short note.'
 Start-Sleep -Milliseconds 220
@@ -1213,3 +1267,5 @@ Write-Output $resultJson
 if ($failures.Count -gt 0) {
     throw ('native UI selftest failed: ' + ($failures -join ', '))
 }
+
+#used: 'powershell -ExecutionPolicy Bypass -File ".\selftest_native_ui.ps1"'
