@@ -439,11 +439,11 @@ int g_SystemCaretHeight = 0;
 void AppendImeTrace(const std::string& message) {
 	static std::mutex s_mutex;
 	std::lock_guard<std::mutex> lock(s_mutex);
-	std::ofstream out("d:\\Repo\\fusion_window\\artifacts\\log\\ime_trace.txt", std::ios::app);
+	static std::ofstream out("d:\\Repo\\fusion_window\\artifacts\\log\\ime_trace.txt", std::ios::app);
 	if (!out) {
 		return;
 	}
-	out << utils::timestamp_prefix() << message << '\n';
+	utils::console(out, "{} {}\n", utils::timestamp_prefix(), message);
 }
 
 void NotifyTsfLayoutChange();
